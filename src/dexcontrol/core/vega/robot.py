@@ -1198,11 +1198,16 @@ class VegaRobot:
             elif velocity:
                 # cartesian_velocity
                 action_dict["cartesian_velocity"] = cart_action.tolist()
-                # NOTE: This uses vel*dt which differs from the server's
-                # _cartesian_velocity_to_delta (normalize + max_delta scaling).
-                # Known discrepancy — see bugfix branch for the corrected
-                # version.  Kept as-is here for inference compatibility.
-                cartesian_delta = cart_action * dt
+                # Use the same motor-delta conversion as the server when the
+                # caller provides max_*_delta limits, so the logged
+                # cartesian_delta matches what the robot actually executes.
+                # Fall back to vel*dt for callers that do not pass limits.
+                if max_lin_delta is not None and max_rot_delta is not None:
+                    cartesian_delta = self._velocity_to_motor_delta(
+                        cart_action, max_lin_delta, max_rot_delta,
+                    )
+                else:
+                    cartesian_delta = cart_action * dt
             else:
                 # cartesian_delta
                 cartesian_delta = cart_action
