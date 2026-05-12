@@ -6,6 +6,20 @@
     dexmate_ip: "192.168.5.20"
     dexmate_user: "dexmate"
     dexmate_pass: "hello-dex"
+    # Activate conda base on dexmate before any pip/python call. The
+    # interactive shell auto-activates (base), but ansible's non-interactive
+    # heredoc shell does not source ~/.bashrc, so we activate explicitly.
+    # Probes the two standard install paths; fails loudly if neither exists.
+    conda_activate: |
+      if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+        source "$HOME/miniconda3/etc/profile.d/conda.sh"
+      elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+        source "$HOME/anaconda3/etc/profile.d/conda.sh"
+      else
+        echo "ERROR: conda.sh not found in ~/miniconda3 or ~/anaconda3" >&2
+        exit 1
+      fi
+      conda activate base
 
   tasks:
     # ── Teleop host setup (ds-teleop-0004-XX) ────────────────────────────────
@@ -23,6 +37,7 @@
     - name: Install Python dependencies on dexmate
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        {{ conda_activate }}
         cd ~/custom_dexcontrol
         pip install -e . 2>&1 | tail -5
         ENDSSH
@@ -33,6 +48,7 @@
     - name: Install Robotiq gripper dependencies on dexmate
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        {{ conda_activate }}
         pip install pymodbus pyserial
         cd ~/custom_dexcontrol
         pip install -e robotiq_2f_85_controller/ 2>&1 | tail -5
@@ -44,6 +60,7 @@
     - name: Install SR gripper dependencies on dexmate
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        {{ conda_activate }}
         pip install pysoem
         cd ~/custom_dexcontrol
         pip install -e sr_gripper_controller/ 2>&1 | tail -5
@@ -59,6 +76,7 @@
       # setcap targets the real ELF binary.
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        {{ conda_activate }}
         PYBIN=$(python -c 'import os, sys; print(os.path.realpath(sys.executable))')
         echo "$PYBIN"
         sudo setcap cap_net_raw,cap_net_admin=eip "$PYBIN"
