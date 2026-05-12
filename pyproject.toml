@@ -31,6 +31,10 @@ dependencies = [
     "dexbot-utils>=0.4.3,<0.5.0",
     "grpcio",
     "protobuf",
+    "scipy",
+    "pytransform3d",
+    "dexmotion",
+    "dualsense-controller",
 ]
 requires-python = ">=3.10"
 
@@ -54,10 +58,6 @@ docs = [
 example = [
     "matplotlib>=3.8.0",
     "tyro",
-    "dualsense-controller>=0.3.1",
-    "pytransform3d==3.13.0",
-    "dexmotion>=0.2.1",
-    "scipy>=1.16.1"
 ]
 
 [project.urls]
