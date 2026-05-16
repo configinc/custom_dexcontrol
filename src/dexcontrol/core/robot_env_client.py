@@ -36,13 +36,25 @@ from proto import robotenv_pb2
 from proto import robotenv_pb2_grpc
 
 class _RobotProxy:
+    # Gains applied by teleop master before emitting cartesian_velocity.
+    # Used to recover the original gain-free target_cartesian_delta.
+    _TELEOP_POS_ACTION_GAIN = 5.0
+    _TELEOP_ROT_ACTION_GAIN = 2.0
+
     """Proxy that mimics Robot for attributes accessed by policy_runner.
 
     Provides create_action_dict() using a local IK solver so the control
     loop can build action dicts without an extra RPC round-trip.
 
     Note: For Vega robots, IK is handled by VegaRobot/BaseIKController.
-    This proxy provides a minimal implementation for compatibility.
+    This proxy provides a minimal implementation for compatibility. When
+    `self._ik_solver is None`, the cartesian_delta fallback (action/control_hz)
+    does NOT match the vega server's `_cartesian_velocity_to_delta` transform
+    (which applies norm clipping + control_hz-scaled max_lin/rot_delta). As a
+    result, action_dict values produced in fallback mode will diverge from the
+    delta the server actually executes. This is fine for inference today (the
+    proxy is not on the inference data path), but if you wire it into a logging
+    or intervention path, expect logged cartesian_delta to be approximate only.
     """
 
     def __init__(self, control_hz: int = 20):
@@ -53,8 +65,16 @@ class _RobotProxy:
             self._ik_solver = RobotIKSolver(control_hz=control_hz)
             self._add_poses = add_poses
         except ImportError:
-            # Fallback for Vega or other robots without these modules
+            # Fallback for Vega or other robots without these modules.
+            # create_action_dict() will use an approximate transform that does
+            # not match the server's; values are suitable for rough logging but
+            # not for replay or analysis that compares against executed delta.
             self._ik_solver = None
+            print(
+                "[_RobotProxy] IK solver not available; create_action_dict will "
+                "use approximate fallback (cartesian_delta will diverge from "
+                "server-executed delta)."
+            )
             self._add_poses = self._fallback_add_poses
 
         self.control_hz = control_hz
@@ -80,7 +100,8 @@ class _RobotProxy:
         """
         assert action_space in [
             "cartesian_delta", "joint_position",
-            "cartesian_velocity", "joint_velocity", "joint_delta"
+            "cartesian_velocity", "joint_velocity", "joint_delta",
+            "target_cartesian_delta",
         ]
         if robot_state is None:
             robot_state = {}
@@ -101,8 +122,23 @@ class _RobotProxy:
             # Fallback: simple conversion
             action_dict["gripper_delta"] = gripper_delta * self.control_hz
 
-        if "cartesian" in action_space:
-            if velocity:
+        if "cartesian" in action_space or action_space == "target_cartesian_delta":
+            if action_space == "target_cartesian_delta":
+                cart_action = action[:-1]
+                cart_vel = np.empty(6, dtype=np.float64)
+                cart_vel[:3] = np.asarray(cart_action[:3]) * self._TELEOP_POS_ACTION_GAIN
+                cart_vel[3:6] = np.asarray(cart_action[3:6]) * self._TELEOP_ROT_ACTION_GAIN
+                action_dict["cartesian_velocity"] = cart_vel.tolist()
+                action_dict["target_cartesian_delta"] = list(action)
+                if self._ik_solver is not None:
+                    cartesian_delta = self._ik_solver.cartesian_velocity_to_delta(cart_vel)
+                else:
+                    cartesian_delta = cart_vel / self.control_hz
+                action_dict["delta_action"] = np.concatenate([cartesian_delta, [action[-1]]]).tolist()
+                action_dict["cartesian_position"] = self._add_poses(
+                    cartesian_delta, robot_state.get("cartesian_position", [0]*6)
+                ).tolist()
+            elif velocity:
                 action_dict["cartesian_velocity"] = action[:-1]
                 if self._ik_solver is not None:
                     cartesian_delta = self._ik_solver.cartesian_velocity_to_delta(action[:-1])
@@ -192,7 +228,7 @@ class RobotEnvClient:
         self,
         robot_ip: str = "localhost",
         robot_port: int = 50051,
-        action_space: str = "cartesian_velocity",
+        action_space: str = "target_cartesian_delta",
         gripper_action_space: Optional[str] = None,
         reset_joints: Optional[np.ndarray] = None,
         do_reset: bool = True,
