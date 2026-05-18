@@ -878,9 +878,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         return action
 
     def _transform_state_to_env_frame(self, state: np.ndarray) -> np.ndarray:
+        # state[3:6] is an absolute Euler pose (from quat_to_euler("xyz")),
+        # not a small rotation vector, so R @ v is only a small-angle
+        # approximation. Compose rotations instead.
         state = np.asarray(state, dtype=np.float64).copy()
         state[:3] = self.R_robot_to_world @ state[:3]
-        state[3:6] = self.R_robot_to_world @ state[3:6]
+        R_base = R.from_matrix(self.R_robot_to_world)
+        R_state = R.from_euler("xyz", state[3:6])
+        state[3:6] = (R_base * R_state).as_euler("xyz")
         return state
 
 
