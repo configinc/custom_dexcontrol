@@ -2,6 +2,7 @@ import logging
 import socket
 import struct
 import time
+import tyro
 
 from dexcomm import Node
 
@@ -23,7 +24,7 @@ def _make_sndbuf(fps: float) -> int:
     return int(_MAX_FRAME_BYTES * fps * _STALE_THRESHOLD_S)
 
 
-def stream_frames(host: str, port: int, fps: float, camera_key: str = "left_rgb"):
+def stream_frames(host: str, port: int, fps: float, camera_key: str = "right_rgb"):
     topic = _TOPIC_MAP.get(camera_key)
     if topic is None:
         raise ValueError(f"Unsupported camera_key: {camera_key!r}. Valid values: {list(_TOPIC_MAP)}")
@@ -39,6 +40,7 @@ def stream_frames(host: str, port: int, fps: float, camera_key: str = "left_rgb"
     logging.info(f"Connecting to recorder PC {host}:{port}...")
 
     while True:
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
@@ -70,8 +72,8 @@ def stream_frames(host: str, port: int, fps: float, camera_key: str = "left_rgb"
                     time.sleep(0.005)
                     continue
 
-                rx_ns = time.time_ns()
-                age = time.time() - rx_ns * 1e-9  # ≈0, stale check is relative to just after get_latest
+                rx_ns = sub.get_receive_time_ns()
+                age = (time.time_ns() - rx_ns) / 1e9
                 if age > _STALE_THRESHOLD_S:
                     logging.debug(f"Stale frame skipped (age={age:.3f}s)")
                     stat_skipped += 1
@@ -99,7 +101,8 @@ def stream_frames(host: str, port: int, fps: float, camera_key: str = "left_rgb"
             logging.warning(f"Connection failed: {e} — retrying in 3s")
             time.sleep(3.0)
         finally:
-            sock.close()
+            if sock is not None:
+                sock.close()
 
 
 def main(host: str = "192.168.5.17", port: int = 9876, fps: float = 30.0,
@@ -108,5 +111,4 @@ def main(host: str = "192.168.5.17", port: int = 9876, fps: float = 30.0,
 
 
 if __name__ == "__main__":
-    import tyro
     tyro.cli(main)
