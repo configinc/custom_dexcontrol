@@ -4,12 +4,18 @@ import struct
 import time
 import tyro
 
+import numpy as np
+from dexbot_utils import RobotInfo
 from dexcomm import Node
+
+from dexcontrol.core.head import Head
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
 )
+
+_HEAD_PRESET = np.array([-2.0, 0.0, 0.17])  # yaw, pitch, roll (radians)
 
 _STALE_THRESHOLD_S = 0.5        # frames older than this threshold (from receive time) are dropped
 _MAX_FRAME_BYTES   = 960 * 600 * 3  # upper bound on raw frame size, used for SO_SNDBUF calculation
@@ -105,8 +111,25 @@ def stream_frames(host: str, port: int, fps: float, camera_key: str = "right_rgb
                 sock.close()
 
 
+def _move_head_to_preset() -> None:
+    try:
+        robot_info = RobotInfo()
+        head = Head(name="head", robot_info=robot_info)
+        head.set_mode("enable")
+        target = _HEAD_PRESET.copy()
+        limits = head.get_joint_pos_limit()
+        if limits is not None:
+            target = np.clip(target, limits[:, 0], limits[:, 1])
+        head.set_joint_pos(target, wait_time=2.0)
+        head.shutdown()
+        logging.info("Head moved to preset: yaw=%.2f pitch=%.2f roll=%.2f", *target)
+    except Exception as exc:
+        logging.warning("Failed to move head to preset (non-fatal): %s", exc)
+
+
 def main(host: str = "192.168.5.17", port: int = 9876, fps: float = 30.0,
          camera_key: str = "right_rgb"):
+    _move_head_to_preset()
     stream_frames(host=host, port=port, fps=fps, camera_key=camera_key)
 
 
