@@ -9,6 +9,7 @@ from dexbot_utils import RobotInfo
 from dexcomm import Node
 
 from dexcontrol.core.head import Head
+from dexcontrol.core.torso import Torso
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,15 +115,21 @@ def stream_frames(host: str, port: int, fps: float, camera_key: str = "right_rgb
 def _move_head_to_preset() -> None:
     try:
         robot_info = RobotInfo()
+        torso = Torso(name="torso", robot_info=robot_info)
         head = Head(name="head", robot_info=robot_info)
         head.set_mode("enable")
+
         target = _HEAD_PRESET.copy()
+        target[0] += torso.pitch_angle - np.pi / 2
+
         limits = head.get_joint_pos_limit()
         if limits is not None:
             target = np.clip(target, limits[:, 0], limits[:, 1])
         head.set_joint_pos(target, wait_time=2.0)
+
+        torso.shutdown()
         head.shutdown()
-        logging.info("Head moved to preset: yaw=%.2f pitch=%.2f roll=%.2f", *target)
+        logging.info("Head moved to preset: yaw=%.2f pitch=%.2f roll=%.2f", *_HEAD_PRESET)
     except Exception as exc:
         logging.warning("Failed to move head to preset (non-fatal): %s", exc)
 
