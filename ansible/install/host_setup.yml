@@ -6,10 +6,9 @@
     dexmate_ip: "192.168.5.20"
     dexmate_user: "dexmate"
     dexmate_pass: "hello-dex"
-    # Activate conda base on dexmate before any pip/python call. The
-    # interactive shell auto-activates (base), but ansible's non-interactive
-    # heredoc shell does not source ~/.bashrc, so we activate explicitly.
-    # Probes the two standard install paths; fails loudly if neither exists.
+    # Activate conda on dexmate before any pip/python call. The interactive
+    # shell auto-activates (base), but ansible's non-interactive heredoc shell
+    # does not source ~/.bashrc, so we activate explicitly.
     conda_activate: |
       if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
         source "$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -19,7 +18,8 @@
         echo "ERROR: conda.sh not found in ~/miniconda3 or ~/anaconda3" >&2
         exit 1
       fi
-      conda activate base
+      conda env list | grep -q '^robot ' || conda create -n robot python=3.13.11 -y
+      conda activate robot
 
   tasks:
     # ── Teleop host setup (ds-teleop-0004-XX) ────────────────────────────────
