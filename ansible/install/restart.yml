@@ -177,7 +177,7 @@
     # ── Camera session ───────────────────────────────────────────────────────
     - name: Start camera session (nano dexsensor + local camera_stream)
       shell: |
-        bash "~/custom_dexcontrol/scripts/start_camera_session.sh"
+        bash ~/custom_dexcontrol/scripts/start_camera_session.sh
       args:
         executable: /bin/bash
       become: false
