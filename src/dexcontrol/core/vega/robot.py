@@ -434,9 +434,11 @@ class VegaRobot:
                     self.hand.close_hand(wait_time=wait_time)
                 else:
                     self.hand.set_joint_pos(target_joint_pos, wait_time=wait_time)
-            with self._gripper_state_lock:
-                self._gripper_position = target
-                self._gripper_joint_pos = np.asarray(target_joint_pos, dtype=np.float64).copy()
+            # State is refreshed from real measurements by
+            # `_refresh_gripper_state` only — do not write the commanded
+            # target into `_gripper_position` here. Conflating commanded
+            # and measured produces logs/plots where state tracks the
+            # action and snaps back to reality on contact stalls.
             self._prev_gripper_command_successful = True
             return True
         except Exception:
@@ -447,9 +449,6 @@ class VegaRobot:
 
     def _enqueue_gripper_target(self, target: float) -> None:
         target = float(np.clip(target, 0.0, 1.0))
-        with self._gripper_state_lock:
-            self._gripper_position = target
-            self._gripper_joint_pos = self._gripper_target_to_joint_pos(target)
         if self._gripper_command_queue is None:
             self._execute_gripper_command(target, wait_time=0.0, raise_on_error=False)
             return

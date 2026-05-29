@@ -124,7 +124,7 @@
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
         tmux new-session -d -s robot-server
-        tmux send-keys -t robot-server "python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
+        tmux send-keys -t robot-server "conda activate robot && python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
             --arm-side left \
             --grpc-port 50061 \
             --gripper-type {{ gripper_type }} \
@@ -133,7 +133,7 @@
             --ema-alpha 0.7" C-m
         sleep 0.5
         tmux split-window -v -t robot-server
-        tmux send-keys -t robot-server.1 "python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
+        tmux send-keys -t robot-server.1 "conda activate robot && python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
             --arm-side right \
             --grpc-port 50063 \
             --gripper-type {{ gripper_type }} \
