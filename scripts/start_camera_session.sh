@@ -22,11 +22,13 @@ tmux send-keys -t nano "bash $SCRIPT_DIR/nano_dexsensor_loop.sh" Enter
 tmux kill-session -t camera 2>/dev/null || true
 tmux new-session -d -s camera
 
+CAMERA_SCRIPT="$SCRIPT_DIR/../src/dexcontrol/apps/camera_stream.py"
+
 tmux send-keys -t camera "
 while true; do
-    echo \"[camera] Starting camera_stream...\"
-    python ~/custom_dexcontrol/src/dexcontrol/apps/camera_stream.py
-    echo \"[camera] Process ended (exit \$?), retrying in 5s...\"
+    echo '[camera] Starting camera_stream...'
+    python $CAMERA_SCRIPT
+    echo '[camera] Process ended, retrying in 5s...'
     sleep 5
 done
 " Enter
