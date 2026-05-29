@@ -21,7 +21,7 @@ SSH_OPTS=(
 )
 
 run_remote_launch() {
-    sshpass -p "$DEXMATE_PASS" ssh "${SSH_OPTS[@]}" "$NANO_HOST" bash -s <<'REMOTE_EOF'
+    sshpass -p "$DEXMATE_PASS" ssh "${SSH_OPTS[@]}" "$NANO_HOST" bash -l -s <<'REMOTE_EOF'
 set -e
 pkill -f "dexsensor launch" 2>/dev/null || true
 sleep 2
