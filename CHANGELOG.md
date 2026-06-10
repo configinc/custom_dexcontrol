@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-03
+
+### Added
+
+- **`set_joint_target()` — goal-oriented motion via the server-side motion plugin.** New API on `ManagedJointComponent` (arms, head, torso) and `Robot`. Publishes a target to `motion/target/{component}`; the plugin handles trajectory smoothing, gravity compensation, and collision avoidance. `tracked=True` returns a `MotionHandle` for plugin-signaled convergence, cancellation, and async waiting. `scale` is a per-joint motion scale in `(0, 1]` of the hardware velocity ceiling. Complements `set_joint_pos()` (direct streaming control), does not replace it.
+- **`MotionHandle` / `MultiMotionHandle`** (`dexcontrol.core.motion_handle`): async handles for tracked motion with `.wait(timeout)`, `.cancel()`, `.state`, `.is_done`, `.message`. `Robot.set_joint_target({...}, tracked=True)` returns a `MultiMotionHandle` for coordinating motions across components.
+- **`default_velocity_scale`** on `ManagedJointComponent` and `Robot`. Client-side default applied to `set_joint_target` when `scale` is omitted; Robot-level setter fans out to every managed component.
+- **Lazy motion-target publisher.** `_target_publisher` is created on first `set_joint_target` call (`_ensure_target_publisher`), so callers who stick to `set_joint_pos` pay no extra zenoh registration. `_publish_target` mirrors `_publish_control`'s `_policy_manager.touch()` discipline so streaming targets don't auto-idle the state subscriber.
+- **`MotionPluginManaged` marker mixin** (`dexcontrol.core.component.MotionPluginManaged`) for components that talk to the motion plugin. Provides a shared `_new_motion_id_counter()` helper. Enables `isinstance(c, MotionPluginManaged)` for fan-out discovery of all motion-plugin clients. Currently used by `ManagedJointComponent` only; `Chassis` does **not** mix it in (see "Chassis stays on the local-IK control path" below).
+- **`ManagedJointComponent` class** (`dexcontrol.core.component.ManagedJointComponent`), inheriting `RobotJointComponent` + `MotionPluginManaged`. Owns all motion-plugin integration: `set_joint_target`, `go_to_pose`, target publisher, status subscriber, motion handles, per-component `default_velocity_scale`.
+- **`Torso.set_idle_mode(enabled)` / `get_idle_mode()`.** Toggle the torso's server-side auto-idle behaviour. When disabled, the three torso joints stay actively held at the last commanded position instead of powering down between commands — useful for endurance tests and continuous control loops. Backed by the firmware-side idle-mode service.
+
+### Changed
+
+- **`go_to_pose(pose_name, timeout=None)`** uses `set_joint_target(tracked=True)` and plugin-signaled convergence instead of client-side polling. Signature changed from `(pose_name, wait_time=3.0, exit_on_reach=…)`.
+- **`set_joint_pos(joint_pos, wait_time>0)` emits a DeprecationWarning** recommending `set_joint_target()`. `wait_time` will be removed in 0.6.0.
+- **Component hierarchy: `_supports_motion_target` flag replaced with explicit type hierarchy.** Motion-plugin integration moved from a flag-gated path on `RobotJointComponent` to the new `ManagedJointComponent` subclass. `Arm`, `Head`, and `Torso` now inherit from `ManagedJointComponent`; `Hand`, `HandF5D6`, `HandF5D6V2`, `DexGripper`, `ChassisSteer`, and `ChassisDrive` inherit from `RobotJointComponent` directly and no longer expose `set_joint_target`/`go_to_pose`. Released APIs (`set_joint_pos`, `set_joint_pos_vel`, `open_hand`, `close_hand`, `set_velocity`, all queries) are unchanged.
+- **`Robot.set_joint_target` validates targets up front.** Passing a non-managed component (e.g., `left_hand`, `chassis`) raises `DexcontrolError` wrapping `ValueError("set_joint_target() does not support [...]. Supported components: [...].")` at the entry point, instead of a downstream `AttributeError`/`NotImplementedError` from the per-component dispatch loop.
+- **`Robot.default_velocity_scale` filter narrowed** from `isinstance(c, RobotJointComponent)` to `isinstance(c, ManagedJointComponent)` (both getter and setter). Same effective component set (arms/head/torso); strictly correct typing.
+- **Unified `side` parameter name across examples.** Renamed `arm_side` to `side` in all example scripts so every example uses the same input name. CLI flag for tyro-driven scripts is now `--side` instead of `--arm-side`.
+- **Software E-Stop service wire encoding switched to `DictDataCodec`** (request encoder and response decoder), replacing the prior `SoftwareEstopCodec` request / undecoded response. `EStop.activate()` / `deactivate()` / `toggle()` now read a `{"success", "message"}` response dict. **This is a breaking wire change — the robot-server must run a matching motion/E-Stop service build.**
+
+### Removed (breaking)
+
+- **`Chassis.set_velocity` parameters `sequential_steering`, `steering_wait_time`, `steering_tolerance`** (present on `main` pre-0.5.0). Sequential steering is always on; the tolerance (0.05 rad) and inter-step wait (1.0 s) are now internal constants. Callers passing these kwargs will get `TypeError`.
+- **`Chassis.set_velocity` `**_legacy_kwargs` swallow.** Unknown kwargs now raise `TypeError` instead of being silently dropped.
+- **`Arm.set_mode(mode)` deprecated alias.** Removed in favour of `Arm.set_modes([...])`. Callers of `set_mode` will get `AttributeError`.
+
+### Dependencies
+
+- Requires `dexcomm >= 0.6.0, < 0.7.0` (raised from `>= 0.4.18`).
+
 ## [0.4.9] - 2026-03-29
 
 ### Added
