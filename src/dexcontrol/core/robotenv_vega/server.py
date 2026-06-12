@@ -488,13 +488,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             else:
                 _cur_grip_raw = 0.0
                 _cur_grip_norm = 0.0
-            if action_space.startswith("joint"):
-                _grip_cmd = float(action[7]) if action.shape[0] > 7 else 0.0
-            else:
-                _grip_cmd = float(action[6]) if action.shape[0] > 6 else 0.0
+            _arm_dof = 7 if action_space.startswith("joint") else 6
+            # End-effector slice: scalar gripper (1) or multi-finger hand (N).
+            _hand_cmd = action[_arm_dof:].tolist() if action.shape[0] > _arm_dof else []
             LOGGER.info(
-                "[Gripper] cmd=%.4f  space=%s  gripper_space=%s  cur_raw=%.4f  cur_norm=%.4f",
-                _grip_cmd, action_space, gripper_action_space, _cur_grip_raw, _cur_grip_norm,
+                "[Gripper] cmd=%s  space=%s  gripper_space=%s  cur_raw=%.4f  cur_norm=%.4f",
+                _hand_cmd, action_space, gripper_action_space, _cur_grip_raw, _cur_grip_norm,
             )
             # -- end gripper debug --
 
@@ -690,8 +689,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             "motor_torques_measured": robotenv_pb2.Value(
                 float_array=robotenv_pb2.FloatArray(values=np.asarray(state_dict.get("motor_torques_measured", [0]*7)).tolist())
             ),
-            "gripper_position": robotenv_pb2.Value(
-                float_value=float(state_dict["gripper_position"])
+            # Scalar gripper → float_value; multi-finger F5D6 hand (6-DoF list)
+            # → float_array. Same key either way (the consumer keeps it as-is).
+            "gripper_position": (
+                robotenv_pb2.Value(
+                    float_array=robotenv_pb2.FloatArray(
+                        values=[float(v) for v in state_dict["gripper_position"]]
+                    )
+                )
+                if isinstance(state_dict["gripper_position"], (list, tuple, np.ndarray))
+                else robotenv_pb2.Value(float_value=float(state_dict["gripper_position"]))
             ),
             "cartesian_position": robotenv_pb2.Value(
                 float_array=robotenv_pb2.FloatArray(values=cartesian_position.tolist())
