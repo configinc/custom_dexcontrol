@@ -308,7 +308,7 @@ class Robot(RobotQueryInterface):
 
         # Attempt to read the file (permission check)
         try:
-            config_path.read_text()
+            config_path.read_bytes()
         except PermissionError as e:
             raise ConfigurationError(
                 f"Cannot read Zenoh config file: {config_path}\n"
