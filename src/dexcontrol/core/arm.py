@@ -110,7 +110,7 @@ class Arm(ManagedJointComponent):
 
         # Initialize temperature sensor if configured
         self.temperature_sensor: TemperatureSensor | None = None
-        if config.temperature_sub_topic:
+        if hasattr(config, "temperature_sub_topic") and config.temperature_sub_topic:
             self.temperature_sensor = TemperatureSensor(
                 f"{name}_temperature", config.temperature_sub_topic
             )
