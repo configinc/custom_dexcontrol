@@ -51,11 +51,10 @@ Example Usage:
     ```
 """
 
-from typing import Any, cast
+from typing import cast
 
 import numpy as np
 from dexbot_utils.configs.components.sensors import CameraConfig
-from dexcomm.codecs import JsonDataCodec
 from loguru import logger
 
 from dexcontrol.sensors.camera.base_camera import (
@@ -101,23 +100,22 @@ class ZedCameraSensor(BaseCameraSensor):
         super().__init__(name=name)
 
         # Create stream subscribers
-        for name in ["left_rgb", "right_rgb", "depth"]:
-            cam_config = cast(CameraConfig, getattr(configs, name))
-            self._streams[name] = self._create_stream(
-                stream_name=name,
+        for stream_name in ["left_rgb", "right_rgb", "depth"]:
+            cam_config = cast(CameraConfig, getattr(configs, stream_name))
+            self._streams[stream_name] = self._create_stream(
+                stream_name=stream_name,
                 config={
                     "enable": cam_config.enabled,
                     "transport": cam_config.transport,
                     "topic": cam_config.topic,
                     "rtc_channel": cam_config.rtc_channel,
                 },
-                stream_type=StreamType.RGB if name in ["left_rgb", "right_rgb"] else StreamType.DEPTH,
+                stream_type=StreamType.RGB if stream_name in ["left_rgb", "right_rgb"] else StreamType.DEPTH,
             )
 
 
-        # Set up camera info service
-        self._camera_info_cache: dict[str, Any] | None = None
-        self._setup_camera_info_service(name, configs)
+        # Query camera info from dexsensor (best-effort)
+        self._setup_camera_info_service()
 
         # Log initialization summary
         enabled = self.available_streams
@@ -131,6 +129,8 @@ class ZedCameraSensor(BaseCameraSensor):
             )
         else:
             logger.warning(f"ZED camera '{name}' has no active streams")
+
+        self._register_stream_subcomponents()
 
     def get_obs(
         self,
@@ -325,108 +325,6 @@ class ZedCameraSensor(BaseCameraSensor):
         stream = self._streams.get(stream_name)
         return stream.transport.value if stream is not None else None
 
-    def _setup_camera_info_service(self, name: str, configs: Any) -> None:
-        """Set up camera info service to query dexsensor for camera information.
-
-        Args:
-            name: Camera name used to construct the service topic.
-            configs: Camera configuration object.
-        """
-        if self._node is None:
-            logger.warning(f"Cannot set up camera info service for '{name}': Node not available")
-            return
-
-        # Construct service topic based on camera name
-        # Expected format: sensors/{camera_name}/info
-        service_topic = f"sensors/{name}/info"
-
-        try:
-            # Query camera info immediately on startup
-            self._query_camera_info(service_topic)
-            logger.info(f"Camera info service initialized for '{name}' at '{service_topic}'")
-        except Exception as e:
-            logger.warning(f"Failed to query camera info for '{name}': {e}")
-
-    def _query_camera_info(self, service_topic: str) -> dict[str, Any] | None:
-        """Query camera info from dexsensor service.
-
-        Args:
-            service_topic: Service topic to query.
-
-        Returns:
-            Camera information dictionary or None if query fails.
-        """
-        if self._node is None:
-            return None
-
-        try:
-            # Call service with empty request
-            response = self._node.call_service(service_topic, b"", timeout=2.0)
-
-            if response is None:
-                logger.debug(f"No response from camera info service: {service_topic}")
-                return None
-
-            # Decode JSON response
-            info_dict = JsonDataCodec.decode(response)
-            self._camera_info_cache = info_dict
-            return info_dict
-
-        except Exception as e:
-            logger.debug(f"Failed to query camera info from '{service_topic}': {e}")
-            return None
-
-    def get_camera_info(self, force_refresh: bool = False) -> dict[str, Any] | None:
-        """Get camera information from dexsensor.
-
-        This method queries the camera info service to get comprehensive information
-        about the camera including model, serial number, firmware version, resolution,
-        calibration parameters, and current status.
-
-        Args:
-            force_refresh: If True, forces a new query to the service.
-                          If False, returns cached info if available.
-
-        Returns:
-            Dictionary containing camera information with keys:
-            - type: Camera type (e.g., "ZED_CAMERA")
-            - camera_id: Camera ID or serial number
-            - status: Camera status ("running", "error", etc.)
-            - model: Camera model name (if available)
-            - serial_number: Camera serial number (if available)
-            - firmware_version: Firmware version (if available)
-            - actual: Dict with actual resolution and FPS
-            - configured: Dict with configured settings
-            - streams: Dict of enabled streams
-            - statistics: Dict with frame count statistics
-
-            Returns None if camera info is not available.
-
-        Thread Safety:
-            This method is thread-safe.
-
-        Example:
-            ```python
-            camera = ZedCameraSensor(name="head_camera", configs=configs)
-
-            # Get cached camera info
-            info = camera.get_camera_info()
-            if info:
-                print(f"Camera model: {info['model']}")
-                print(f"Resolution: {info['actual']['width']}x{info['actual']['height']}")
-                print(f"Enabled streams: {info['streams']}")
-
-            # Force refresh from service
-            info = camera.get_camera_info(force_refresh=True)
-            ```
-        """
-        if force_refresh or self._camera_info_cache is None:
-            service_topic = f"sensors/{self._name}/info"
-            return self._query_camera_info(service_topic)
-
-        return self._camera_info_cache
-
-
 class ZedXOneCameraSensor(BaseCameraSensor):
     """ZED X One camera sensor for single RGB stream acquisition.
 
@@ -480,6 +378,9 @@ class ZedXOneCameraSensor(BaseCameraSensor):
             stream_type=StreamType.RGB,
         )
 
+        # Query camera info from dexsensor (best-effort)
+        self._setup_camera_info_service()
+
         if self._streams["rgb"] is None:
             logger.warning(f"ZED X One camera '{name}' has no active RGB stream")
         else:
@@ -487,6 +388,8 @@ class ZedXOneCameraSensor(BaseCameraSensor):
                 f"ZED X One camera '{name}' initialized with "
                 f"{self._streams['rgb'].transport.value} transport"
             )
+
+        self._register_stream_subcomponents()
 
     def get_obs(self, include_timestamp: bool = False) -> np.ndarray | dict | None:
         """Get the latest RGB observation from the camera.

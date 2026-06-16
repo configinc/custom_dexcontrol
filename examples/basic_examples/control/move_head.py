@@ -50,15 +50,18 @@ def move_joint_sequence(
 
     # Move positive
     logger.info(f"Moving head {joint_names[joint_idx]} positive ({step_size} rad)")
-    head.set_joint_pos(positive_pos, wait_time=wait_time)
+    handle = head.set_joint_target(positive_pos, tracked=True)
+    handle.wait(timeout=wait_time)
 
     # Move negative
     logger.info(f"Moving head {joint_names[joint_idx]} negative ({-step_size} rad)")
-    head.set_joint_pos(negative_pos, wait_time=wait_time)
+    handle = head.set_joint_target(negative_pos, tracked=True)
+    handle.wait(timeout=wait_time)
 
     # Return to zero
     logger.info(f"Moving head {joint_names[joint_idx]} to zero")
-    head.set_joint_pos(zero_pos, wait_time=wait_time)
+    handle = head.set_joint_target(zero_pos, tracked=True)
+    handle.wait(timeout=wait_time)
 
 
 def main(
@@ -78,7 +81,8 @@ def main(
         # Initial head position (slightly tilted down)
         initial_pos = np.array([-np.pi / 6, 0.0, 0.0])
         logger.info(f"Moving head to initial position: {np.rad2deg(initial_pos)} deg")
-        head.set_joint_pos(initial_pos, wait_time=1.0)
+        handle = head.set_joint_target(initial_pos, tracked=True)
+        handle.wait(timeout=1.0)
 
         # Define joint names and movement sequence
         joint_names = ["yaw (left/right)", "pitch (up/down)", "roll"]

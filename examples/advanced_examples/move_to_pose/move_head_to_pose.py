@@ -57,10 +57,12 @@ def main(
                 head.get_predefined_pose(pose),
                 "head",
             )
-            head.set_joint_pos(adjusted_pose, wait_time=6.0)
+            handle = head.set_joint_target(adjusted_pose, tracked=True)
+            assert handle is not None
+            handle.wait(timeout=6.0)
         else:
             # Move directly to predefined pose
-            head.go_to_pose(pose, wait_time=6.0)
+            head.go_to_pose(pose, timeout=6.0)
     finally:
         logger.info("Shutting down robot")
         bot.shutdown()

@@ -8,11 +8,10 @@
 # 2. Commercial License
 #    For commercial licensing terms, contact: contact@dexmate.ai
 
-"""Example script to disable arm motors and control brake release.
+"""Example script to control arm brake release.
 
-This script demonstrates how to:
-1. Disable arm motors with optional brake release mode
-2. Control brake release (over-limit drag) for calibration or recovery
+This script demonstrates how to control brake release (over-limit drag)
+for calibration or recovery purposes.
 
 Recovery when a joint is stuck at limit (move arm back manually):
   1. Release brake on the stuck joint(s):
@@ -141,4 +140,4 @@ def brake(
 
 
 if __name__ == "__main__":
-    tyro.extras.subcommand_cli_from_dict({"disable": disable, "brake": brake})
+    tyro.cli(brake)

@@ -18,9 +18,9 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import tyro
-from dexcontrol.config.vega import get_vega_config
 from loguru import logger
 
+from dexcontrol.core.config import get_robot_config
 from dexcontrol.robot import Robot
 
 try:
@@ -83,13 +83,13 @@ def print_scan_info(
 
 def main() -> None:
     """Initializes the robot, retrieves LIDAR data, and displays it."""
-    configs = get_vega_config()
-    configs.enable_sensor("lidar")
+    configs = get_robot_config()
+    configs.enable_sensor("lidar_2d_front")
     robot = Robot(configs=configs)
 
     try:
         # Get LIDAR scan data
-        scan_data = robot.sensors.lidar.get_obs()
+        scan_data = robot.sensors.lidar_2d_front.get_obs()
         if not scan_data:
             logger.error("Failed to retrieve LIDAR data.")
             return

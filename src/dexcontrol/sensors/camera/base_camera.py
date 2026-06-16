@@ -37,7 +37,14 @@ from dexcomm import Node
 from dexcomm.codecs import DepthImageCodec, RGBImageCodec
 from loguru import logger
 
-from dexcontrol.exceptions import ConfigurationError, ServiceUnavailableError
+from dexcontrol.core.shared_node import get_shared_node
+from dexcontrol.core.subscription_policy import (
+    SubscriptionPolicy,
+    SubscriptionPolicyManager,
+    SubscriptionPolicyMixin,
+)
+from dexcontrol.exceptions import ConfigurationError
+from dexcontrol.utils.comm_helper import query_json_service
 
 # RTC imports (optional for systems without hardware video support)
 try:
@@ -82,7 +89,7 @@ class SubscriberProtocol(Protocol):
         ...
 
 
-class StreamSubscriber:
+class StreamSubscriber(SubscriptionPolicyMixin):
     """Unified wrapper for camera stream subscribers.
 
     Provides a consistent interface for both Zenoh (reliable, compressed) and
@@ -138,6 +145,7 @@ class StreamSubscriber:
         self._frame_queue: Queue[np.ndarray] | None = None
         self._latest_frame: np.ndarray | None = None
         self._active = False
+        self._receive_count: int = 0
 
         # Validate and create subscriber based on transport type
         if transport == TransportType.ZENOH:
@@ -148,6 +156,15 @@ class StreamSubscriber:
             )
         else:
             raise ValueError(f"Unknown transport type: {transport}")
+
+        # Initialize policy manager for lifecycle control
+        if self._subscriber is not None:
+            self._policy_manager = SubscriptionPolicyManager(
+                self._subscriber, name=stream_name
+            )
+        else:
+            self._policy_manager = None
+        self._subcomponents: dict[str, object] = {}
 
     def _create_zenoh_subscriber(
         self,
@@ -239,6 +256,35 @@ class StreamSubscriber:
                 f"VideoSubscriber will auto-query from publisher"
             )
 
+        # Auto-detect codec from publisher metadata if not specified
+        if codec.lower() == "auto":
+            try:
+                import json as _json
+                import os
+
+                from dexcomm._core import ServiceClient
+
+                robot_name = os.environ.get("ROBOT_NAME", "")
+                meta_topic = f"{robot_name}/{rtc_channel}/metadata" if robot_name else f"{rtc_channel}/metadata"
+                client = ServiceClient(meta_topic)
+                raw = client.call(b"")
+                metadata = _json.loads(raw)
+                codec = metadata.get("codec", "vp8")
+                if width is None:
+                    width = metadata.get("width")
+                if height is None:
+                    height = metadata.get("height")
+                logger.info(
+                    f"Auto-detected codec '{codec}' for '{self.stream_name}' "
+                    f"(resolution: {width}x{height})"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to auto-detect codec for '{self.stream_name}': {e}. "
+                    f"Defaulting to vp8"
+                )
+                codec = "vp8"
+
         # Map codec string to VideoCodec enum
         codec_map = {
             "vp8": VideoCodec.VP8,
@@ -266,6 +312,7 @@ class StreamSubscriber:
                 self._frame_queue.put_nowait(frame)
                 self._latest_frame = frame
                 self._active = True
+                self._receive_count += 1
             except Exception as e:
                 logger.debug(
                     f"Error queuing frame for '{self.stream_name}': {e}"
@@ -301,7 +348,8 @@ class StreamSubscriber:
         """Get the most recent frame from the stream.
 
         Returns:
-            For Zenoh: dict with 'data' (np.ndarray) and 'timestamp' (int) keys.
+            For Zenoh: dict with 'data' (np.ndarray), 'timestamp_ns' (int),
+                and 'receive_time_ns' (int, wall-clock when received) keys.
             For RTC: np.ndarray directly (RGB format, uint8).
             None if no data is available.
 
@@ -316,8 +364,12 @@ class StreamSubscriber:
                 # For RTC, return latest from queue
                 return self._latest_frame.copy() if self._latest_frame is not None else None
             else:
-                # For Zenoh, use subscriber's get_latest
-                return self._subscriber.get_latest()
+                # For Zenoh, unwrap Message to get decoded dict with receive_time_ns
+                if self._policy_manager is not None:
+                    msg = self._policy_manager.get_latest_managed()
+                    return msg.data if msg is not None else None
+                msg = self._subscriber.get_latest()
+                return msg.data if msg is not None else None
         except Exception as e:
             logger.debug(f"Error getting latest from '{self.stream_name}': {e}")
             return None
@@ -342,7 +394,7 @@ class StreamSubscriber:
                 return self._active
             else:
                 # For Zenoh, check if we have any data
-                return self._subscriber.get_latest() is not None
+                return self._subscriber.get_latest() is not None  # Message or None
         except Exception as e:
             logger.debug(f"Error checking activity for '{self.stream_name}': {e}")
             return False
@@ -410,7 +462,7 @@ class StreamSubscriber:
         self._active = False
 
 
-class BaseCameraSensor(ABC):
+class BaseCameraSensor(SubscriptionPolicyMixin, ABC):
     """Abstract base class for camera sensors.
 
     Provides common functionality for managing camera streams with both Zenoh
@@ -441,14 +493,14 @@ class BaseCameraSensor(ABC):
         self._name = name
         self._node: Node | None = None
         self._streams: dict[str, StreamSubscriber] = {}
+        self._camera_info_cache: dict[str, Any] | None = None
 
-        # Create DexComm Node for Zenoh subscribers
-        try:
-            self._node = Node(name=f"{name}_camera_node")
-            logger.info(f"Created DexComm Node for camera '{name}'")
-        except Exception as e:
-            logger.error(f"Failed to create DexComm Node for '{name}': {e}")
-            raise ServiceUnavailableError(f"Node creation failed: {e}") from e
+        # Use shared DexComm Node for Zenoh subscribers
+        self._node = get_shared_node()
+
+        # Camera has no own subscriber — delegates to stream subcomponents
+        self._policy_manager = None
+        self._subcomponents: dict[str, object] = {}
 
     def _create_stream(
         self,
@@ -505,12 +557,28 @@ class BaseCameraSensor(ABC):
                 rtc_channel=config.get("rtc_channel"),
                 width=config.get("width"),
                 height=config.get("height"),
-                codec=config.get("codec", "h264"),
+                codec=config.get("codec", "auto"),
                 buffer_size=config.get("buffer_size", 1),
             )
         except Exception as e:
             logger.error(f"Failed to create stream '{stream_name}': {e}")
             return None
+
+    def _register_stream_subcomponents(self) -> None:
+        """Register stream subscribers as subcomponents for policy control."""
+        self._subcomponents = {
+            name: stream
+            for name, stream in self._streams.items()
+            if stream is not None
+        }
+
+    def set_subscription_policy(
+        self, policy: SubscriptionPolicy, recursive: bool = True
+    ) -> None:
+        """Set subscription policy for all camera streams."""
+        for stream in self._streams.values():
+            if stream is not None and hasattr(stream, "set_subscription_policy"):
+                stream.set_subscription_policy(policy, recursive=recursive)
 
     @abstractmethod
     def get_obs(self, **kwargs) -> Any:
@@ -547,15 +615,7 @@ class BaseCameraSensor(ABC):
                         f"Error shutting down stream '{stream_name}': {e}"
                     )
 
-        # Shutdown node
-        if self._node is not None:
-            try:
-                self._node.shutdown()
-                logger.debug(f"Shutdown DexComm Node for '{self._name}'")
-            except Exception as e:
-                logger.error(f"Error shutting down DexComm Node: {e}")
-            finally:
-                self._node = None
+        # Shared node is shut down by Robot.shutdown() via shutdown_shared_node()
 
     def is_active(self) -> bool:
         """Check if any camera stream is actively receiving data.
@@ -629,6 +689,44 @@ class BaseCameraSensor(ABC):
                 time.sleep(0.1)
             logger.warning(f"'{self._name}': Timeout waiting for any stream")
             return False
+
+    def _setup_camera_info_service(self) -> None:
+        """Query camera info from dexsensor on startup (best-effort)."""
+        service_topic = f"sensors/{self._name}/info"
+        result = self._query_camera_info(service_topic)
+        if result is not None:
+            logger.info(f"Camera info retrieved for '{self._name}' from '{service_topic}'")
+        else:
+            logger.debug(f"Camera info service not available for '{self._name}' at '{service_topic}'")
+
+    def _query_camera_info(self, service_topic: str) -> dict[str, Any] | None:
+        """Query camera info from dexsensor service.
+
+        Args:
+            service_topic: Service topic to query (will be namespace-resolved).
+
+        Returns:
+            Camera information dictionary or None if query fails.
+        """
+        info_dict = query_json_service(service_topic, timeout=2.0, max_retries=1)
+        if info_dict is not None:
+            self._camera_info_cache = info_dict
+        return info_dict
+
+    def get_camera_info(self, force_refresh: bool = False) -> dict[str, Any] | None:
+        """Get camera information from dexsensor.
+
+        Args:
+            force_refresh: If True, forces a new query to the service.
+                          If False, returns cached info if available.
+
+        Returns:
+            Dictionary containing camera information, or None if unavailable.
+        """
+        if force_refresh or self._camera_info_cache is None:
+            service_topic = f"sensors/{self._name}/info"
+            return self._query_camera_info(service_topic)
+        return self._camera_info_cache
 
     @property
     def name(self) -> str:
