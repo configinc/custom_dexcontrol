@@ -37,9 +37,10 @@ from loguru import logger
 from rich.console import Console
 from rich.table import Table
 
-from dexcontrol.core.component import RobotComponent
+from dexcontrol.core.component import ManagedJointComponent, RobotComponent
 from dexcontrol.core.config import get_component_config_map
 from dexcontrol.core.robot_query_interface import RobotQueryInterface
+from dexcontrol.core.subscription_policy import IdleMonitor, SubscriptionPolicyManager
 from dexcontrol.exceptions import (
     ComponentError,
     ComponentNotAvailableError,
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
     from dexcontrol.core.hand import Hand
     from dexcontrol.core.head import Head
     from dexcontrol.core.misc import Battery, EStop, Heartbeat
+    from dexcontrol.core.motion_handle import MultiMotionHandle
     from dexcontrol.core.torso import Torso
 
 
@@ -169,7 +171,7 @@ class Robot(RobotQueryInterface):
 
         Raises:
             ComponentError: If any critical component fails to become active within timeout.
-            ValueError: If configs cannot be loaded.
+            ConfigurationError: If the communication config is not set or the file is unreadable.
         """
         self._shutdown_called: bool = False
         self._components: list[RobotComponent] = []
@@ -221,7 +223,11 @@ class Robot(RobotQueryInterface):
         return self._robot_name
 
     def __enter__(self) -> "Robot":
-        """Enter context manager."""
+        """Enter context manager.
+
+        Returns:
+            The Robot instance for use in the ``with`` block.
+        """
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -289,7 +295,8 @@ class Robot(RobotQueryInterface):
             raise ConfigurationError(
                 f"{COMM_CFG_PATH_ENV_VAR} environment variable not set.\n"
                 f"  Set it with: export {COMM_CFG_PATH_ENV_VAR}="
-                f"~/.dexmate/comm/zenoh/<robot>/zenoh_peer_config.json5"
+                f"~/.dexmate/comm/zenoh/<config>.dzcfg\n"
+                f"  (also supports legacy .json5 config files)"
             )
 
         # Check config file exists and is readable
@@ -328,6 +335,7 @@ class Robot(RobotQueryInterface):
             ("robot components", self._initialize_robot_components),
             ("component activation", self._wait_for_components),
             ("sensors", self._initialize_sensors),
+            ("subscription policies", self._initialize_subscription_policies),
             ("default state", self._set_default_state),
         ]
 
@@ -400,7 +408,20 @@ class Robot(RobotQueryInterface):
         logger.info(f"Initialized: {', '.join(initialized_components)}")
 
     def _set_default_state(self) -> None:
-        """Set default control modes for robot components."""
+        """Set default control modes for robot components.
+
+        Skips all control setup if the software E-Stop is active.
+        """
+        if estop := getattr(self, "estop", None):
+            if estop.is_software_estop_enabled():
+                logger.warning(
+                    "Software E-Stop is active. "
+                    "Head cannot be enabled and control features are not functional. "
+                    "Call robot.estop.deactivate() to release the software E-Stop "
+                    "before controlling the robot."
+                )
+                return
+
         for arm in ["left_arm", "right_arm"]:
             if component := getattr(self, arm, None):
                 component.set_modes(["position"] * 7)
@@ -595,6 +616,38 @@ class Robot(RobotQueryInterface):
 
             raise ValueError(error_msg)
 
+    def _validate_managed_targets(self, joint_pos: dict[str, Any]) -> None:
+        """Validate that every target component is motion-plugin-managed.
+
+        ``set_joint_target`` is only supported by ``ManagedJointComponent``
+        subclasses (Arm, Head, Torso). Calling it on Hand, DexGripper, or
+        chassis joints is a programming error. This check surfaces it at
+        the entry point with a clear list of supported components.
+
+        Args:
+            joint_pos: Joint position dictionary to validate.
+
+        Raises:
+            ValueError: If any target component does not support
+                ``set_joint_target``.
+        """
+        component_map = self.get_controllable_component_map()
+        invalid = sorted(
+            n
+            for n in joint_pos
+            if not isinstance(component_map.get(n), ManagedJointComponent)
+        )
+        if invalid:
+            supported = sorted(
+                n
+                for n, c in component_map.items()
+                if isinstance(c, ManagedJointComponent)
+            )
+            raise ValueError(
+                f"set_joint_target() does not support {invalid}. "
+                f"Supported components: {supported}."
+            )
+
     def _check_version_compatibility(self) -> None:
         """Check version compatibility between client and server.
 
@@ -608,6 +661,141 @@ class Robot(RobotQueryInterface):
             check_version_compatibility(version_info)
         except Exception as e:
             logger.warning(f"Version compatibility check failed: {e}")
+
+    def _initialize_subscription_policies(self) -> None:
+        """Initialize subscription policies and start the idle monitor.
+
+        Idle timers are reset for all managers before the monitor starts so
+        that subscribers created early during construction are not immediately
+        paused due to elapsed time during the init sequence.
+        """
+        self._idle_monitor = IdleMonitor(check_interval=1.0)
+
+        # Register all component policy managers with the idle monitor
+        for component in self._components:
+            self._register_policy_managers(component)
+
+        # Register sensor policy managers
+        if hasattr(self, "sensors"):
+            for sensor in self.sensors._sensors:
+                self._register_policy_managers(sensor)
+
+        # Reset idle timers so construction time doesn't count as inactivity.
+        # Without this, subscribers created early in init may already exceed
+        # the idle timeout and get paused on the monitor's first sweep.
+        for mgr in self._idle_monitor._managers:
+            mgr.touch()
+
+        self._idle_monitor.start()
+        logger.info("Subscription lifecycle idle monitor started")
+
+    def _register_policy_managers(self, obj: Any) -> None:
+        """Recursively register all policy managers found on obj and its subcomponents."""
+        # Register the object's own policy manager
+        if hasattr(obj, "_policy_manager") and obj._policy_manager is not None:
+            self._idle_monitor.register(obj._policy_manager)
+
+        # If the object itself IS a SubscriptionPolicyManager, register it directly
+        if isinstance(obj, SubscriptionPolicyManager):
+            self._idle_monitor.register(obj)
+
+        # Recurse into subcomponents
+        if hasattr(obj, "_subcomponents"):
+            for sub in obj._subcomponents.values():
+                self._register_policy_managers(sub)
+
+    def set_idle_timeout(self, seconds: float) -> None:
+        """Set global idle timeout for all auto-policy components.
+
+        Args:
+            seconds: Seconds of inactivity before auto-pause.
+        """
+        self._idle_monitor.set_global_idle_timeout(seconds)
+
+    def set_subscription_policy(self, policy: str, recursive: bool = True) -> None:
+        """Set subscription policy for all non-safety components.
+
+        Skips components with always_on default (Battery, EStop).
+
+        Args:
+            policy: New policy string ("always_on", "auto", "manual", "always_off").
+            recursive: If True, propagate to subcomponents.
+        """
+        _SAFETY_COMPONENTS = {"battery", "estop"}
+        component_names = self._robot_info.get_component_list()
+
+        for name in component_names:
+            if name in _SAFETY_COMPONENTS:
+                continue
+            component = getattr(self, name, None)
+            if component is not None and hasattr(component, "set_subscription_policy"):
+                component.set_subscription_policy(policy, recursive=recursive)
+
+        # Apply to sensors
+        if hasattr(self, "sensors"):
+            for sensor in self.sensors._sensors:
+                if hasattr(sensor, "set_subscription_policy"):
+                    sensor.set_subscription_policy(policy, recursive=recursive)
+
+    def get_subscription_status(self) -> dict[str, dict[str, Any]]:
+        """Get subscription status for all components.
+
+        Returns:
+            Dict mapping component names to their policy status including
+            policy, is_paused, and idle_timeout.
+        """
+        status: dict[str, dict[str, Any]] = {}
+        component_names = self._robot_info.get_component_list()
+
+        for name in component_names:
+            component = getattr(self, name, None)
+            if component is None:
+                continue
+            if (
+                hasattr(component, "_policy_manager")
+                and component._policy_manager is not None
+            ):
+                status[name] = {
+                    "policy": component._policy_manager.get_policy().value,
+                    "is_paused": component._policy_manager.is_paused(),
+                    "idle_timeout": component._policy_manager._idle_timeout,
+                }
+            if hasattr(component, "_subcomponents"):
+                for sub_name, sub in component._subcomponents.items():
+                    key = f"{name}.{sub_name}"
+                    if hasattr(sub, "get_policy"):
+                        status[key] = {
+                            "policy": sub.get_policy().value,
+                            "is_paused": sub.is_paused(),
+                            "idle_timeout": sub._idle_timeout,
+                        }
+                    elif (
+                        hasattr(sub, "_policy_manager")
+                        and sub._policy_manager is not None
+                    ):
+                        status[key] = {
+                            "policy": sub._policy_manager.get_policy().value,
+                            "is_paused": sub._policy_manager.is_paused(),
+                            "idle_timeout": sub._policy_manager._idle_timeout,
+                        }
+
+        # Add sensor status
+        if hasattr(self, "sensors"):
+            for sensor in self.sensors._sensors:
+                sensor_name = getattr(
+                    sensor, "_name", getattr(sensor, "name", "unknown")
+                )
+                if (
+                    hasattr(sensor, "_policy_manager")
+                    and sensor._policy_manager is not None
+                ):
+                    status[f"sensor.{sensor_name}"] = {
+                        "policy": sensor._policy_manager.get_policy().value,
+                        "is_paused": sensor._policy_manager.is_paused(),
+                        "idle_timeout": sensor._policy_manager._idle_timeout,
+                    }
+
+        return status
 
     def shutdown(self) -> None:
         """Cleans up and closes all component connections.
@@ -623,34 +811,37 @@ class Robot(RobotQueryInterface):
         logger.info("Shutting down robot components...")
         self._shutdown_called = True
 
+        # Stop idle monitor
+        if hasattr(self, "_idle_monitor"):
+            self._idle_monitor.stop()
+
         try:
             _active_robots.discard(self)
         except Exception:  # pylint: disable=broad-except
             pass
 
-        # First, stop all components that have stop methods to halt ongoing operations
+        # Phase 1: Graceful stop — halt operations on every component that
+        # supports it. An idle-paused *subscriber* only means state reads went
+        # quiet; the component may still be holding torque at its last commanded
+        # target, so it must be stopped regardless of pause state.
         for component in self._components:
             if component is not None:
                 try:
-                    if hasattr(component, "stop"):
-                        method = getattr(component, "stop")
-                        if callable(method):
-                            method()
+                    if hasattr(component, "stop") and callable(component.stop):
+                        component.stop()
                 except Exception as e:  # pylint: disable=broad-except
                     logger.error(
                         f"Error stopping component {component.__class__.__name__}: {e}"
                     )
 
-        # Shutdown sensors first (they may have background threads)
+        # Phase 2: Release resources — shutdown ALL components and sensors.
         try:
             if hasattr(self, "sensors") and self.sensors is not None:
                 self.sensors.shutdown()
-                # Give time for sensor subscribers to undeclare cleanly
                 time.sleep(0.2)
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f"Error shutting down sensors: {e}")
 
-        # Shutdown components in reverse order
         for component in reversed(self._components):
             if component is not None:
                 try:
@@ -663,7 +854,12 @@ class Robot(RobotQueryInterface):
         # Brief delay to allow component shutdown to complete
         time.sleep(0.1)
 
-        # Cleanup DexComm shared session
+        # Release this instance's hold on the shared node (only fully shut down
+        # once the last owner releases it) and clean up the DexComm session.
+        try:
+            self._release_shared_node()
+        except Exception as e:
+            logger.debug(f"Shared node cleanup note: {e}")
         try:
             cleanup_session()
         except Exception as e:
@@ -730,9 +926,9 @@ class Robot(RobotQueryInterface):
             relative: Whether positions are relative to current position.
 
         Raises:
-            ValueError: If trajectory is empty or components have different trajectory lengths.
-            ValueError: If trajectory format is invalid.
-            DexcontrolError: If trajectory execution fails.
+            ValueError: If trajectory is empty.
+            DexcontrolError: If trajectory execution fails (including invalid format or
+                inconsistent trajectory lengths).
         """
         if not trajectory:
             raise ValueError("Trajectory must be a non-empty dictionary")
@@ -751,6 +947,112 @@ class Robot(RobotQueryInterface):
 
         except Exception as e:
             raise DexcontrolError(f"Failed to execute trajectory: {e}") from e
+
+    @property
+    def default_velocity_scale(self) -> float | None:
+        """Robot-wide default velocity scale for ``set_joint_target``.
+
+        Setting this fans out to every ``ManagedJointComponent`` (arms, head,
+        torso). Any subsequent ``set_joint_target`` call without an explicit
+        ``scale`` uses this value.
+        ``None`` clears the default on all such components, restoring deferral
+        to the motion plugin's own default.
+
+        **Carve-outs:** Cartesian-velocity components like ``Chassis`` are
+        not affected — ``chassis.set_velocity()`` has its own internal
+        clamping (``max_lin_vel`` / ``max_ang_vel``) and ignores this scale.
+
+        **Reads:** return the common value across joint-motion components, or
+        ``None`` if no default is set anywhere. If components disagree (e.g.,
+        a per-component setter was called after the robot-wide fanout), the
+        getter returns ``None`` *and* logs a warning so the inconsistency is
+        visible. Inspect individual ``component.default_velocity_scale`` if
+        you need to distinguish "unset" from "mismatched".
+        """
+        scales = {
+            c.default_velocity_scale
+            for c in self._components
+            if isinstance(c, ManagedJointComponent)
+        }
+        if len(scales) <= 1:
+            # Empty set or single value (including {None}) — return it.
+            return next(iter(scales), None)
+        # Multiple distinct values — components disagree. Surface this so it
+        # doesn't silently look like "nothing is set".
+        logger.warning(
+            "Robot.default_velocity_scale: joint-motion components disagree "
+            f"({scales}); returning None. Set the property again to re-sync, "
+            "or read per-component values directly."
+        )
+        return None
+
+    @default_velocity_scale.setter
+    def default_velocity_scale(self, value: float | None) -> None:
+        for c in self._components:
+            if isinstance(c, ManagedJointComponent):
+                c.default_velocity_scale = value
+
+    def set_joint_target(
+        self,
+        joint_pos: dict[str, list[float] | np.ndarray],
+        scale: float | dict[str, list[float] | np.ndarray] | None = None,
+        relative: bool = False,
+        tracked: bool = False,
+    ) -> "MultiMotionHandle | None":
+        """Send target positions to the motion plugin for multiple components.
+
+        This is the robot-level equivalent of
+        ``ManagedJointComponent.set_joint_target()``.  It loops over the provided
+        components, delegates to each component's ``set_joint_target()``, and
+        optionally returns a combined handle for tracking completion.
+
+        Args:
+            joint_pos: Dictionary mapping component names to target joint
+                positions.  Values can be lists of floats or numpy arrays.
+            scale: Per-joint motion scale in (0, 1]. Controls how fast the
+                motion executes as a fraction of the hardware velocity ceiling.
+                A scalar is broadcast to all joints of all components. A dict
+                maps component names to per-component scales (scalar or array).
+                None uses the plugin's default (typically 0.5).
+            relative: If True, positions are offsets from current joint
+                positions.
+            tracked: If True, returns a ``MultiMotionHandle`` that can be
+                waited on.  If False (default), fire-and-forget.
+
+        Returns:
+            MultiMotionHandle if tracked=True, None if tracked=False.
+
+        Raises:
+            DexcontrolError: If any component name is invalid or the call
+                fails.
+        """
+        from dexcontrol.core.motion_handle import MultiMotionHandle
+
+        try:
+            component_map = self.get_controllable_component_map()
+            self.validate_component_names(joint_pos)
+            self._validate_managed_targets(joint_pos)
+
+            handles: dict[str, Any] = {}
+            for name, pos in joint_pos.items():
+                component = component_map[name]
+                comp_scale = scale
+                if isinstance(scale, dict):
+                    comp_scale = scale.get(name)
+                handle = component.set_joint_target(
+                    pos, scale=comp_scale, relative=relative, tracked=tracked
+                )
+                if handle is not None:
+                    handles[name] = handle
+
+            if tracked and handles:
+                return MultiMotionHandle(handles)
+            return None
+
+        except DexcontrolError:
+            raise
+        except Exception as e:
+            raise DexcontrolError(f"Failed to set target positions: {e}") from e
 
     def set_joint_pos(
         self,
@@ -775,8 +1077,7 @@ class Robot(RobotQueryInterface):
             exit_on_reach_kwargs: Optional parameters for exit when the joint positions are reached.
 
         Raises:
-            ValueError: If any component name is invalid.
-            DexcontrolError: If joint position setting fails.
+            DexcontrolError: If joint position setting fails (including invalid component names).
         """
         if wait_kwargs is None:
             wait_kwargs = {}
@@ -876,11 +1177,14 @@ class Robot(RobotQueryInterface):
 
         Args:
             joint_pos: Joint positions to compensate.
-            robot: Robot instance.
             part: Component name for which joint positions are being compensated.
+                Valid values are ``"left_arm"``, ``"right_arm"``, and ``"head"``.
 
         Returns:
-            Compensated joint positions.
+            Compensated joint positions as a new numpy array.
+
+        Raises:
+            ValueError: If ``part`` is not one of the supported body parts.
         """
         if self.robot_model == "vega_1u":
             torso_pitch = np.pi / 2
@@ -907,7 +1211,15 @@ class Robot(RobotQueryInterface):
         return adjusted_positions
 
     def have_hand(self, side: Literal["left", "right"]) -> bool:
-        """Check if the robot has a hand."""
+        """Check if the robot has a hand on the given side.
+
+        Args:
+            side: Which side to check. Must be ``"left"`` or ``"right"``.
+
+        Returns:
+            True if a hand of a known type is detected on that side, False if
+            the hand type is ``HandType.UNKNOWN``.
+        """
         return self._hand_types.get(side) != HandType.UNKNOWN
 
     def _process_trajectory(
