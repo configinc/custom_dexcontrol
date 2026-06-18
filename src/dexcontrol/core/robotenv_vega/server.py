@@ -755,6 +755,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         LOGGER.info("Reset[%s]: gripper done (%.2fs), starting reset motion", self.arm_side, time.time() - t0)
         self._robot.reset_filter_state()
 
+        # First waypoint: keep current j1~j6, move only j0 to middle reset position.
+        # This reduces abrupt multi-joint displacement when starting from an arbitrary pose.
+        current_joint_pos = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
+        first_reset_joints = current_joint_pos.copy()
+        first_reset_joints[0] = self.reset_middle_joints[0]
+        LOGGER.info("Reset[%s]: moving to first waypoint (j0=%.4f)", self.arm_side, first_reset_joints[0])
+        self._move_incremental(first_reset_joints)
+        LOGGER.info("Reset[%s]: first waypoint reached (%.2fs)", self.arm_side, time.time() - t0)
+
         # Move to middle waypoint to avoid collisions.
         middle_f64 = np.asarray(self.reset_middle_joints, dtype=np.float64)
         LOGGER.info("Reset[%s]: moving to middle waypoint", self.arm_side)
