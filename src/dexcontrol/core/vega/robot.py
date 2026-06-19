@@ -478,9 +478,47 @@ class VegaRobot:
             return np.asarray(self._gripper_joint_pos, dtype=np.float64).copy()
 
     def _hand_dof(self) -> int:
-        """End-effector DoF: 6 for the F5D6 multi-finger hand, else 1 (scalar gripper)."""
+        """End-effector DoF: 6 for the F5D6 multi-finger hand, else 1 (scalar gripper).
+
+        Prefer the component's joint_name list (cached from RobotInfo at init):
+        it is the reliable DoF for dexbot Hand components (6 for F5D6) and does
+        NOT depend on live hardware state — unlike get_joint_pos(), which raises
+        ServiceUnavailableError until the first Zenoh state arrives and would
+        make this fall back to 1 mid-run, rejecting the 6-DoF hand action.
+        Scalar grippers (Robotiq/SR) have no joint_name, so fall back to
+        get_joint_pos().size for them.
+        """
         if self.hand is None:
+            if not getattr(self, "_hand_dof_logged", False):
+                _logger.info("[HandDoF] self.hand is None -> dof=1 (gripper_type=%s)", self.gripper_type)
+                self._hand_dof_logged = True
             return 1
+        # --- diagnostics: log what we actually see, once ---
+        _names = None
+        _gjp_repr = None
+        try:
+            _names = getattr(self.hand, "joint_name", None)
+        except Exception as e:
+            _names = f"<joint_name raised {e!r}>"
+        try:
+            _g = np.asarray(self.hand.get_joint_pos())
+            _gjp_repr = f"shape={_g.shape} size={_g.size}"
+        except Exception as e:
+            _gjp_repr = f"<get_joint_pos raised {e!r}>"
+        if not getattr(self, "_hand_dof_logged", False):
+            _logger.info(
+                "[HandDoF] hand_type=%s gripper_type=%s joint_name=%s get_joint_pos(%s)",
+                type(self.hand).__name__, self.gripper_type, _names, _gjp_repr,
+            )
+            self._hand_dof_logged = True
+        # --- end diagnostics ---
+        try:
+            names = getattr(self.hand, "joint_name", None)
+            if names:
+                n = len(names)
+                return n if n > 1 else 1
+        except Exception:
+            pass
         try:
             n = int(np.asarray(self.hand.get_joint_pos()).size)
         except Exception:
@@ -497,6 +535,13 @@ class VegaRobot:
         hand_dof = self._hand_dof()
         expected = arm_dof + hand_dof
         n = action.shape[0]
+        _hn = getattr(self.hand, "joint_name", None) if self.hand is not None else None
+        _logger.info(
+            "[Split] space=%s len=%d arm_dof=%d hand_dof=%d expected=%d hand=%s joint_name_len=%s",
+            action_space, n, arm_dof, hand_dof, expected,
+            type(self.hand).__name__ if self.hand is not None else None,
+            (len(_hn) if _hn else _hn),
+        )
         if n == expected:
             return action[:arm_dof], action[arm_dof:expected]
         # Back-compat: a scalar-gripper command (arm_dof+1) is always allowed.

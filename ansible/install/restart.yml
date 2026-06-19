@@ -6,8 +6,12 @@
     dexmate_ip: "192.168.5.20"
     dexmate_user: "dexmate"
     dexmate_pass: "hello-dex"
-    # Gripper selection: "robotiq" (default, ttyUSB) or "sr_gripper" (EtherCAT).
-    # Override with `-e gripper_type=sr_gripper` on the ansible-playbook CLI.
+    # Gripper selection:
+    #   "robotiq"    -> 2-finger over ttyUSB
+    #   "sr_gripper" -> 2-finger over EtherCAT
+    #   "vega_hand"  -> F5D6 5-finger hand (no serial/EtherCAT; auto-detected by
+    #                   the server, which is launched with --gripper-type default)
+    # Override with `-e gripper_type=vega_hand` on the ansible-playbook CLI.
     gripper_type: "robotiq"
 
   tasks:
@@ -99,6 +103,14 @@
         right_gripper_port: "{{ sr_iface_list.stdout_lines | last }}"
       when: gripper_type == "sr_gripper"
 
+    # vega_hand (F5D6) has no serial/EtherCAT port — the server auto-detects it.
+    # Provide empty defaults so the start/debug tasks don't reference undefined vars.
+    - name: Default empty gripper ports for vega_hand
+      set_fact:
+        left_gripper_port: ""
+        right_gripper_port: ""
+      when: gripper_type == "vega_hand"
+
     - name: Display gripper port assignments
       debug:
         msg: "[{{ gripper_type }}] Left: {{ left_gripper_port }} / Right: {{ right_gripper_port }}"
@@ -116,9 +128,20 @@
     # The gripper-port flag differs between gripper types:
     #   robotiq      -> --robotiq-comport <ttyUSB>
     #   sr_gripper   -> --gripper-iface   <EtherCAT iface>
+    # Map the ansible gripper_type to the server's --gripper-type and port flag.
+    #   robotiq    -> --gripper-type robotiq     --robotiq-comport <ttyUSB>
+    #   sr_gripper -> --gripper-type sr_gripper   --gripper-iface   <iface>
+    #   vega_hand  -> --gripper-type vega_hand    (no port flag; F5D6 hand component)
+    # vega_hand is passed through explicitly: VegaRobot treats any non-robotiq,
+    # non-sr_gripper value as the built-in F5D6 hand component (robot.py else branch),
+    # so the 5-finger hand is selected without relying on server-side auto-detection.
     - name: Resolve gripper-port CLI flag
       set_fact:
-        gripper_port_flag: "{{ '--gripper-iface' if gripper_type == 'sr_gripper' else '--robotiq-comport' }}"
+        gripper_port_flag: >-
+          {{ '' if gripper_type == 'vega_hand'
+             else '--gripper-iface' if gripper_type == 'sr_gripper'
+             else '--robotiq-comport' }}
+        server_gripper_type: "{{ gripper_type }}"
 
     - name: Start robot-server tmux session on dexmate (left + right arm)
       shell: |
@@ -127,7 +150,7 @@
         tmux send-keys -t robot-server "conda activate robot && python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
             --arm-side left \
             --grpc-port 50061 \
-            --gripper-type {{ gripper_type }} \
+            --gripper-type {{ server_gripper_type }} \
             {{ gripper_port_flag }} {{ left_gripper_port }} \
             --use-velocity-feedforward \
             --ema-alpha 0.7" C-m
@@ -136,7 +159,7 @@
         tmux send-keys -t robot-server.1 "conda activate robot && python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
             --arm-side right \
             --grpc-port 50063 \
-            --gripper-type {{ gripper_type }} \
+            --gripper-type {{ server_gripper_type }} \
             {{ gripper_port_flag }} {{ right_gripper_port }} \
             --use-velocity-feedforward \
             --ema-alpha 0.7" C-m

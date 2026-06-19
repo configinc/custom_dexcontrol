@@ -104,6 +104,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         if hand_type is not None and gripper_type == "default":
             gripper_type = hand_type
 
+        # The F5D6 5-finger hand is an integrated robot component (left_hand/
+        # right_hand) that only exists in the *_f5d6 robot config. Robotiq/SR
+        # grippers are separate hardware (serial/EtherCAT) and use the base
+        # vega_1 config. So when the hand is vega_hand, ensure robot_model
+        # carries the f5d6 variant — otherwise has_component('left_hand') is
+        # False, the hand is never wired up, and the hand DoF collapses to 1.
+        if gripper_type == "vega_hand" and "f5d6" not in robot_model:
+            robot_model = f"{robot_model}_f5d6"
+        LOGGER.info("[ModelResolve] gripper_type=%s -> robot_model=%s", gripper_type, robot_model)
+
         self.robot_model = robot_model
         self.arm_side = arm_side
         self.gripper_type = gripper_type
