@@ -145,7 +145,7 @@ class VegaRobot:
         max_jerk: float = 0.25,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
-        head_init_pos: list[float] | np.ndarray | None = None,
+        head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
