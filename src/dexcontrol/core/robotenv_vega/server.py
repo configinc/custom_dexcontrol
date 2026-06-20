@@ -95,6 +95,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         rot_sensitivity: float = 1.0,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
+        head_init_pos: list[float] | None = None,  # default: [yaw=2.0, pitch=0.0, roll=-0.3]
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -103,6 +104,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             raise TypeError(f"Unexpected keyword arguments: {unexpected}")
         if hand_type is not None and gripper_type == "default":
             gripper_type = hand_type
+        if head_init_pos is None:
+            head_init_pos = [2.0, 0.0, -0.3]
 
         self.robot_model = robot_model
         self.arm_side = arm_side
@@ -136,6 +139,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             max_jerk=max_jerk,
             vel_ratio=vel_ratio,
             vel_damp_thresh=vel_damp_thresh,
+            head_init_pos=head_init_pos,
         )
         self._robot.launch_robot()
 
@@ -919,6 +923,7 @@ def serve(
     rot_sensitivity: float = 1.0,
     vel_ratio: float = 1.0,
     vel_damp_thresh: float = 0.05,
+    head_init_pos: list[float] | None = None,
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
@@ -963,6 +968,7 @@ def serve(
         rot_sensitivity=rot_sensitivity,
         vel_ratio=vel_ratio,
         vel_damp_thresh=vel_damp_thresh,
+        head_init_pos=head_init_pos,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -1192,6 +1198,15 @@ def main() -> None:
         default=0.05,
         help="Velocity damping threshold in rad. Velocity tapers linearly from 0→100%% over this distance to target (default: 0.05). Smaller=less damping, larger=more damping.",
     )
+    parser.add_argument(
+        "--head-init-pos",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("YAW", "PITCH", "ROLL"),
+        help="Head joint init position in radians [yaw, pitch, roll]. "
+             "If omitted, the predefined 'home' pose is used.",
+    )
     args = parser.parse_args()
 
     # Both flags feed the same downstream "where is the gripper attached"
@@ -1229,6 +1244,7 @@ def main() -> None:
         rot_sensitivity=args.rot_sensitivity,
         vel_ratio=args.vel_ratio,
         vel_damp_thresh=args.vel_damp_thresh,
+        head_init_pos=args.head_init_pos,
     )
 
 
