@@ -33,6 +33,53 @@ for _path in (_DEXCONTROL_SRC, _DEXCONTROL_TELEOP):
 from dexcontrol import Robot
 from dexbot_utils.configs import get_robot_config
 
+
+class _RobotWithCustomHeadPose(Robot):
+    """Robot subclass that skips the default head home pose on startup.
+
+    HEAD_INIT_POS is set by VegaRobot before instantiation so that
+    _set_default_state() moves the head directly to the desired position
+    instead of the predefined "home" pose.
+    """
+
+    HEAD_INIT_POS: np.ndarray | None = None
+
+    def _set_default_state(self) -> None:
+        import logging as _logging
+        from dexcontrol.core.component import RobotComponent  # noqa: F401
+
+        _log = _logging.getLogger("robotenv_vega")
+
+        # Replicate the estop guard from the original implementation.
+        estop = getattr(self, "estop", None)
+        if estop is not None and estop.is_software_estop_enabled():
+            _log.warning(
+                "Software E-Stop is active. "
+                "Head cannot be enabled and control features are not functional. "
+                "Call robot.estop.deactivate() to release the software E-Stop "
+                "before controlling the robot."
+            )
+            return
+
+        for arm in ["left_arm", "right_arm"]:
+            component = getattr(self, arm, None)
+            if component is not None:
+                component.set_modes(["position"] * 7)
+
+        head = getattr(self, "head", None)
+        if head is not None:
+            head.set_mode("enable")
+            if self.HEAD_INIT_POS is not None:
+                init_pos = self.compensate_torso_pitch(
+                    np.asarray(self.HEAD_INIT_POS, dtype=np.float32).copy(), "head"
+                )
+                _log.info("Setting custom head init pos: %s", init_pos.tolist())
+            else:
+                init_pos = self.compensate_torso_pitch(
+                    head.get_predefined_pose("home"), "head"
+                )
+            head.set_joint_pos(init_pos)
+
 _base_arm_teleop_error = None
 try:
     from base_arm_teleop import BaseIKController
@@ -98,6 +145,7 @@ class VegaRobot:
         max_jerk: float = 0.25,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
+        head_init_pos: list[float] | np.ndarray | None = None,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -127,7 +175,10 @@ class VegaRobot:
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
 
         configs = get_robot_config(robot_model)
-        self.robot = Robot(configs=configs)
+        _RobotWithCustomHeadPose.HEAD_INIT_POS = (
+            np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None
+        )
+        self.robot = _RobotWithCustomHeadPose(configs=configs)
         self.arm = getattr(self.robot, f"{arm_side}_arm")
         hand_component = f"{arm_side}_hand"
 
