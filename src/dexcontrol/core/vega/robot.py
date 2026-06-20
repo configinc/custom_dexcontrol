@@ -37,20 +37,20 @@ from dexbot_utils.configs import get_robot_config
 class _RobotWithCustomHeadPose(Robot):
     """Robot subclass that skips the default head home pose on startup.
 
-    HEAD_INIT_POS is set by VegaRobot before instantiation so that
-    _set_default_state() moves the head directly to the desired position
-    instead of the predefined "home" pose.
+    head_init_pos is passed via __init__ so that _set_default_state() moves
+    the head directly to the desired position instead of the predefined "home"
+    pose.
     """
 
-    HEAD_INIT_POS: np.ndarray | None = None
+    def __init__(self, *args, head_init_pos: np.ndarray | None = None, **kwargs):
+        self._head_init_pos = head_init_pos
+        super().__init__(*args, **kwargs)
 
     def _set_default_state(self) -> None:
         import logging as _logging
-        from dexcontrol.core.component import RobotComponent  # noqa: F401
 
         _log = _logging.getLogger("robotenv_vega")
 
-        # Replicate the estop guard from the original implementation.
         estop = getattr(self, "estop", None)
         if estop is not None and estop.is_software_estop_enabled():
             _log.warning(
@@ -69,9 +69,9 @@ class _RobotWithCustomHeadPose(Robot):
         head = getattr(self, "head", None)
         if head is not None:
             head.set_mode("enable")
-            if self.HEAD_INIT_POS is not None:
+            if self._head_init_pos is not None:
                 init_pos = self.compensate_torso_pitch(
-                    np.asarray(self.HEAD_INIT_POS, dtype=np.float32).copy(), "head"
+                    np.asarray(self._head_init_pos, dtype=np.float32).copy(), "head"
                 )
                 _log.info("Setting custom head init pos: %s", init_pos.tolist())
             else:
@@ -175,10 +175,10 @@ class VegaRobot:
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
 
         configs = get_robot_config(robot_model)
-        _RobotWithCustomHeadPose.HEAD_INIT_POS = (
-            np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None
+        self.robot = _RobotWithCustomHeadPose(
+            configs=configs,
+            head_init_pos=np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None,
         )
-        self.robot = _RobotWithCustomHeadPose(configs=configs)
         self.arm = getattr(self.robot, f"{arm_side}_arm")
         hand_component = f"{arm_side}_hand"
 

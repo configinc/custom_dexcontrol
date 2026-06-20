@@ -1205,7 +1205,7 @@ def main() -> None:
         default=None,
         metavar=("YAW", "PITCH", "ROLL"),
         help="Head joint init position in radians [yaw, pitch, roll]. "
-             "If omitted, the predefined 'home' pose is used.",
+             "If omitted, defaults to [2.0, 0.0, -0.3].",
     )
     args = parser.parse_args()
 
