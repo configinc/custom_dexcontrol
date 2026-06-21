@@ -212,6 +212,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         LOGGER.info("Moving to init position on startup (arm=%s)", arm_side)
         self._execute_reset_sequence(self.reset_joints)
 
+        # Fetch and cache robot firmware version once at startup.
+        self._firmware_version = self._fetch_firmware_version()
+
     # ------------------------------------------------------------------
     # Background control loop (for interpolation upsampling)
     # ------------------------------------------------------------------
@@ -643,7 +646,29 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             branch=info.get("branch", "unknown"),
             commit=info.get("commit", "unknown"),
             tag=info.get("tag", "unknown"),
+            firmware_version=self._firmware_version,
         )
+
+    def _fetch_firmware_version(self) -> str:
+        """Query robot firmware version via Zenoh at server startup and return it.
+
+        Calls Robot.get_version_info() which queries the hardware's JSON version
+        endpoint over DexComm/Zenoh. The result is cached in self._firmware_version
+        and served through GetVersion RPC for the lifetime of the server process.
+
+        Returns empty string if the firmware version cannot be retrieved.
+        """
+        try:
+            version_info = self._robot.robot.get_version_info(show=False)
+            firmware_version = version_info.get("version", "")
+            if firmware_version:
+                LOGGER.info("Robot firmware version: %s", firmware_version)
+            else:
+                LOGGER.warning("Firmware version field missing in version_info response")
+            return firmware_version
+        except Exception as exc:
+            LOGGER.warning("Failed to fetch robot firmware version: %s", exc)
+            return ""
 
     def _load_version_info(self) -> dict[str, str]:
         """Load version info from version_info.txt."""
