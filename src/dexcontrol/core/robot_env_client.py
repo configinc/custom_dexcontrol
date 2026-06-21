@@ -400,6 +400,18 @@ class RobotEnvClient:
             # Build robot_state dict matching FrankaRobot.get_robot_state() format
             robot_state = self._build_robot_state(obs)
 
+            # Parse cartesian_position pair from server action_info:
+            #   action_cartesian_position : pre_cart + motor_delta  (action이 목표하는 위치)
+            #   state_cartesian_position  : pre-action FK           (명령 직전 실제 위치)
+            # 두 값은 동일한 step t의 pre_action_state 기반이므로 직접 비교 가능.
+            action_cartesian_position = []
+            state_cartesian_position = []
+            for key, val in response.action_info.items():
+                if key == "cartesian_position" and val.HasField("float_array"):
+                    action_cartesian_position = list(val.float_array.values)
+                elif key == "state.cartesian_position" and val.HasField("float_array"):
+                    state_cartesian_position = list(val.float_array.values)
+
             # Build action_info matching FrankaRobot.update_command() return
             # policy_runner reads action_info["robot_state"] at line 1651
             action_info = {
@@ -407,6 +419,9 @@ class RobotEnvClient:
                 "joint_position": obs.get("joint_positions", []),
                 "cartesian_position": obs.get("cartesian_position", []),
                 "gripper_position": obs.get("gripper_position", 0),
+                # Cartesian comparison pair (same step t, pre-action 기준)
+                "action_cartesian_position": action_cartesian_position,
+                "state_cartesian_position": state_cartesian_position,
             }
 
             return action_info
