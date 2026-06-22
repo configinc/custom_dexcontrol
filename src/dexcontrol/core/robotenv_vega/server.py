@@ -13,6 +13,8 @@ from concurrent import futures
 from pathlib import Path
 from typing import Any, Optional
 
+import csv
+
 import grpc
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -210,9 +212,28 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         else:
             LOGGER.info("Smoothing: disabled (alpha=0.0)")
 
+        # Action log CSV (action_space, curr_cart, tgt_cart per step)
+        _ts = time.strftime("%Y%m%d_%H%M%S")
+        self._action_log_path = Path(f"action_log_{arm_side}_{_ts}.csv")
+        self._action_log_file = self._action_log_path.open("w", newline="")
+        self._action_log_writer = csv.writer(self._action_log_file)
+        self._action_log_writer.writerow([
+            "step", "action_space",
+            "curr_x", "curr_y", "curr_z", "curr_rx", "curr_ry", "curr_rz",
+            "tgt_x",  "tgt_y",  "tgt_z",  "tgt_rx",  "tgt_ry",  "tgt_rz",
+        ])
+        self._action_log_step = 0
+        LOGGER.info("Action log CSV: %s", self._action_log_path.resolve())
+
         # Move to init position on startup.
         LOGGER.info("Moving to init position on startup (arm=%s)", arm_side)
         self._execute_reset_sequence(self.reset_joints)
+
+    def __del__(self):
+        try:
+            self._action_log_file.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Background control loop (for interpolation upsampling)
@@ -561,6 +582,21 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     max_rot_delta=self._max_rot_delta,
                 )
                 action_info = self._action_dict_to_proto(action_dict)
+                curr_cart = (action_dict.get("robot_state") or {}).get("cartesian_position", [])
+                tgt_cart = action_dict.get("cartesian_position", [])
+                LOGGER.info(
+                    "[action_dict] space=%s | curr_cart=%s | tgt_cart=%s",
+                    action_space,
+                    [round(v, 4) for v in curr_cart],
+                    [round(v, 4) for v in tgt_cart],
+                )
+                self._action_log_step += 1
+                self._action_log_writer.writerow([
+                    self._action_log_step,
+                    action_space,
+                    *curr_cart,
+                    *tgt_cart,
+                ])
             except Exception as exc:
                 LOGGER.warning("create_action_dict failed, sending empty action_info: %s", exc)
                 action_info = {}
