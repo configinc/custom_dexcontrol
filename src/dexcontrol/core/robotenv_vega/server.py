@@ -53,8 +53,8 @@ def _to_proto_value(val: Any) -> robotenv_pb2.Value:
 # Per-arm init (home) and reset middle waypoints.
 # Left→Right mirroring: [-v0, -v1, -v2, v3, -v4, -v5, -v6]
 _INIT_JOINTS = {
-    "left":  np.array([-1.4234,  1.3524,  2.8707, -1.981,   0.6751, -0.1662,  0.068]),
-    "right": np.array([ 1.4234, -1.3524, -2.8707, -1.981,  -0.1515,  0.1662, -0.068]),
+    "left":  np.array([1.2691, 0.5979, 0.0775, -1.6467, -0.6208, -0.7753, -0.3100]),
+    "right": np.array([-1.2691, -0.5979, -0.0775, -1.6467, 0.6208, 0.7753, 0.3100]),
 }
 _RESET_MIDDLE_JOINTS = {
     "left":  np.array([-2.7592,   1.3579,   2.8643, -1.8855, 0.6702, -0.1592, 0.2338]),
