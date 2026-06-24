@@ -1,9 +1,30 @@
+# Python bytecode
 __pycache__/
 *.py[cod]
-*.egg-info/
-.eggs/
+*$py.class
+
+# Packaging / build
 dist/
 build/
+*.egg-info/
+.eggs/
+*.egg
+
+# Native extensions (로컬 빌드 시)
 *.so
+
+# Secrets & local env
 .env
+.env.local
+.env.*.local
+
+# Virtual environments
 .venv/
+venv/
+env/
+
+# Testing / linting caches
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/

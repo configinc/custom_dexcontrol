@@ -610,7 +610,7 @@ class VegaRobot:
 
         # Log per-joint delta from IK (before smoothing/clipping)
         ik_delta = target_joint_pos - current_joint_pos
-        if np.max(np.abs(ik_delta)) > 0.01:
+        if np.max(np.abs(ik_delta)) > 0.005:
             _logger.info(
                 "[IKDelta] space=%s delta=%s cart_in=%s",
                 action_space,
@@ -1123,7 +1123,7 @@ class VegaRobot:
             target_joint_pos = self.ik_controller.move_delta_cartesian(
                 delta_xyz=np.asarray(delta_xyz, dtype=np.float64),
                 delta_rpy=np.asarray(delta_rpy, dtype=np.float64),
-                arm_side=self.arm_side,
+                side=self.arm_side,
             )
         except Exception as exc:
             raise IKFailedError(f"IK solver failed: {exc}") from exc

@@ -153,7 +153,16 @@
             --gripper-type {{ server_gripper_type }} \
             {{ gripper_port_flag }} {{ left_gripper_port }} \
             --use-velocity-feedforward \
-            --ema-alpha 0.7" C-m
+            --interpolation-method linear \
+            --interpolation-history 3 \
+            --control-loop-hz 200 \
+            --filter-type none \
+            --vel-smoothing-alpha 1.0 \
+            --hw-correction-alpha 0.5 \
+            --max-delta-scale 3.0 \
+            --max-jerk 0 \
+            --rot-sensitivity 2.0 \
+            --vel-ratio 1.0" C-m
         sleep 0.5
         tmux split-window -v -t robot-server
         tmux send-keys -t robot-server.1 "conda activate robot && python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
@@ -162,7 +171,16 @@
             --gripper-type {{ server_gripper_type }} \
             {{ gripper_port_flag }} {{ right_gripper_port }} \
             --use-velocity-feedforward \
-            --ema-alpha 0.7" C-m
+            --interpolation-method linear \
+            --interpolation-history 3 \
+            --control-loop-hz 200 \
+            --filter-type none \
+            --vel-smoothing-alpha 1.0 \
+            --hw-correction-alpha 0.5 \
+            --max-delta-scale 3.0 \
+            --max-jerk 0 \
+            --rot-sensitivity 2.0 \
+            --vel-ratio 1.0" C-m
         ENDSSH
       args:
         executable: /bin/bash

@@ -2,6 +2,94 @@
 
 All notable changes to this project will be documented in this file.
 
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.5.0] - 2026-06-03
+
+### Added
+
+- **`set_joint_target()` — goal-oriented motion via the server-side motion plugin.** New API on `ManagedJointComponent` (arms, head, torso) and `Robot`. Publishes a target to `motion/target/{component}`; the plugin handles trajectory smoothing, gravity compensation, and collision avoidance. `tracked=True` returns a `MotionHandle` for plugin-signaled convergence, cancellation, and async waiting. `scale` is a per-joint motion scale in `(0, 1]` of the hardware velocity ceiling. Complements `set_joint_pos()` (direct streaming control), does not replace it.
+- **`MotionHandle` / `MultiMotionHandle`** (`dexcontrol.core.motion_handle`): async handles for tracked motion with `.wait(timeout)`, `.cancel()`, `.state`, `.is_done`, `.message`. `Robot.set_joint_target({...}, tracked=True)` returns a `MultiMotionHandle` for coordinating motions across components.
+- **`default_velocity_scale`** on `ManagedJointComponent` and `Robot`. Client-side default applied to `set_joint_target` when `scale` is omitted; Robot-level setter fans out to every managed component.
+- **Lazy motion-target publisher.** `_target_publisher` is created on first `set_joint_target` call (`_ensure_target_publisher`), so callers who stick to `set_joint_pos` pay no extra zenoh registration. `_publish_target` mirrors `_publish_control`'s `_policy_manager.touch()` discipline so streaming targets don't auto-idle the state subscriber.
+- **`MotionPluginManaged` marker mixin** (`dexcontrol.core.component.MotionPluginManaged`) for components that talk to the motion plugin. Provides a shared `_new_motion_id_counter()` helper. Enables `isinstance(c, MotionPluginManaged)` for fan-out discovery of all motion-plugin clients. Currently used by `ManagedJointComponent` only; `Chassis` does **not** mix it in (see "Chassis stays on the local-IK control path" below).
+- **`ManagedJointComponent` class** (`dexcontrol.core.component.ManagedJointComponent`), inheriting `RobotJointComponent` + `MotionPluginManaged`. Owns all motion-plugin integration: `set_joint_target`, `go_to_pose`, target publisher, status subscriber, motion handles, per-component `default_velocity_scale`.
+- **`Torso.set_idle_mode(enabled)` / `get_idle_mode()`.** Toggle the torso's server-side auto-idle behaviour. When disabled, the three torso joints stay actively held at the last commanded position instead of powering down between commands — useful for endurance tests and continuous control loops. Backed by the firmware-side idle-mode service.
+
+### Changed
+
+- **`go_to_pose(pose_name, timeout=None)`** uses `set_joint_target(tracked=True)` and plugin-signaled convergence instead of client-side polling. Signature changed from `(pose_name, wait_time=3.0, exit_on_reach=…)`.
+- **`set_joint_pos(joint_pos, wait_time>0)` emits a DeprecationWarning** recommending `set_joint_target()`. `wait_time` will be removed in 0.6.0.
+- **Component hierarchy: `_supports_motion_target` flag replaced with explicit type hierarchy.** Motion-plugin integration moved from a flag-gated path on `RobotJointComponent` to the new `ManagedJointComponent` subclass. `Arm`, `Head`, and `Torso` now inherit from `ManagedJointComponent`; `Hand`, `HandF5D6`, `HandF5D6V2`, `DexGripper`, `ChassisSteer`, and `ChassisDrive` inherit from `RobotJointComponent` directly and no longer expose `set_joint_target`/`go_to_pose`. Released APIs (`set_joint_pos`, `set_joint_pos_vel`, `open_hand`, `close_hand`, `set_velocity`, all queries) are unchanged.
+- **`Robot.set_joint_target` validates targets up front.** Passing a non-managed component (e.g., `left_hand`, `chassis`) raises `DexcontrolError` wrapping `ValueError("set_joint_target() does not support [...]. Supported components: [...].")` at the entry point, instead of a downstream `AttributeError`/`NotImplementedError` from the per-component dispatch loop.
+- **`Robot.default_velocity_scale` filter narrowed** from `isinstance(c, RobotJointComponent)` to `isinstance(c, ManagedJointComponent)` (both getter and setter). Same effective component set (arms/head/torso); strictly correct typing.
+- **Unified `side` parameter name across examples.** Renamed `arm_side` to `side` in all example scripts so every example uses the same input name. CLI flag for tyro-driven scripts is now `--side` instead of `--arm-side`.
+- **Software E-Stop service wire encoding switched to `DictDataCodec`** (request encoder and response decoder), replacing the prior `SoftwareEstopCodec` request / undecoded response. `EStop.activate()` / `deactivate()` / `toggle()` now read a `{"success", "message"}` response dict. **This is a breaking wire change — the robot-server must run a matching motion/E-Stop service build.**
+
+### Removed (breaking)
+
+- **`Chassis.set_velocity` parameters `sequential_steering`, `steering_wait_time`, `steering_tolerance`** (present on `main` pre-0.5.0). Sequential steering is always on; the tolerance (0.05 rad) and inter-step wait (1.0 s) are now internal constants. Callers passing these kwargs will get `TypeError`.
+- **`Chassis.set_velocity` `**_legacy_kwargs` swallow.** Unknown kwargs now raise `TypeError` instead of being silently dropped.
+- **`Arm.set_mode(mode)` deprecated alias.** Removed in favour of `Arm.set_modes([...])`. Callers of `set_mode` will get `AttributeError`.
+
+### Dependencies
+
+- Requires `dexcomm >= 0.6.0, < 0.7.0` (raised from `>= 0.4.18`).
+
+## [0.4.9] - 2026-03-29
+
+### Added
+
+- **Auto-detect RTC video codec from publisher** — Camera subscribers query the publisher's metadata to determine the video codec (VP8, H264, H265) instead of hardcoding. Falls back to VP8 if detection fails.
+- **Live FPS display in camera examples** — `get_head_zed_x_mini_data.py` shows per-stream FPS in both matplotlib titles and terminal output. Works for both Zenoh and RTC transport.
+
+### Dependencies
+
+- Requires **dexcomm-video >= 0.4.18** for RTC video streaming support.
+
+## [0.4.7] - 2026-03-13
+
+### Added
+
+- **End-to-end latency measurement in camera examples.** `get_head_zed_x_mini_data.py` and `get_wrist_zed_x_one_data.py` now display live publish-to-receive latency per stream (current, rolling avg/min/max) in the terminal and on matplotlib plot titles. Uses `receive_time_ns` from dexcomm v0.4.6 for accurate measurement.
+
+### Changed
+
+- **Camera info service moved to `BaseCameraSensor`.** `_setup_camera_info_service()`, `_query_camera_info()`, and `get_camera_info()` are now in the base class, eliminating duplicate implementations in `ZedCameraSensor` and `ZedXOneCameraSensor`.
+
+### Dependencies
+
+- Requires **dexcomm >= 0.4.6** for `receive_time_ns` in decoded subscriber messages.
+
+## [0.4.6] - 2026-03-10
+
+### Fixed
+
+- `AttributeError: 'EStopConfig' object has no attribute 'monitoring'`. Fix this issue by enforcing new dexbot-utils version.
+
+
+### Dependencies
+
+- Requires `dexcomm >= 0.4.4` (raised from 0.4.2) `dexbot-utils >= 0.4.4` (raised from 0.4.3).
+
+## [0.4.5] - 2026-03-08
+
+### Added
+
+- **E-Stop boot warning.** `Robot.__init__` now checks whether the software E-Stop is active immediately after initialization. If it is, all control setup is skipped and a clear warning is logged telling the user to call `robot.estop.deactivate()` before controlling the robot. The monitor thread now uses the `monitoring` field instead of `enabled` to control the run loop, matching the actual attribute set during initialization. The previous field name caused the thread to exit immediately on start.
+
+- **Connection benchmark.** New `connect_robot_latency.py` benchmark for measuring robot connection latency.
+
+### Breaking Changes
+
+- **`Robot.__init__` skips control setup when software E-Stop is active.** Previously, all control modes were initialized unconditionally. Now, if the software E-Stop is enabled at startup, control setup is skipped entirely and a warning is logged. Code that initializes `Robot()` while the software E-Stop is active will no longer have functional control — call `robot.estop.deactivate()` first.
+
+### Fixed
+
+- **Outdated docstrings across the core public API.** Audited and corrected all public method docstrings in `component.py`, `robot_query_interface.py`, `robot.py`, `arm.py`, `hand.py`, `head.py`, `chassis.py`, `torso.py`, and `misc.py`. Fixed wrong default values, phantom parameters, inaccurate return type descriptions, and exceptions listed that were never actually raised. Added missing docstrings where none existed.
+- **LIDAR data retrieval no longer calls the removed `get_vega_config`.** `get_lidar_data` was calling `get_vega_config`, which no longer exists. Updated to use `get_robot_config` instead.
+
 ## [0.4.4] - 2026-02-18
 
 ### Fixed
