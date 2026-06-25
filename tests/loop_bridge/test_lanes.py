@@ -7,6 +7,16 @@ import threading
 from conftest import FakeApplier, FakeConsumer, make_observation
 
 from loop_bridge import lanes
+from loop_bridge.action_consumer import ArmActionBackend
+
+
+def _backends():
+    return [
+        ArmActionBackend(
+            FakeApplier(), arm_prefix="robot0", action_space="target_cartesian_delta"
+        )
+    ]
+
 
 # --- run_obs_poll ---
 
@@ -98,15 +108,12 @@ def _patch_consumer(monkeypatch, *, fault=None, frames=None):
     return consumers
 
 
-def _lane_kwargs(stop, applier, register, sleep):
+def _lane_kwargs(stop, register, sleep):
     return dict(
         stop_event=stop,
         loop_addr="loop:1",
-        applier=applier,
+        backends=_backends(),
         action_source_id="robot-action",
-        arm_prefix="robot0",
-        action_space="target_cartesian_delta",
-        gripper_action_space="",
         register_consumer=register,
         sleep=sleep,
     )
@@ -118,9 +125,7 @@ def test_action_lane_returns_immediately_when_stop_already_set(monkeypatch):
     stop.set()
     registered = []
 
-    lanes.run_action_lane(
-        **_lane_kwargs(stop, FakeApplier(), registered.append, lambda _: None)
-    )
+    lanes.run_action_lane(**_lane_kwargs(stop, registered.append, lambda _: None))
 
     assert consumers == []  # never connected
     assert registered == []
@@ -131,9 +136,7 @@ def test_action_lane_retries_on_fault_then_stops(monkeypatch):
     stop = threading.Event()
     registered = []
 
-    lanes.run_action_lane(
-        **_lane_kwargs(stop, FakeApplier(), registered.append, lambda _: stop.set())
-    )
+    lanes.run_action_lane(**_lane_kwargs(stop, registered.append, lambda _: stop.set()))
 
     assert len(consumers) == 1
     assert consumers[0].subscribed == ["robot-action"]
@@ -149,7 +152,7 @@ def test_action_lane_bails_before_run_if_stop_lands_during_setup(monkeypatch):
         if consumer is not None:
             stop.set()
 
-    lanes.run_action_lane(**_lane_kwargs(stop, FakeApplier(), register, lambda _: None))
+    lanes.run_action_lane(**_lane_kwargs(stop, register, lambda _: None))
 
     assert len(consumers) == 1
     assert consumers[0].subscribed == []  # run()/subscribe never reached

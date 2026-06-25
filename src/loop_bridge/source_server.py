@@ -1,18 +1,22 @@
 """In-process Source Bus bridge for the Vega RobotEnv server.
 
-``LoopVegaRobotEnvService`` subclasses the upstream ``VegaRobotEnvService`` and
-adds the bus I/O edge, in the same process that owns the hardware:
+Presents a Vega robot — single- or bimanual — as ONE ``robot-obs`` source and
+executes ONE ``robot-action``, per the robot source contract. The combiner of the
+arms lives here (the robot's own repo), not in loop or loop-sdk.
 
-  - an **obs poll** thread reads the current observation on a clock and publishes
-    it as ``robot-obs`` (Vega only computes obs when ``_create_observation`` runs,
-    so the bridge must drive it — otherwise teleop, which needs obs to compute a
-    delta, and obs, driven by the resulting action's Step, deadlock at startup);
-  - an **action lane** thread subscribes ``robot-action`` and replays each frame
-    through the service's own ``Step`` (so the teleop-gain / frame-transform /
-    interpolation logic is reused verbatim, not duplicated).
+- ``_LockedStepService`` is the upstream ``VegaRobotEnvService`` plus one fix: it
+  serializes ``Step`` on the upstream ``_cmd_lock`` (upstream guards only ``Reset``),
+  so the bus action lane can't race a Reset on shared IK/filter state.
+- ``LoopBridge`` owns the bus I/O over N arm services that share ONE hardware unit:
+  an **obs poll** reads each arm's ``_create_observation`` on a clock and publishes
+  the merged ``robot-obs`` (Vega computes obs only inside ``_create_observation``, so
+  the bridge must drive it — else teleop, which needs obs for a delta, and obs,
+  driven by the resulting action's Step, deadlock at startup); an **action lane**
+  subscribes ``robot-action`` and dispatches each arm's slice to that arm's Step.
 
-The robot's control/hardware logic and the RobotEnv gRPC contract are untouched;
-living in our own module keeps the upstream-sync merge surface minimal.
+A bimanual robot is ONE ``Robot`` exposing both arms; two per-arm services share it
+(``VegaRobot``/service take an injected ``robot``), reusing every per-arm
+gain/frame/interpolation/IK/gripper path verbatim.
 """
 
 from __future__ import annotations
@@ -23,14 +27,14 @@ import signal
 import sys
 import threading
 from concurrent import futures
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import grpc
 
 # Importing the upstream module runs its sys.path setup and binds the proto stubs.
 from dexcontrol.core.robotenv_vega import server as _vega_server
 from loop_bridge import lanes
-from loop_bridge.action_consumer import RobotActionConsumer
+from loop_bridge.action_consumer import ArmActionBackend, RobotActionConsumer
 from loop_bridge.obs_publisher import (
     DEFAULT_OBS_SOURCE_ID,
     DEFAULT_OBS_SOURCE_NAME,
@@ -48,9 +52,9 @@ DEFAULT_OBS_HZ = 20.0
 class _BusStepContext:
     """Minimal gRPC servicer context for replaying Step in-process.
 
-    The Vega ``Step`` happy path never touches the context; we still record an
-    ``abort`` (which it would only call on a hard error) and surface it as an
-    exception so the action lane skips that tick rather than silently succeeding.
+    The Vega ``Step`` happy path never touches the context; we still surface an
+    ``abort`` (which it would only call on a hard error) as an exception so the
+    action lane skips that tick rather than silently succeeding.
     """
 
     def set_code(self, code: Any) -> None:
@@ -64,9 +68,9 @@ class _BusStepContext:
 
 
 class _StepApplier:
-    """Adapts the service's ``Step`` to the action consumer's ``step(...)`` seam."""
+    """Adapts one arm service's ``Step`` to the action consumer's ``step(...)`` seam."""
 
-    def __init__(self, service: "LoopVegaRobotEnvService") -> None:
+    def __init__(self, service: Any) -> None:
         self._service = service
 
     def step(
@@ -78,9 +82,9 @@ class _StepApplier:
             gripper_action_space=gripper_action_space,
         )
         response = self._service.Step(request, _BusStepContext())
-        # Step swallows hardware faults into a non-SUCCESS StepResponse.status
-        # rather than raising, so the action lane would otherwise treat a stalled
-        # command (joint limit, IK failure, comms) as success. Surface it.
+        # Step swallows hardware faults into a non-SUCCESS StepResponse.status rather
+        # than raising, so the action lane would otherwise treat a stalled command
+        # (joint limit, IK failure, comms) as success. Surface it.
         status = getattr(response, "status", "") or ""
         if status and status != "SUCCESS":
             LOGGER.warning(
@@ -90,41 +94,52 @@ class _StepApplier:
             )
 
 
-class LoopVegaRobotEnvService(_vega_server.VegaRobotEnvService):
-    """Vega RobotEnv server that also streams ``robot-obs`` and executes ``robot-action``."""
+class _LockedStepService(_vega_server.VegaRobotEnvService):
+    """``VegaRobotEnvService`` whose ``Step`` is serialized on the upstream ``_cmd_lock``.
+
+    Upstream takes ``_cmd_lock`` only in ``Reset`` — safe when Step had a single
+    caller. The bus action lane is a second concurrent Step source, so without this
+    an action-lane Step can race a Reset (or another Step) on shared IK / filter
+    state and command a real arm a corrupted pose. ``Step`` never takes the lock
+    itself, so this cannot self-deadlock.
+    """
+
+    def Step(self, request, context):
+        with self._cmd_lock:
+            return super().Step(request, context)
+
+
+class LoopBridge:
+    """Bus I/O (one robot-obs + one robot-action) over N arm services sharing a robot."""
 
     def __init__(
         self,
+        arm_services: Sequence[tuple[str, Any]],
         *,
         loop_addr: str,
         obs_source_id: str = DEFAULT_OBS_SOURCE_ID,
         obs_source_name: str = DEFAULT_OBS_SOURCE_NAME,
-        arm_prefix: str = DEFAULT_ARM_PREFIX,
         action_source_id: str = DEFAULT_ACTION_SOURCE_ID,
         action_space: str = DEFAULT_ACTION_SPACE,
         gripper_action_space: str = "",
         obs_hz: float = DEFAULT_OBS_HZ,
         enable_action: bool = True,
-        **service_kwargs: Any,
     ) -> None:
         if obs_hz <= 0:
             raise ValueError(f"obs_hz must be > 0, got {obs_hz}")
+        if not arm_services:
+            raise ValueError("at least one (arm_prefix, service) is required")
+        self._arm_services = tuple(arm_services)
+        arm_prefixes = [arm_prefix for arm_prefix, _ in self._arm_services]
+        if len(set(arm_prefixes)) != len(arm_prefixes):
+            raise ValueError(f"duplicate arm prefixes: {arm_prefixes}")
 
-        # Connect the publisher BEFORE launching the robot so the obs lane (started
-        # after the hardware is up) always has a live publisher. Tear it down if
-        # the hardware launch fails.
         self._obs_publisher = RobotObsPublisher.connect(
             loop_addr=loop_addr,
             source_id=obs_source_id,
             name=obs_source_name,
-            arm_prefix=arm_prefix,
+            arm_prefixes=arm_prefixes,
         )
-        try:
-            super().__init__(**service_kwargs)
-        except BaseException:
-            self._obs_publisher.close()
-            raise
-
         self._lane_stop = threading.Event()
         self._action_consumer: Optional[RobotActionConsumer] = None
         self._consumer_lock = threading.Lock()
@@ -134,7 +149,7 @@ class LoopVegaRobotEnvService(_vega_server.VegaRobotEnvService):
             target=lanes.run_obs_poll,
             kwargs=dict(
                 stop_event=self._lane_stop,
-                read_observation=self._create_observation,
+                read_observation=self._read_observations,
                 publish=self._obs_publisher.publish,
                 period_s=1.0 / obs_hz,
             ),
@@ -145,16 +160,22 @@ class LoopVegaRobotEnvService(_vega_server.VegaRobotEnvService):
         self._threads.append(obs_thread)
 
         if enable_action:
+            backends = [
+                ArmActionBackend(
+                    _StepApplier(service),
+                    arm_prefix=arm_prefix,
+                    action_space=action_space,
+                    gripper_action_space=gripper_action_space,
+                )
+                for arm_prefix, service in self._arm_services
+            ]
             action_thread = threading.Thread(
                 target=lanes.run_action_lane,
                 kwargs=dict(
                     stop_event=self._lane_stop,
                     loop_addr=loop_addr,
-                    applier=_StepApplier(self),
+                    backends=backends,
                     action_source_id=action_source_id,
-                    arm_prefix=arm_prefix,
-                    action_space=action_space,
-                    gripper_action_space=gripper_action_space,
                     register_consumer=self._register_consumer,
                 ),
                 name="robot-action-lane",
@@ -166,7 +187,7 @@ class LoopVegaRobotEnvService(_vega_server.VegaRobotEnvService):
         LOGGER.info(
             "loop bridge enabled: robot-obs %r (%s, %.1f Hz) -> %s%s",
             obs_source_id,
-            arm_prefix,
+            arm_prefixes,
             obs_hz,
             loop_addr,
             f"; robot-action {action_source_id!r} -> Step({action_space})"
@@ -174,36 +195,29 @@ class LoopVegaRobotEnvService(_vega_server.VegaRobotEnvService):
             else "",
         )
 
-    def Step(self, request, context):
-        """Serialize bus-action / gRPC Steps against Reset (and each other).
-
-        Upstream takes ``_cmd_lock`` only in ``Reset`` — safe when Step had a
-        single caller. The bus action lane is a second concurrent Step source, so
-        without this an action-lane Step can race a Reset (or another Step) on the
-        shared IK / smoothing-filter / motion-manager state and command a real arm
-        a corrupted pose. ``Step`` itself never takes the lock, so this cannot
-        self-deadlock.
-        """
-        with self._cmd_lock:
-            return super().Step(request, context)
+    def _read_observations(self) -> tuple[dict[str, Any], int]:
+        """Read every arm's observation in one tick (paired) → {prefix: obs}, timestamp."""
+        observations: dict[str, Any] = {}
+        timestamp_us: Optional[int] = None
+        for arm_prefix, service in self._arm_services:
+            observation, sample_ts = service._create_observation()
+            observations[arm_prefix] = observation
+            if timestamp_us is None:
+                timestamp_us = sample_ts
+        return observations, int(timestamp_us or 0)
 
     def _register_consumer(self, consumer: Optional[RobotActionConsumer]) -> None:
         with self._consumer_lock:
             self._action_consumer = consumer
 
-    def close_loop_bridge(self) -> None:
-        """Stop both lanes and close the publisher. Safe to call once.
-
-        Stops + joins the lane threads (so no Step/obs read is in flight) before
-        the caller closes the robot — call this BEFORE ``_robot.close()``.
-        """
+    def close(self) -> None:
+        """Stop both lanes and close the publisher (call BEFORE closing the robot)."""
         self._lane_stop.set()
-        # Cancel any in-flight subscribe so the action thread unwinds promptly.
         with self._consumer_lock:
             consumer = self._action_consumer
         if consumer is not None:
             with contextlib.suppress(Exception):
-                consumer.close()
+                consumer.close()  # cancel the in-flight subscribe so the lane unwinds
         for thread in self._threads:
             thread.join(timeout=5.0)
             if thread.is_alive():
@@ -211,6 +225,18 @@ class LoopVegaRobotEnvService(_vega_server.VegaRobotEnvService):
                     "lane thread %r did not stop within timeout", thread.name
                 )
         self._obs_publisher.close()
+
+
+def _install_signal_shutdown(cleanup) -> None:
+    def shutdown_handler(signum, frame):
+        del signum, frame
+        LOGGER.info("Shutting down Vega RobotEnv+Loop bridge")
+        with contextlib.suppress(Exception):
+            cleanup()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
 
 
 def serve_with_loop(
@@ -227,62 +253,115 @@ def serve_with_loop(
     enable_action: bool = True,
     **service_kwargs: Any,
 ) -> None:
-    """Start a Vega RobotEnv gRPC server that also bridges robot-obs / robot-action.
-
-    Mirrors the upstream ``server.serve()`` gRPC boilerplate (it hardcodes the
-    plain service class, so we cannot reuse it directly) and instantiates the
-    bus-bridging subclass instead. Extra keyword args are forwarded verbatim to
-    ``VegaRobotEnvService`` (arm_side, gripper_type, control_hz, ...).
-    """
+    """Single-arm: a RobotEnv gRPC server that also bridges one robot-obs/robot-action."""
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
 
-    service = LoopVegaRobotEnvService(
+    service = _LockedStepService(**service_kwargs)  # builds its own one-arm Robot
+    bridge = LoopBridge(
+        [(arm_prefix, service)],
         loop_addr=loop_addr,
         obs_source_id=obs_source_id,
         obs_source_name=obs_source_name,
-        arm_prefix=arm_prefix,
         action_source_id=action_source_id,
         action_space=action_space,
         gripper_action_space=gripper_action_space,
         obs_hz=obs_hz,
         enable_action=enable_action,
-        **service_kwargs,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     _vega_server.robotenv_pb2_grpc.add_RobotEnvServicer_to_server(service, server)
-
-    server_address = f"0.0.0.0:{grpc_port}"
-    server.add_insecure_port(server_address)
+    server.add_insecure_port(f"0.0.0.0:{grpc_port}")
     server.start()
     LOGGER.info(
-        "Vega RobotEnv+Loop server started on %s (robot-obs=%r, robot-action=%r)",
-        server_address,
+        "Vega RobotEnv+Loop server on 0.0.0.0:%d (robot-obs=%r)",
+        grpc_port,
         obs_source_id,
-        action_source_id if enable_action else None,
     )
 
-    def shutdown_handler(signum, frame):
-        del signum, frame
-        LOGGER.info("Shutting down Vega RobotEnv+Loop server")
-        # Stop the bus lanes FIRST (no Step / obs read can then be in flight),
-        # then the control loop, then close the robot — otherwise an action-lane
-        # Step could touch the arm after _robot.close() (use-after-close).
-        for teardown in (
-            service.close_loop_bridge,
-            service._stop_control_loop,
-            service._robot.close,
-        ):
-            try:
+    def cleanup() -> None:
+        # Lanes first (no Step/obs read in flight), then control loop, then robot.
+        bridge.close()
+        for teardown in (service._stop_control_loop, service._robot.close):
+            with contextlib.suppress(Exception):
                 teardown()
-            except Exception:
-                LOGGER.exception("teardown step failed")
         server.stop(grace=5)
-        sys.exit(0)
 
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
+    _install_signal_shutdown(cleanup)
     server.wait_for_termination()
+
+
+def serve_dual_arm(
+    *,
+    loop_addr: str,
+    arm_prefixes: tuple[str, str] = ("robot0", "robot1"),
+    obs_source_id: str = DEFAULT_OBS_SOURCE_ID,
+    obs_source_name: str = DEFAULT_OBS_SOURCE_NAME,
+    action_source_id: str = DEFAULT_ACTION_SOURCE_ID,
+    action_space: str = DEFAULT_ACTION_SPACE,
+    gripper_action_space: str = "",
+    obs_hz: float = DEFAULT_OBS_HZ,
+    enable_action: bool = True,
+    **service_kwargs: Any,
+) -> None:
+    """Bimanual: ONE Vega robot, both arms, presented as one robot-obs/robot-action.
+
+    Builds the left service (which constructs the one ``Robot`` with both arms), then
+    a right service that SHARES that Robot (injected), so both arms run over one
+    hardware connection. Each service keeps its own per-arm IK/filter/gripper.
+    """
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    left_prefix, right_prefix = arm_prefixes
+
+    # A serial gripper (robotiq/sr_gripper) is one COM port; both arms sharing it
+    # would corrupt gripper comms. Bimanual needs the built-in per-arm grippers
+    # (or per-arm comports, not yet wired) — fail fast rather than open it twice.
+    if service_kwargs.get("gripper_type", "default") in ("robotiq", "sr_gripper"):
+        raise ValueError(
+            f"dual-arm needs per-arm grippers; a shared serial gripper "
+            f"({service_kwargs.get('gripper_type')!r}) can't be opened by both arms"
+        )
+
+    left = _LockedStepService(arm_side="left", **service_kwargs)
+    shared_robot = left._robot.robot  # the one hardware unit (both arms) left built
+    right = _LockedStepService(arm_side="right", robot=shared_robot, **service_kwargs)
+
+    bridge = LoopBridge(
+        [(left_prefix, left), (right_prefix, right)],
+        loop_addr=loop_addr,
+        obs_source_id=obs_source_id,
+        obs_source_name=obs_source_name,
+        action_source_id=action_source_id,
+        action_space=action_space,
+        gripper_action_space=gripper_action_space,
+        obs_hz=obs_hz,
+        enable_action=enable_action,
+    )
+    LOGGER.info(
+        "Vega dual-arm bridge running: arms=%s robot-obs=%r",
+        list(arm_prefixes),
+        obs_source_id,
+    )
+
+    def cleanup() -> None:
+        # Lanes first (no Step/obs read in flight), then per-arm control loops, then
+        # close each VegaRobot — VegaRobot.close() stops that arm's gripper worker AND
+        # calls the shared Robot.shutdown() (idempotent, so the second call is a no-op
+        # but still stops the right arm's gripper). Using the raw shared_robot.close()
+        # would only release the comm node, leaving both arms energized + threads leaked.
+        bridge.close()
+        for service in (left, right):
+            with contextlib.suppress(Exception):
+                service._stop_control_loop()
+        for service in (left, right):
+            with contextlib.suppress(Exception):
+                service._robot.close()
+
+    _install_signal_shutdown(cleanup)
+    # No gRPC server here: actions arrive via the bus, obs leave via the bus. The
+    # bridge owns the lifetime; block until a shutdown signal.
+    threading.Event().wait()

@@ -25,6 +25,7 @@ from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 from loop_bridge.source_server import (
     DEFAULT_ACTION_SOURCE_ID,
     DEFAULT_OBS_HZ,
+    serve_dual_arm,
     serve_with_loop,
 )
 
@@ -74,6 +75,11 @@ def main() -> None:
         action="store_true",
         help="Publish robot-obs only; do not consume/execute robot-action",
     )
+    parser.add_argument(
+        "--dual-arm",
+        action="store_true",
+        help="Bimanual: drive BOTH arms of one Vega as one robot-obs (robot0+robot1)",
+    )
     # Common RobotEnv server options (forwarded to VegaRobotEnvService).
     parser.add_argument(
         "--grpc-port", type=int, default=50061, help="RobotEnv gRPC service port"
@@ -97,23 +103,35 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    serve_with_loop(
+    loop_kwargs = dict(
         loop_addr=args.loop_addr,
-        grpc_port=args.grpc_port,
         obs_source_id=args.obs_source_id,
         obs_source_name=args.obs_source_name,
-        arm_prefix=args.arm_prefix,
         action_source_id=args.action_source_id,
         action_space=args.action_space,
         gripper_action_space=args.gripper_action_space,
         obs_hz=args.obs_hz,
         enable_action=not args.no_action,
+    )
+    service_kwargs = dict(
         robot_model=args.robot_model,
-        arm_side=args.arm_side,
         gripper_type=args.gripper_type,
         robotiq_comport=args.robotiq_comport,
         control_hz=args.control_hz,
     )
+
+    if args.dual_arm:
+        # One Vega, both arms, one robot-obs (robot0+robot1). No gRPC server — the
+        # bridge owns the lifetime and actions arrive via the bus.
+        serve_dual_arm(**loop_kwargs, **service_kwargs)
+    else:
+        serve_with_loop(
+            grpc_port=args.grpc_port,
+            arm_prefix=args.arm_prefix,
+            arm_side=args.arm_side,
+            **loop_kwargs,
+            **service_kwargs,
+        )
 
 
 if __name__ == "__main__":

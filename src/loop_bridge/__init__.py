@@ -11,7 +11,7 @@ stack; the bus-only modules below do not, so they stay unit-testable on their ow
 
 from __future__ import annotations
 
-from loop_bridge.action_consumer import RobotActionConsumer
+from loop_bridge.action_consumer import ArmActionBackend, RobotActionConsumer
 from loop_bridge.obs_publisher import RobotObsPublisher
 from loop_bridge.robot_action import action_from_state
 from loop_bridge.robot_obs import (
@@ -21,6 +21,7 @@ from loop_bridge.robot_obs import (
 )
 
 __all__ = [
+    "ArmActionBackend",
     "RobotActionConsumer",
     "RobotObsPublisher",
     "action_from_state",

@@ -14,7 +14,7 @@ this module keeps the bus-facing logic isolated and unit-testable.
 from __future__ import annotations
 
 import threading
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
 from loop_sdk import RobotStepSender
 
@@ -46,9 +46,11 @@ class RobotObsPublisher:
     poll loop and any other caller may publish from different threads.
     """
 
-    def __init__(self, sender: _Sender, arm_prefix: str = DEFAULT_ARM_PREFIX) -> None:
+    def __init__(
+        self, sender: _Sender, arm_prefixes: Sequence[str] = (DEFAULT_ARM_PREFIX,)
+    ) -> None:
         self._sender = sender
-        self._arm_prefix = arm_prefix
+        self._arm_prefixes = tuple(arm_prefixes)
         self._lock = threading.Lock()
 
     @classmethod
@@ -57,27 +59,35 @@ class RobotObsPublisher:
         loop_addr: str,
         source_id: str = DEFAULT_OBS_SOURCE_ID,
         name: str = DEFAULT_OBS_SOURCE_NAME,
-        arm_prefix: str = DEFAULT_ARM_PREFIX,
+        arm_prefixes: Sequence[str] = (DEFAULT_ARM_PREFIX,),
     ) -> RobotObsPublisher:
-        """Open a Source Bus sender and declare the robot-obs channel layout.
+        """Open a Source Bus sender and declare every arm's robot-obs channels.
 
-        Declares the layout up front (rather than letting the first ``send`` do it)
-        so the source reaches "ready" before any data flows. (Config negotiation —
+        Declares the full layout up front (every arm's channels concatenated) so the
+        source reaches "ready" before any data flows. (Config negotiation —
         ``RobotStepSender``'s ``options``/``apply_config`` — is not wired here yet;
         add it when a caller needs to advertise control rates.)
         """
+        channels: list[Any] = []
+        for arm_prefix in arm_prefixes:
+            channels.extend(build_obs_channels(arm_prefix))
         sender = RobotStepSender(loop_addr, source_id, name=name)
         sender.connect()
-        sender.declare(build_obs_channels(arm_prefix))
-        return cls(sender, arm_prefix)
+        sender.declare(tuple(channels))
+        return cls(sender, arm_prefixes)
 
-    def publish(self, observation: Mapping[str, Any], timestamp_us: int) -> bool:
-        """Project one observation onto the step dict and send it as ``robot-obs``.
+    def publish(
+        self, observations: Mapping[str, Mapping[str, Any]], timestamp_us: int
+    ) -> bool:
+        """Merge each arm's observation into one ``robot-obs`` sample and send it.
 
-        Returns whether the send was accepted (the sender drops, never raises, on
-        a transport hiccup so the poll loop keeps running).
+        ``observations`` maps each ``robotN.`` arm prefix to that arm's RobotEnv
+        observation map. Returns whether the send was accepted (the sender drops,
+        never raises, on a transport hiccup so the poll loop keeps running).
         """
-        step = observation_to_step(observation, self._arm_prefix)
+        step: dict[str, float] = {}
+        for arm_prefix, observation in observations.items():
+            step.update(observation_to_step(observation, arm_prefix))
         with self._lock:
             return bool(self._sender.send(timestamp_us, step))
 

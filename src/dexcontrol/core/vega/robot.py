@@ -76,10 +76,22 @@ class CommunicationFailedError(RuntimeError):
 class VegaRobot:
     """Thin wrapper around dexcontrol Robot for single-arm control."""
 
+    @classmethod
+    def build(cls, robot_model: str = "vega_1", arm_side: str = "left", **kwargs) -> "VegaRobot":
+        """Construct the hardware unit and a single-arm controller over it.
+
+        The convenience path for single-arm use. A bimanual caller instead builds
+        ONE ``Robot`` and passes it to two ``VegaRobot`` instances (one per arm), so
+        both arms share a single hardware connection.
+        """
+        robot = Robot(configs=get_robot_config(robot_model))
+        return cls(robot, arm_side=arm_side, robot_model=robot_model, **kwargs)
+
     def __init__(
         self,
-        robot_model: str = "vega_1",
+        robot: Robot,
         arm_side: str = "left",
+        robot_model: str = "vega_1",
         control_hz: int = 20,
         gripper_type: str = "default",
         ik_solver_type: str = "pink",
@@ -126,8 +138,10 @@ class VegaRobot:
         self.gripper_type = gripper_type
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
 
-        configs = get_robot_config(robot_model)
-        self.robot = Robot(configs=configs)
+        # This controls ONE arm of an injected hardware unit. Constructing the unit
+        # is a separate concern (see ``build`` for the single-arm convenience); a
+        # bimanual caller builds ONE Robot and hands it to two VegaRobot instances.
+        self.robot = robot
         self.arm = getattr(self.robot, f"{arm_side}_arm")
         hand_component = f"{arm_side}_hand"
 

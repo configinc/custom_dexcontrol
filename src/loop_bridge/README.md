@@ -29,9 +29,9 @@ be unit-tested without the heavy `dexcontrol` import.
 | `robot_obs.py` | `robot-obs` channel layout + observation→step-dict projection | loop-sdk only |
 | `robot_action.py` | `robot-action` decode (`<arm>.action.<space>[i]` → action vector) | loop-sdk only |
 | `obs_publisher.py` | `RobotObsPublisher` — wraps a loop-sdk `RobotStepSender` | loop-sdk only |
-| `action_consumer.py` | `RobotActionConsumer` — subscribe + apply via an injected applier | loop-sdk only |
+| `action_consumer.py` | `ArmActionBackend` (per-arm decode→Step) + `RobotActionConsumer` (one source → N backends) | loop-sdk only |
 | `lanes.py` | `run_obs_poll` + `run_action_lane` (the two thread bodies) | loop-sdk only |
-| `source_server.py` | `LoopVegaRobotEnvService` (subclass) + `serve_with_loop()` | dexcontrol + loop-sdk |
+| `source_server.py` | `_LockedStepService` + `LoopBridge` (N arm services → one robot-obs) + `serve_with_loop` (single) / `serve_dual_arm` (bimanual) | dexcontrol + loop-sdk |
 | `__main__.py` | CLI launcher | the above |
 
 Every module except `source_server` has no `dexcontrol` import, so the tests in
@@ -43,15 +43,24 @@ loop-sdk is an internal package (not on PyPI); install via the `loop` extra:
 
 ```bash
 pip install -e '.[loop]'
-python -m loop_bridge \
-    --loop-addr loop-host:50051 \
+
+# single-arm:
+python -m loop_bridge --loop-addr loop-host:50051 \
     --arm-side left --gripper-type robotiq --robotiq-comport /dev/ttyUSB0
+
+# bimanual (ONE Vega, both arms → one robot-obs robot0+robot1):
+python -m loop_bridge --loop-addr loop-host:50051 --dual-arm
+
 # obs-only (no motion) — useful for first bring-up:
 python -m loop_bridge --loop-addr loop-host:50051 --no-action ...
 ```
 
 Vega supports Python 3.10–3.13, so loop-sdk runs directly in the RobotEnv server
-process (in-process pattern).
+process (in-process pattern). Per the robot source contract, a bimanual Vega is
+ONE robot: `serve_dual_arm` builds one `Robot` and drives both arms over it (two
+per-arm services sharing the unit), presenting one `robot-obs` (`robot0`+`robot1`)
+and one `robot-action`. Bimanual needs the built-in per-arm grippers (a single
+serial gripper can't be shared across both arms).
 
 ## Wire format
 
