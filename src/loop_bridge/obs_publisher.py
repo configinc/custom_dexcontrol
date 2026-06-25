@@ -1,9 +1,11 @@
 """Publish Vega RobotEnv observations onto Loop's Source Bus as ``robot-obs``.
 
-``RobotObsPublisher`` wraps a loop-sdk ``SourceProducer`` and turns each
-RobotEnv observation map into one ``robot-obs`` sample (flat value vector +
-monotonic sequence). It owns no hardware and only depends on loop-sdk, so it is
-testable with a fake producer — no robot and no running Source Bus required.
+``RobotObsPublisher`` wraps a loop-sdk ``RobotStepSender`` (the ergonomic front
+door over the raw producer) and turns each RobotEnv observation map into one
+``robot-obs`` sample — a ``{channel_key: reading}`` dict in the RCI wire format
+(named, namespaced channels; the SDK assigns sequence numbers and omits absent
+readings). It owns no hardware and only depends on loop-sdk, so it is testable
+with a fake sender — no robot and no running Source Bus required.
 
 The subclass in ``source_server.py`` wires this to the live RobotEnv server;
 this module keeps the bus-facing logic isolated and unit-testable.
@@ -12,44 +14,43 @@ this module keeps the bus-facing logic isolated and unit-testable.
 from __future__ import annotations
 
 import threading
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Optional, Protocol
 
-from loop_sdk import ChannelSpec, RobotStreamSchema, SourceProducer, SourceSchema
+from loop_sdk import RobotConfig, RobotConfigOptions, RobotStepSender
 
-from loop_bridge.robot_obs import build_obs_channels, flatten_observation
+from loop_bridge.robot_obs import (
+    DEFAULT_ARM_PREFIX,
+    build_obs_channels,
+    observation_to_step,
+)
 
 DEFAULT_OBS_SOURCE_ID = "robot-obs"
 DEFAULT_OBS_SOURCE_NAME = "vega robot state"
 
+ApplyConfig = Callable[[RobotConfig], Optional[RobotConfig]]
 
-class _Producer(Protocol):
-    """The slice of ``SourceProducer`` this publisher needs (eases testing)."""
 
-    def send_robot(
-        self,
-        source_id: str,
-        timestamp_us: int,
-        sequence: int,
-        values: tuple[float, ...],
-    ) -> None: ...
+class _Sender(Protocol):
+    """The slice of ``RobotStepSender`` this publisher needs (eases testing)."""
 
-    def close(self) -> None: ...
+    def send(
+        self, timestamp_us: int, step: Mapping[str, Any], *, sequence: int | None = ...
+    ) -> bool: ...
+
+    def disconnect(self) -> None: ...
 
 
 class RobotObsPublisher:
     """Publishes RobotEnv observations to a single ``robot-obs`` source.
 
-    Sequence numbers are assigned monotonically per published sample, guarded by
-    a lock because the RobotEnv server serves Step/Reset/status on a gRPC thread
-    pool and may publish concurrently.
+    The wrapped ``RobotStepSender`` owns sequence numbering and the (declared
+    once) channel layout. The lock guards concurrent publishes because the obs
+    poll loop and any other caller may publish from different threads.
     """
 
-    def __init__(
-        self, producer: _Producer, source_id: str = DEFAULT_OBS_SOURCE_ID
-    ) -> None:
-        self._producer = producer
-        self._source_id = source_id
-        self._sequence = 0
+    def __init__(self, sender: _Sender, arm_prefix: str = DEFAULT_ARM_PREFIX) -> None:
+        self._sender = sender
+        self._arm_prefix = arm_prefix
         self._lock = threading.Lock()
 
     @classmethod
@@ -58,35 +59,33 @@ class RobotObsPublisher:
         loop_addr: str,
         source_id: str = DEFAULT_OBS_SOURCE_ID,
         name: str = DEFAULT_OBS_SOURCE_NAME,
-        channels: tuple[ChannelSpec, ...] | None = None,
+        arm_prefix: str = DEFAULT_ARM_PREFIX,
+        options: Optional[RobotConfigOptions] = None,
+        apply_config: Optional[ApplyConfig] = None,
     ) -> RobotObsPublisher:
-        """Open a Source Bus producer declaring one robot-obs source."""
-        declared = channels if channels is not None else build_obs_channels()
-        producer = SourceProducer.connect(
-            loop_addr=loop_addr,
-            schema=SourceSchema(
-                robot=(
-                    RobotStreamSchema(
-                        source_id=source_id, name=name, channels=declared
-                    ),
-                )
-            ),
-        )
-        return cls(producer, source_id)
+        """Open a Source Bus sender and declare the robot-obs channel layout.
 
-    def publish(self, observation: Mapping[str, Any], timestamp_us: int) -> int:
-        """Flatten one observation and send it as the next robot-obs sample.
-
-        Returns the sequence number assigned to this sample.
+        Declaring up front (rather than letting the first ``send`` do it) lets the
+        Source Bus negotiate ``options`` and run ``apply_config`` before any data
+        flows. Pass ``options`` to advertise the configs (e.g. control rates) this
+        arm can open with; omit it for no negotiation.
         """
-        values = flatten_observation(observation)
-        with self._lock:
-            sequence = self._sequence
-            self._sequence += 1
-        self._producer.send_robot(
-            self._source_id, timestamp_us=timestamp_us, sequence=sequence, values=values
+        sender = RobotStepSender(
+            loop_addr, source_id, name=name, options=options, apply_config=apply_config
         )
-        return sequence
+        sender.connect()
+        sender.declare(build_obs_channels(arm_prefix))
+        return cls(sender, arm_prefix)
+
+    def publish(self, observation: Mapping[str, Any], timestamp_us: int) -> bool:
+        """Project one observation onto the step dict and send it as ``robot-obs``.
+
+        Returns whether the send was accepted (the sender drops, never raises, on
+        a transport hiccup so the poll loop keeps running).
+        """
+        step = observation_to_step(observation, self._arm_prefix)
+        with self._lock:
+            return bool(self._sender.send(timestamp_us, step))
 
     def close(self) -> None:
-        self._producer.close()
+        self._sender.disconnect()

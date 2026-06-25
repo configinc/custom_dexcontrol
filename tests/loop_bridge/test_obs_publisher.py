@@ -2,56 +2,48 @@
 
 from __future__ import annotations
 
-from conftest import FakeProducer, make_observation
+from conftest import FakeSender, make_observation
 
 from loop_bridge.obs_publisher import RobotObsPublisher
-from loop_bridge.robot_obs import flatten_observation
+from loop_bridge.robot_obs import observation_to_step
 
 
-def test_publish_sends_flattened_values():
-    producer = FakeProducer()
-    publisher = RobotObsPublisher(producer, source_id="robot-obs")
+def test_publish_sends_projected_step():
+    sender = FakeSender()
+    publisher = RobotObsPublisher(sender)
     obs = make_observation()
 
-    publisher.publish(obs, timestamp_us=111)
+    assert publisher.publish(obs, timestamp_us=111) is True
 
-    assert len(producer.sent) == 1
-    call = producer.sent[0]
-    assert call["source_id"] == "robot-obs"
+    assert len(sender.sent) == 1
+    call = sender.sent[0]
     assert call["timestamp_us"] == 111
     assert call["sequence"] == 0
-    assert call["values"] == flatten_observation(obs)
+    assert call["step"] == observation_to_step(obs)
 
 
-def test_publish_assigns_monotonic_sequence():
-    producer = FakeProducer()
-    publisher = RobotObsPublisher(producer, source_id="robot-obs")
+def test_publish_lets_sender_assign_monotonic_sequence():
+    sender = FakeSender()
+    publisher = RobotObsPublisher(sender)
 
-    seqs = [
-        publisher.publish(make_observation(), timestamp_us=ts) for ts in (10, 20, 30)
-    ]
+    for ts in (10, 20, 30):
+        publisher.publish(make_observation(), timestamp_us=ts)
 
-    assert seqs == [0, 1, 2]
-    assert [c["sequence"] for c in producer.sent] == [0, 1, 2]
-    assert [c["timestamp_us"] for c in producer.sent] == [10, 20, 30]
+    assert [c["sequence"] for c in sender.sent] == [0, 1, 2]
+    assert [c["timestamp_us"] for c in sender.sent] == [10, 20, 30]
 
 
-def test_publish_returns_assigned_sequence():
-    producer = FakeProducer()
-    publisher = RobotObsPublisher(producer, source_id="robot-obs")
-    assert publisher.publish(make_observation(), timestamp_us=1) == 0
-    assert publisher.publish(make_observation(), timestamp_us=2) == 1
-
-
-def test_close_closes_producer():
-    producer = FakeProducer()
-    publisher = RobotObsPublisher(producer, source_id="robot-obs")
-    publisher.close()
-    assert producer.closed is True
-
-
-def test_custom_source_id_is_used():
-    producer = FakeProducer()
-    publisher = RobotObsPublisher(producer, source_id="cell3/robot-obs")
+def test_publish_uses_configured_arm_prefix():
+    sender = FakeSender()
+    publisher = RobotObsPublisher(sender, arm_prefix="robot1")
     publisher.publish(make_observation(), timestamp_us=5)
-    assert producer.sent[0]["source_id"] == "cell3/robot-obs"
+    assert all(
+        k.startswith("robot1.observation.robot_state.") for k in sender.sent[0]["step"]
+    )
+
+
+def test_close_disconnects_sender():
+    sender = FakeSender()
+    publisher = RobotObsPublisher(sender)
+    publisher.close()
+    assert sender.disconnected is True

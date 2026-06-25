@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 
 class FakeFloatArray:
@@ -11,7 +11,7 @@ class FakeFloatArray:
 
 
 class FakeValue:
-    """Duck-typed stand-in for robotenv_pb2.Value (only fields flatten reads)."""
+    """Duck-typed stand-in for robotenv_pb2.Value (only fields the projection reads)."""
 
     def __init__(
         self, float_value: float = 0.0, float_array: FakeFloatArray | None = None
@@ -30,7 +30,7 @@ def scalar(value: float) -> FakeValue:
 
 def make_observation() -> dict[str, Any]:
     """A complete, well-formed Vega RobotEnv observation map with distinct values
-    so ordering bugs in flatten are detectable."""
+    so ordering bugs in the projection are detectable."""
     return {
         "joint_positions": arr([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
         "gripper_position": scalar(0.5),
@@ -44,22 +44,64 @@ def make_observation() -> dict[str, Any]:
     }
 
 
-class FakeProducer:
-    """Records send_robot / close calls in place of a loop-sdk SourceProducer."""
+class FakeSender:
+    """Records send / disconnect in place of a loop-sdk RobotStepSender."""
 
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
-        self.closed = False
+        self.disconnected = False
+        self._seq = 0
 
-    def send_robot(self, source_id, timestamp_us, sequence, values) -> None:
+    def send(self, timestamp_us, step, *, sequence=None) -> bool:
+        seq = self._seq if sequence is None else sequence
         self.sent.append(
+            {"timestamp_us": timestamp_us, "step": dict(step), "sequence": seq}
+        )
+        self._seq = seq + 1
+        return True
+
+    def disconnect(self) -> None:
+        self.disconnected = True
+
+
+class FakeApplier:
+    """Stand-in for the in-process Step applier. Optionally fails the first N steps."""
+
+    def __init__(self, fail_times: int = 0) -> None:
+        self.steps: list[dict[str, Any]] = []
+        self._fail_times = fail_times
+
+    def step(self, action, action_space, gripper_action_space="") -> None:
+        if len(self.steps) < self._fail_times:
+            self.steps.append({"failed": True})
+            raise RuntimeError("transient step failure")
+        self.steps.append(
             {
-                "source_id": source_id,
-                "timestamp_us": timestamp_us,
-                "sequence": sequence,
-                "values": values,
+                "action": list(action),
+                "action_space": action_space,
+                "gripper_action_space": gripper_action_space,
             }
         )
+
+
+class FakeConsumer:
+    """Stand-in for loop-sdk SourceConsumer: yields a fixed list of frames.
+
+    ``fault`` makes ``subscribe`` raise after yielding the queued frames; ``close``
+    records the cancellation.
+    """
+
+    def __init__(self, frames=None, fault: Optional[Exception] = None) -> None:
+        self._frames = list(frames or [])
+        self._fault = fault
+        self.closed = False
+        self.subscribed: list[str] = []
+
+    def subscribe(self, source_id, session_id=""):
+        self.subscribed.append(source_id)
+        yield from self._frames
+        if self._fault is not None:
+            raise self._fault
 
     def close(self) -> None:
         self.closed = True
