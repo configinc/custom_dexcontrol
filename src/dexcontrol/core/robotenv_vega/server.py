@@ -29,6 +29,8 @@ from core.vega.robot import (  # noqa: E402
     IKFailedError,
     JointLimitExceededError,
     VegaRobot,
+    _TELEOP_POS_ACTION_GAIN,
+    _TELEOP_ROT_ACTION_GAIN,
 )
 from proto import robotenv_pb2, robotenv_pb2_grpc  # noqa: E402
 
@@ -504,9 +506,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             # -- end gripper debug --
 
             t_step_start = time.time()
-            if self.R_world_to_robot is not None and (
-                "cartesian" in action_space or action_space == "target_cartesian_delta"
-            ):
+            if self.R_world_to_robot is not None and "cartesian" in action_space:
                 action = self._transform_action_to_robot_frame(action)
             if action_space == "cartesian_velocity":
                 raw_action = action.copy()
@@ -521,10 +521,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             elif action_space == "target_cartesian_delta":
                 # Recover cartesian_velocity by re-applying teleop gains,
                 # then convert to motor delta via the standard path.
-                from dexcontrol.core.vega.robot import (
-                    _TELEOP_POS_ACTION_GAIN,
-                    _TELEOP_ROT_ACTION_GAIN,
-                )
                 action[:3] *= _TELEOP_POS_ACTION_GAIN
                 action[3:6] *= _TELEOP_ROT_ACTION_GAIN
                 action = self._cartesian_velocity_to_delta(action)
