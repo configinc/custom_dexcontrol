@@ -57,8 +57,8 @@ _INIT_JOINTS = {
     "right": np.array([-1.2691, -0.5979, -0.0775, -1.6467, 0.6208, 0.7753, 0.3100]),
 }
 _RESET_MIDDLE_JOINTS = {
-    "left":  np.array([-2.7592,   1.3579,   2.8643, -1.8855, 0.6702, -0.1592, 0.2338]),
-    "right": np.array([ 2.7592,   -1.3579,   -2.8643, -1.8855, -0.6702, 0.1592, -0.2338]),
+    "left":  np.array([-1.3592, 0.5979, 0.0775, -1.6467, -0.6208, -0.7753, -0.3100]),
+    "right": np.array([ 1.3592, -0.5979, -0.0775, -1.6467, 0.6208, 0.7753, 0.3100]),
 }
 
 
@@ -410,6 +410,17 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description="Robot timestamp in microseconds",
             )
         )
+        # Fingertip force (tactile) is emitted only by the F5D6_V2 hand. Declared
+        # optional and only for vega_hand so scalar-gripper specs are unchanged.
+        if self.gripper_type == "vega_hand":
+            spec.fields["hand_tactile"].CopyFrom(
+                robotenv_pb2.FieldSpec(
+                    dtype="float64",
+                    shape=[5],
+                    required=False,
+                    description="Fingertip force per finger [f1..f5]",
+                )
+            )
         return spec
 
     def GetConfig(self, request, context):
@@ -729,6 +740,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 int_value=int(timestamp_us)
             ),
         }
+        # Fingertip force (tactile), present only for the F5D6_V2 hand. Added as a
+        # float_array under its own key when get_robot_state() supplied it; scalar
+        # grippers never set "hand_tactile" so the observation is byte-identical
+        # to before for them. Clients that don't know the key ignore it (proto map).
+        if state_dict.get("hand_tactile") is not None:
+            observation["hand_tactile"] = robotenv_pb2.Value(
+                float_array=robotenv_pb2.FloatArray(
+                    values=[float(v) for v in state_dict["hand_tactile"]]
+                )
+            )
         return observation, int(timestamp_us)
 
     @staticmethod

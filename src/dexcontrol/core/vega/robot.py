@@ -1002,6 +1002,15 @@ class VegaRobot:
         else:
             gripper_position = self.get_cached_gripper_position()
 
+        # Fingertip force (tactile), F5D6_V2 hand only. get_finger_tip_force()
+        # exists solely on HandF5D6V2, so the hasattr gate keeps scalar grippers
+        # (Robotiq/SR, which lack the method) completely untouched — no new key.
+        hand_tactile = None
+        if hasattr(self.hand, "get_finger_tip_force"):
+            _force = self.hand.get_finger_tip_force()
+            if _force is not None:
+                hand_tactile = np.asarray(_force, dtype=np.float64).tolist()
+
         wrench_state = np.zeros(6, dtype=np.float64)
         if getattr(self.arm, "wrench_sensor", None) is not None:
             wrench_state = np.asarray(self.arm.wrench_sensor.get_wrench_state(), dtype=np.float64)
@@ -1029,6 +1038,9 @@ class VegaRobot:
             "prev_command_successful": bool(self._prev_command_successful),
             "prev_gripper_command_successful": bool(self._prev_gripper_command_successful),
         }
+        # Only present for the F5D6_V2 hand; scalar grippers never add this key.
+        if hand_tactile is not None:
+            state_dict["hand_tactile"] = hand_tactile
         return state_dict, timestamp_dict
 
     def validate_joint_limits(self, target_joint_pos: np.ndarray) -> None:
