@@ -140,7 +140,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         )
         # A bimanual caller passes a shared ``robot`` so both arms' services drive one
         # hardware unit; single-arm callers omit it and the service builds its own.
-        self._robot = VegaRobot(robot, **vega_kwargs) if robot is not None else VegaRobot.build(**vega_kwargs)
+        self._robot = VegaRobot(robot=robot, **vega_kwargs) if robot is not None else VegaRobot.build(**vega_kwargs)
         self._robot.launch_robot()
 
         # --- Background control loop for interpolation-based upsampling ---

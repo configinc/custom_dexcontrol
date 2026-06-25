@@ -92,6 +92,9 @@ class _StepApplier:
                 status,
                 getattr(response, "message", ""),
             )
+            raise RuntimeError(
+                f"robot-action Step returned {status}: {getattr(response, 'message', '')}"
+            )
 
 
 class _LockedStepService(_vega_server.VegaRobotEnvService):
@@ -320,10 +323,20 @@ def serve_dual_arm(
     # A serial gripper (robotiq/sr_gripper) is one COM port; both arms sharing it
     # would corrupt gripper comms. Bimanual needs the built-in per-arm grippers
     # (or per-arm comports, not yet wired) — fail fast rather than open it twice.
-    if service_kwargs.get("gripper_type", "default") in ("robotiq", "sr_gripper"):
+    # VegaRobot resolves ``hand_type`` to ``gripper_type`` when the latter is
+    # "default", so a programmatic caller can request a serial gripper via either
+    # key — guard both so neither path slips past.
+    serial_grippers = ("robotiq", "sr_gripper")
+    if (
+        service_kwargs.get("gripper_type", "default") in serial_grippers
+        or service_kwargs.get("hand_type") in serial_grippers
+    ):
+        requested = service_kwargs.get("gripper_type", "default")
+        if requested == "default":
+            requested = service_kwargs.get("hand_type")
         raise ValueError(
             f"dual-arm needs per-arm grippers; a shared serial gripper "
-            f"({service_kwargs.get('gripper_type')!r}) can't be opened by both arms"
+            f"({requested!r}) can't be opened by both arms"
         )
 
     left = _LockedStepService(arm_side="left", **service_kwargs)

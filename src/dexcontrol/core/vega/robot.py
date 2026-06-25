@@ -85,13 +85,12 @@ class VegaRobot:
         both arms share a single hardware connection.
         """
         robot = Robot(configs=get_robot_config(robot_model))
-        return cls(robot, arm_side=arm_side, robot_model=robot_model, **kwargs)
+        return cls(robot_model=robot_model, arm_side=arm_side, robot=robot, **kwargs)
 
     def __init__(
         self,
-        robot: Robot,
-        arm_side: str = "left",
         robot_model: str = "vega_1",
+        arm_side: str = "left",
         control_hz: int = 20,
         gripper_type: str = "default",
         ik_solver_type: str = "pink",
@@ -110,6 +109,7 @@ class VegaRobot:
         max_jerk: float = 0.25,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
+        robot: Robot | None = None,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -138,10 +138,10 @@ class VegaRobot:
         self.gripper_type = gripper_type
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
 
-        # This controls ONE arm of an injected hardware unit. Constructing the unit
-        # is a separate concern (see ``build`` for the single-arm convenience); a
-        # bimanual caller builds ONE Robot and hands it to two VegaRobot instances.
-        self.robot = robot
+        # This controls ONE arm. A bimanual caller injects one shared Robot via the
+        # keyword-only ``robot`` argument; direct/single-arm callers keep the original
+        # custom_dexcontrol constructor shape and get a freshly constructed Robot.
+        self.robot = robot if robot is not None else Robot(configs=get_robot_config(robot_model))
         self.arm = getattr(self.robot, f"{arm_side}_arm")
         hand_component = f"{arm_side}_hand"
 
