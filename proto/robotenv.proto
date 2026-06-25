@@ -231,6 +231,9 @@ message VersionInfo {
 
     // Git tag at deployment time (e.g., "v2.4.14" or "no tag")
     string tag = 3;
+
+    // Robot firmware version (e.g., "0.5.0"). Empty string if unavailable.
+    string firmware_version = 4;
 }
 
 // ============================================================================
