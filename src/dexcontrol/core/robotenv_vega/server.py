@@ -484,7 +484,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         action = np.asarray(request.action, dtype=np.float64)
         gripper_action_space = request.gripper_action_space
         if not gripper_action_space:
-            gripper_action_space = "velocity" if "velocity" in action_space else "position"
+            gripper_action_space = "velocity" if action_space == "joint_velocity" else "position"
 
         try:
             # -- gripper debug --
@@ -770,6 +770,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     _RESET_CMD_HZ = 100.0
     _RESET_MAX_STEP_RAD = 0.2
     _RESET_SETTLE_S = 0.5
+    _RESET_SETTLE_TOL_RAD = 0.15  # Looser tolerance for settle-based exit
 
     def _execute_reset_sequence(self, target_joints: np.ndarray) -> None:
         t0 = time.time()
@@ -795,8 +796,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
         )
         LOGGER.info("Reset[%s]: sequence complete (%.2fs)", self.arm_side, time.time() - t0)
-
-    _RESET_SETTLE_TOL_RAD = 0.15  # Looser tolerance for settle-based exit
 
     def _move_incremental(
         self,
