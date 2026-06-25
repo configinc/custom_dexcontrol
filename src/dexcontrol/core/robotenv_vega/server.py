@@ -95,6 +95,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         rot_sensitivity: float = 1.0,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
+        head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),  # head_j1 limit: ±1.483 rad
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -136,6 +137,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             max_jerk=max_jerk,
             vel_ratio=vel_ratio,
             vel_damp_thresh=vel_damp_thresh,
+            head_init_pos=head_init_pos,
         )
         self._robot.launch_robot()
 
@@ -944,6 +946,7 @@ def serve(
     rot_sensitivity: float = 1.0,
     vel_ratio: float = 1.0,
     vel_damp_thresh: float = 0.05,
+    head_init_pos: tuple[float, ...] | list[float] = (1.48, 0.0, -0.3),
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
@@ -988,6 +991,7 @@ def serve(
         rot_sensitivity=rot_sensitivity,
         vel_ratio=vel_ratio,
         vel_damp_thresh=vel_damp_thresh,
+        head_init_pos=head_init_pos,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -1217,6 +1221,15 @@ def main() -> None:
         default=0.05,
         help="Velocity damping threshold in rad. Velocity tapers linearly from 0→100%% over this distance to target (default: 0.05). Smaller=less damping, larger=more damping.",
     )
+    parser.add_argument(
+        "--head-init-pos",
+        type=float,
+        nargs=3,
+        default=[2.0, 0.0, -0.3],
+        metavar=("YAW", "PITCH", "ROLL"),
+        help="Head joint init position in radians [yaw, pitch, roll]. "
+             "Defaults to [1.48, 0.0, -0.3] (head_j1 limit: ±1.483 rad).",
+    )
     args = parser.parse_args()
 
     # Both flags feed the same downstream "where is the gripper attached"
@@ -1254,6 +1267,7 @@ def main() -> None:
         rot_sensitivity=args.rot_sensitivity,
         vel_ratio=args.vel_ratio,
         vel_damp_thresh=args.vel_damp_thresh,
+        head_init_pos=args.head_init_pos,
     )
 
 
