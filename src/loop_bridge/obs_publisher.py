@@ -14,9 +14,9 @@ this module keeps the bus-facing logic isolated and unit-testable.
 from __future__ import annotations
 
 import threading
-from typing import Any, Callable, Mapping, Optional, Protocol
+from typing import Any, Mapping, Protocol
 
-from loop_sdk import RobotConfig, RobotConfigOptions, RobotStepSender
+from loop_sdk import RobotStepSender
 
 from loop_bridge.robot_obs import (
     DEFAULT_ARM_PREFIX,
@@ -26,8 +26,6 @@ from loop_bridge.robot_obs import (
 
 DEFAULT_OBS_SOURCE_ID = "robot-obs"
 DEFAULT_OBS_SOURCE_NAME = "vega robot state"
-
-ApplyConfig = Callable[[RobotConfig], Optional[RobotConfig]]
 
 
 class _Sender(Protocol):
@@ -60,19 +58,15 @@ class RobotObsPublisher:
         source_id: str = DEFAULT_OBS_SOURCE_ID,
         name: str = DEFAULT_OBS_SOURCE_NAME,
         arm_prefix: str = DEFAULT_ARM_PREFIX,
-        options: Optional[RobotConfigOptions] = None,
-        apply_config: Optional[ApplyConfig] = None,
     ) -> RobotObsPublisher:
         """Open a Source Bus sender and declare the robot-obs channel layout.
 
-        Declaring up front (rather than letting the first ``send`` do it) lets the
-        Source Bus negotiate ``options`` and run ``apply_config`` before any data
-        flows. Pass ``options`` to advertise the configs (e.g. control rates) this
-        arm can open with; omit it for no negotiation.
+        Declares the layout up front (rather than letting the first ``send`` do it)
+        so the source reaches "ready" before any data flows. (Config negotiation —
+        ``RobotStepSender``'s ``options``/``apply_config`` — is not wired here yet;
+        add it when a caller needs to advertise control rates.)
         """
-        sender = RobotStepSender(
-            loop_addr, source_id, name=name, options=options, apply_config=apply_config
-        )
+        sender = RobotStepSender(loop_addr, source_id, name=name)
         sender.connect()
         sender.declare(build_obs_channels(arm_prefix))
         return cls(sender, arm_prefix)
