@@ -30,7 +30,7 @@ from concurrent import futures
 from typing import Any, Optional, Sequence
 
 import grpc
-from loop_sdk import RobotActionReceiver
+from loop_sdk import RobotActionReceiver, RobotConfig, RobotConfigOptions
 
 # Importing the upstream module runs its sys.path setup and binds the proto stubs.
 from dexcontrol.core.robotenv_vega import server as _vega_server
@@ -127,6 +127,8 @@ class LoopBridge:
         gripper_action_space: str = "",
         obs_hz: float = DEFAULT_OBS_HZ,
         enable_action: bool = True,
+        control_hz_options: Sequence[int] = (),
+        action_space_options: Sequence[str] = (),
     ) -> None:
         if obs_hz <= 0:
             raise ValueError(f"obs_hz must be > 0, got {obs_hz}")
@@ -137,15 +139,32 @@ class LoopBridge:
         if len(set(arm_prefixes)) != len(arm_prefixes):
             raise ValueError(f"duplicate arm prefixes: {arm_prefixes}")
 
+        self._action_space = action_space
+        self._gripper_action_space = gripper_action_space
+        self._period_s = 1.0 / obs_hz  # mutable: reconfigure() re-paces the obs poll
+        self._lane_stop = threading.Event()
+
+        # Advertise the configs this robot can open with (control_hz / action_space);
+        # default to the configured values. apply_config re-paces the live bridge.
+        options = RobotConfigOptions(
+            control_hz=tuple(control_hz_options) or (int(obs_hz),),
+            action_space=tuple(action_space_options) or (action_space,),
+        )
+
+        def apply_config(config: RobotConfig) -> RobotConfig:
+            self.reconfigure(
+                control_hz=config.control_hz, action_space=config.action_space
+            )
+            return config
+
         self._obs_publisher = RobotObsPublisher.connect(
             loop_addr=loop_addr,
             source_id=obs_source_id,
             name=obs_source_name,
             arm_prefixes=arm_prefixes,
+            options=options,
+            apply_config=apply_config,
         )
-        self._action_space = action_space
-        self._gripper_action_space = gripper_action_space
-        self._lane_stop = threading.Event()
 
         # Action consume is a loop-sdk RobotActionReceiver (its own subscribe +
         # reconnect thread); the obs poll pulls its latest() each tick and Steps each
@@ -171,7 +190,7 @@ class LoopBridge:
                 stop_event=self._lane_stop,
                 read_observation=self._read_observations,
                 publish=self._obs_publisher.publish,
-                period_s=1.0 / obs_hz,
+                period_s=lambda: self._period_s,
                 apply_actions=self._apply_actions if enable_action else None,
             ),
             name="robot-obs-poll",
@@ -190,6 +209,20 @@ class LoopBridge:
             if enable_action
             else "",
         )
+
+    def reconfigure(
+        self, control_hz: float | None = None, action_space: str = ""
+    ) -> None:
+        """Apply a Source-Bus-selected config: re-pace the obs poll / re-target Step.
+
+        Called from the obs sender's ``apply_config`` when the recorder picks a config.
+        ``_period_s`` is read by the obs poll each tick (via a callable) and
+        ``_action_space`` by each Step apply, so the change takes effect next tick.
+        """
+        if control_hz and control_hz > 0:
+            self._period_s = 1.0 / control_hz
+        if action_space:
+            self._action_space = action_space
 
     def _read_observations(self) -> tuple[dict[str, Any], int]:
         """Read every arm's observation in one tick (paired) → {prefix: obs}, timestamp."""
@@ -258,6 +291,8 @@ def serve_with_loop(
     gripper_action_space: str = "",
     obs_hz: float = DEFAULT_OBS_HZ,
     enable_action: bool = True,
+    control_hz_options: Sequence[int] = (),
+    action_space_options: Sequence[str] = (),
     **service_kwargs: Any,
 ) -> None:
     """Single-arm: a RobotEnv gRPC server that also bridges one robot-obs/robot-action."""
@@ -276,6 +311,8 @@ def serve_with_loop(
         gripper_action_space=gripper_action_space,
         obs_hz=obs_hz,
         enable_action=enable_action,
+        control_hz_options=control_hz_options,
+        action_space_options=action_space_options,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -311,6 +348,8 @@ def serve_dual_arm(
     gripper_action_space: str = "",
     obs_hz: float = DEFAULT_OBS_HZ,
     enable_action: bool = True,
+    control_hz_options: Sequence[int] = (),
+    action_space_options: Sequence[str] = (),
     **service_kwargs: Any,
 ) -> None:
     """Bimanual: ONE Vega robot, both arms, presented as one robot-obs/robot-action.
@@ -357,6 +396,8 @@ def serve_dual_arm(
         gripper_action_space=gripper_action_space,
         obs_hz=obs_hz,
         enable_action=enable_action,
+        control_hz_options=control_hz_options,
+        action_space_options=action_space_options,
     )
     LOGGER.info(
         "Vega dual-arm bridge running: arms=%s robot-obs=%r",

@@ -56,16 +56,21 @@ class RobotObsPublisher:
         source_id: str = DEFAULT_OBS_SOURCE_ID,
         name: str = DEFAULT_OBS_SOURCE_NAME,
         arm_prefixes: Sequence[str] = (DEFAULT_ARM_PREFIX,),
+        options: Any = None,
+        apply_config: Any = None,
     ) -> RobotObsPublisher:
         """Open a Source Bus sender for the robot-obs source.
 
         No channel layout is declared here — the first ``publish`` (send) fixes the
         layout from its dict keys and the recorder takes its columns from the
-        streamed keys (self-describing source). (Config negotiation —
-        ``RobotStepSender``'s ``options``/``apply_config`` — is not wired here yet;
-        add it when a caller needs to advertise control rates.)
+        streamed keys (self-describing source). ``options`` advertises the configs
+        the source can open with (control_hz / action_space candidates) and
+        ``apply_config`` is called when the Source Bus selects one, so the bridge
+        re-paces / re-targets to the chosen config.
         """
-        sender = RobotStepSender(loop_addr, source_id, name=name)
+        sender = RobotStepSender(
+            loop_addr, source_id, name=name, options=options, apply_config=apply_config
+        )
         sender.connect()
         return cls(sender, arm_prefixes)
 

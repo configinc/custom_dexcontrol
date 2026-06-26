@@ -28,16 +28,17 @@ def run_obs_poll(
     stop_event: threading.Event,
     read_observation: ReadObservation,
     publish: Publish,
-    period_s: float,
+    period_s: float | Callable[[], float],
     apply_actions: Optional[Callable[[], None]] = None,
     sleep: Optional[Callable[[float], None]] = None,
 ) -> None:
     """Read + publish one observation per ``period_s`` (and apply pulled actions).
 
     A failed read/publish on one tick is logged and skipped — a transient hiccup
-    must not kill the lane. ``apply_actions`` (optional) is called each tick after
-    the publish to Step the freshest pulled action. Backoff defaults to the stop
-    event's wait so shutdown wakes it immediately; tests inject a sleep.
+    must not kill the lane. ``period_s`` may be a callable so the rate can be
+    re-paced live (config negotiation). ``apply_actions`` (optional) is called each
+    tick after the publish to Step the freshest pulled action. Backoff defaults to
+    the stop event's wait so shutdown wakes it immediately; tests inject a sleep.
     """
     wait = sleep if sleep is not None else (lambda seconds: stop_event.wait(seconds))
     while not stop_event.is_set():
@@ -50,7 +51,7 @@ def run_obs_poll(
             LOGGER.exception("robot-obs poll failed; skipping tick")
         if stop_event.is_set():
             return
-        wait(period_s)
+        wait(period_s() if callable(period_s) else period_s)
 
 
 def now_us() -> int:

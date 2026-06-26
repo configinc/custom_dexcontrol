@@ -38,6 +38,28 @@ def test_obs_poll_reads_and_publishes_each_tick():
     assert [ts for _, ts in published] == [1000, 1001, 1002]
 
 
+def test_obs_poll_uses_callable_period_so_rate_can_re_pace_live():
+    stop = threading.Event()
+    period = {"v": 0.1}
+    seen = []
+
+    def sleep(seconds):
+        seen.append(seconds)
+        period["v"] = 0.05  # re-pace mid-run (as reconfigure() would)
+        if len(seen) >= 2:
+            stop.set()
+
+    lanes.run_obs_poll(
+        stop_event=stop,
+        read_observation=lambda: (make_observation(), 1),
+        publish=lambda *_: None,
+        period_s=lambda: period["v"],
+        sleep=sleep,
+    )
+
+    assert seen == [0.1, 0.05]  # the loop reads the (now mutated) period each tick
+
+
 def test_obs_poll_applies_actions_each_tick():
     stop = threading.Event()
     applied = {"n": 0}

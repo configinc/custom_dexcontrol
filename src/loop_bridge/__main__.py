@@ -100,6 +100,16 @@ def main() -> None:
     parser.add_argument(
         "--control-hz", type=int, default=20, help="Control frequency in Hz"
     )
+    parser.add_argument(
+        "--control-hz-options",
+        default="",
+        help="Comma-separated control_hz the source advertises for negotiation (default: --obs-hz)",
+    )
+    parser.add_argument(
+        "--action-space-options",
+        default="",
+        help="Comma-separated action spaces the source advertises (default: --action-space)",
+    )
 
     args = parser.parse_args()
 
@@ -112,6 +122,12 @@ def main() -> None:
         gripper_action_space=args.gripper_action_space,
         obs_hz=args.obs_hz,
         enable_action=not args.no_action,
+        control_hz_options=tuple(
+            int(v) for v in args.control_hz_options.split(",") if v.strip()
+        ),
+        action_space_options=tuple(
+            v.strip() for v in args.action_space_options.split(",") if v.strip()
+        ),
     )
     service_kwargs = dict(
         robot_model=args.robot_model,
