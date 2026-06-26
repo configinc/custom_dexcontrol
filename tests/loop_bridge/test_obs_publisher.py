@@ -53,7 +53,7 @@ def test_publish_uses_configured_arm_prefix():
     publisher = RobotObsPublisher(sender, arm_prefixes=["robot1"])
     publisher.publish({"robot1": make_observation()}, timestamp_us=5)
     assert all(
-        k.startswith("robot1.observation.robot_state.") for k in sender.sent[0]["step"]
+        k.startswith("robot1.observation.state.") for k in sender.sent[0]["step"]
     )
 
 

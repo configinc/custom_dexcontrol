@@ -67,7 +67,7 @@ serial gripper can't be shared across both arms).
 Channels follow the RCI convention (named, namespaced by arm prefix, default
 `robot0`):
 
-- **obs** `robot-obs` — `<arm>.observation.robot_state.<field>[i]`:
+- **obs** `robot-obs` — `<arm>.observation.state.<field>[i]`:
   - **CORE** `joint_positions[0..6]` (rad), `gripper_position` (normalized 0–1),
     `cartesian_position[0..5]` (xyz m, rpy rad)
   - **AUX** `joint_velocities[0..6]` (rad/s), `joint_torques_computed[0..6]` (N·m),

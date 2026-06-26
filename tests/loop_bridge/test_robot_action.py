@@ -39,7 +39,7 @@ def test_returns_none_on_empty_state():
 def test_ignores_unrelated_keys_and_other_spaces():
     state = {
         **_delta([1.0, 2.0, 3.0]),
-        "robot0.observation.robot_state.joint_positions[0]": 7.0,
+        "robot0.observation.state.joint_positions[0]": 7.0,
         "robot0.action.joint_position[0]": 5.0,
     }
     assert action_from_state(state, action_space=_FREE) == [1.0, 2.0, 3.0]

@@ -12,7 +12,7 @@ from loop_bridge.robot_obs import (
     observation_to_step,
 )
 
-_PREFIX = "robot0.observation.robot_state"
+_PREFIX = "robot0.observation.state"
 
 
 def test_obs_dim_matches_channels_and_field_layout():
@@ -42,7 +42,7 @@ def test_aux_channels_are_provenance():
 
 def test_arm_prefix_namespaces_every_channel():
     keys = [c.key for c in build_obs_channels(arm_prefix="robot1")]
-    assert all(k.startswith("robot1.observation.robot_state.") for k in keys)
+    assert all(k.startswith("robot1.observation.state.") for k in keys)
     assert all(".action." not in k for k in keys)  # obs/action are sibling namespaces
 
 

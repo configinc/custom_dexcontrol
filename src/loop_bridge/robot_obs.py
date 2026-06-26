@@ -8,7 +8,7 @@ This module owns the contract between Vega's RobotEnv observation and the
     layout, producing the ``{channel_key: reading}`` dict ``RobotStepSender``
     streams (the dict-payload wire format — named channels, not a bare vector).
 
-Channel keys follow the RCI wire convention ``<arm>.observation.robot_state.``
+Channel keys follow the RCI wire convention ``<arm>.observation.state.``
 ``<field>[i]`` (a sibling of the ``<arm>.action.<space>[i]`` keys the action lane
 carries), so observation and action keys never collide when the loop pairs them
 into a robot-step. The arm prefix (default ``robot0``) namespaces one arm's
@@ -26,8 +26,11 @@ from typing import Any, Mapping, Optional
 
 from loop_sdk import ChannelRole, ChannelSpec
 
-# Namespace infix mirroring the RobotEnv obs_dict shape (obs["robot_state"][field]).
-_OBS_NAMESPACE = "observation.robot_state"
+# Wire-key infix. The recorder stores obs columns as ``observation.state.*`` (its
+# old transform renamed ``robot_state``->``state``); now that the recorder no
+# longer transforms, we emit that final column name directly. The native RobotEnv
+# obs_dict is still read by field name, independent of this wire infix.
+_OBS_NAMESPACE = "observation.state"
 
 # Default arm prefix for a single-arm bridge. Dual-arm units run one bridge per
 # arm (robot0 / robot1) and pass the matching prefix.

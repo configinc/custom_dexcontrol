@@ -2,7 +2,7 @@
 
 The mirror of ``robot_obs``: the loop publishes a ``robot-action`` source whose
 channels follow the RCI wire convention ``<arm>.action.<space>[i]`` (a sibling of
-the ``<arm>.observation.robot_state.<field>[i]`` obs keys). This module turns one
+the ``<arm>.observation.state.<field>[i]`` obs keys). This module turns one
 ``RobotFrame.state`` dict back into the flat action vector the RobotEnv ``Step``
 path takes, in the negotiated ``action_space`` (e.g. ``target_cartesian_delta``:
 6 cartesian terms + 1 gripper).
