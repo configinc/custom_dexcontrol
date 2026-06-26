@@ -18,11 +18,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from loop_sdk import RobotStepSender
 
-from loop_bridge.robot_obs import (
-    DEFAULT_ARM_PREFIX,
-    build_obs_channels,
-    observation_to_step,
-)
+from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX, observation_to_step
 
 DEFAULT_OBS_SOURCE_ID = "robot-obs"
 DEFAULT_OBS_SOURCE_NAME = "vega robot state"
@@ -61,19 +57,16 @@ class RobotObsPublisher:
         name: str = DEFAULT_OBS_SOURCE_NAME,
         arm_prefixes: Sequence[str] = (DEFAULT_ARM_PREFIX,),
     ) -> RobotObsPublisher:
-        """Open a Source Bus sender and declare every arm's robot-obs channels.
+        """Open a Source Bus sender for the robot-obs source.
 
-        Declares the full layout up front (every arm's channels concatenated) so the
-        source reaches "ready" before any data flows. (Config negotiation —
+        No channel layout is declared here — the first ``publish`` (send) fixes the
+        layout from its dict keys and the recorder takes its columns from the
+        streamed keys (self-describing source). (Config negotiation —
         ``RobotStepSender``'s ``options``/``apply_config`` — is not wired here yet;
         add it when a caller needs to advertise control rates.)
         """
-        channels: list[Any] = []
-        for arm_prefix in arm_prefixes:
-            channels.extend(build_obs_channels(arm_prefix))
         sender = RobotStepSender(loop_addr, source_id, name=name)
         sender.connect()
-        sender.declare(tuple(channels))
         return cls(sender, arm_prefixes)
 
     def publish(

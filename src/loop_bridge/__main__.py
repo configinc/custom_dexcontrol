@@ -20,10 +20,10 @@ from loop_bridge.obs_publisher import (
     DEFAULT_OBS_SOURCE_ID,
     DEFAULT_OBS_SOURCE_NAME,
 )
-from loop_bridge.robot_action import DEFAULT_ACTION_SPACE
 from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 from loop_bridge.source_server import (
     DEFAULT_ACTION_SOURCE_ID,
+    DEFAULT_ACTION_SPACE,
     DEFAULT_OBS_HZ,
     serve_dual_arm,
     serve_with_loop,

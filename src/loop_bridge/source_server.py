@@ -30,22 +30,22 @@ from concurrent import futures
 from typing import Any, Optional, Sequence
 
 import grpc
+from loop_sdk import RobotActionReceiver
 
 # Importing the upstream module runs its sys.path setup and binds the proto stubs.
 from dexcontrol.core.robotenv_vega import server as _vega_server
 from loop_bridge import lanes
-from loop_bridge.action_consumer import ArmActionBackend, RobotActionConsumer
 from loop_bridge.obs_publisher import (
     DEFAULT_OBS_SOURCE_ID,
     DEFAULT_OBS_SOURCE_NAME,
     RobotObsPublisher,
 )
-from loop_bridge.robot_action import DEFAULT_ACTION_SPACE
 from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 
 LOGGER = logging.getLogger("loop_bridge.vega")
 
 DEFAULT_ACTION_SOURCE_ID = "robot-action"
+DEFAULT_ACTION_SPACE = "target_cartesian_delta"
 DEFAULT_OBS_HZ = 20.0
 
 
@@ -143,10 +143,27 @@ class LoopBridge:
             name=obs_source_name,
             arm_prefixes=arm_prefixes,
         )
+        self._action_space = action_space
+        self._gripper_action_space = gripper_action_space
         self._lane_stop = threading.Event()
-        self._action_consumer: Optional[RobotActionConsumer] = None
-        self._consumer_lock = threading.Lock()
-        self._threads: list[threading.Thread] = []
+
+        # Action consume is a loop-sdk RobotActionReceiver (its own subscribe +
+        # reconnect thread); the obs poll pulls its latest() each tick and Steps each
+        # arm. One per-arm Step applier; latest() is {} when nothing fresh -> hold.
+        self._action_receiver: Any = None
+        self._appliers: dict[str, _StepApplier] = {}
+        if enable_action:
+            self._appliers = {
+                arm_prefix: _StepApplier(service)
+                for arm_prefix, service in self._arm_services
+            }
+            self._action_receiver = RobotActionReceiver(
+                loop_addr,
+                action_source_id,
+                arms=tuple(arm_prefixes),
+                action_space=action_space,
+            )
+            self._action_receiver.connect()
 
         obs_thread = threading.Thread(
             target=lanes.run_obs_poll,
@@ -155,37 +172,13 @@ class LoopBridge:
                 read_observation=self._read_observations,
                 publish=self._obs_publisher.publish,
                 period_s=1.0 / obs_hz,
+                apply_actions=self._apply_actions if enable_action else None,
             ),
             name="robot-obs-poll",
             daemon=True,
         )
         obs_thread.start()
-        self._threads.append(obs_thread)
-
-        if enable_action:
-            backends = [
-                ArmActionBackend(
-                    _StepApplier(service),
-                    arm_prefix=arm_prefix,
-                    action_space=action_space,
-                    gripper_action_space=gripper_action_space,
-                )
-                for arm_prefix, service in self._arm_services
-            ]
-            action_thread = threading.Thread(
-                target=lanes.run_action_lane,
-                kwargs=dict(
-                    stop_event=self._lane_stop,
-                    loop_addr=loop_addr,
-                    backends=backends,
-                    action_source_id=action_source_id,
-                    register_consumer=self._register_consumer,
-                ),
-                name="robot-action-lane",
-                daemon=True,
-            )
-            action_thread.start()
-            self._threads.append(action_thread)
+        self._threads: list[threading.Thread] = [obs_thread]
 
         LOGGER.info(
             "loop bridge enabled: robot-obs %r (%s, %.1f Hz) -> %s%s",
@@ -209,18 +202,29 @@ class LoopBridge:
                 timestamp_us = sample_ts
         return observations, int(timestamp_us or 0)
 
-    def _register_consumer(self, consumer: Optional[RobotActionConsumer]) -> None:
-        with self._consumer_lock:
-            self._action_consumer = consumer
+    def _apply_actions(self) -> None:
+        """Step each arm with the freshest pulled action ({} when nothing fresh → hold)."""
+        if self._action_receiver is None:
+            return
+        for arm_prefix, action in self._action_receiver.latest().items():
+            applier = self._appliers.get(arm_prefix)
+            if applier is None:
+                continue
+            try:
+                applier.step(action, self._action_space, self._gripper_action_space)
+            except (
+                Exception
+            ) as exc:  # _StepApplier raises on non-SUCCESS Step; skip the tick
+                LOGGER.warning(
+                    "robot-action Step failed for %s; skipping: %s", arm_prefix, exc
+                )
 
     def close(self) -> None:
-        """Stop both lanes and close the publisher (call BEFORE closing the robot)."""
+        """Stop the lane + action receiver and close the publisher (BEFORE closing the robot)."""
         self._lane_stop.set()
-        with self._consumer_lock:
-            consumer = self._action_consumer
-        if consumer is not None:
+        if self._action_receiver is not None:
             with contextlib.suppress(Exception):
-                consumer.close()  # cancel the in-flight subscribe so the lane unwinds
+                self._action_receiver.disconnect()  # stops its subscribe thread
         for thread in self._threads:
             thread.join(timeout=5.0)
             if thread.is_alive():

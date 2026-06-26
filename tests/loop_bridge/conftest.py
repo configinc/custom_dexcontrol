@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 
 class FakeFloatArray:
@@ -84,24 +84,22 @@ class FakeApplier:
         )
 
 
-class FakeConsumer:
-    """Stand-in for loop-sdk SourceConsumer: yields a fixed list of frames.
+class FakeActionReceiver:
+    """Stand-in for loop-sdk RobotActionReceiver: ``latest()`` returns a fixed dict.
 
-    ``fault`` makes ``subscribe`` raise after yielding the queued frames; ``close``
-    records the cancellation.
+    ``latest`` maps arm prefix -> action vector (or ``{}`` for "nothing fresh").
     """
 
-    def __init__(self, frames=None, fault: Optional[Exception] = None) -> None:
-        self._frames = list(frames or [])
-        self._fault = fault
-        self.closed = False
-        self.subscribed: list[str] = []
+    def __init__(self, latest=None) -> None:
+        self._latest = dict(latest or {})
+        self.connected = False
+        self.disconnected = False
 
-    def subscribe(self, source_id, session_id=""):
-        self.subscribed.append(source_id)
-        yield from self._frames
-        if self._fault is not None:
-            raise self._fault
+    def latest(self) -> dict[str, Any]:
+        return dict(self._latest)
 
-    def close(self) -> None:
-        self.closed = True
+    def connect(self) -> None:
+        self.connected = True
+
+    def disconnect(self) -> None:
+        self.disconnected = True

@@ -1,36 +1,22 @@
-"""The two bus I/O lanes the Vega bridge runs as background threads.
+"""The obs-poll lane the Vega bridge runs as a background thread.
 
-Kept dexcontrol-free (only loop-sdk + the bridge's own bus modules) so both lanes
-are unit-testable with injected seams, without importing the heavy in-process
-robot stack:
-
-  - ``run_obs_poll`` — read the current observation and publish it as ``robot-obs``
-    at a fixed rate. Vega publishes obs only when ``_create_observation`` runs, so
-    the bridge must DRIVE it on a clock; otherwise teleop (which needs obs to
-    compute a delta) and obs (driven by the resulting action's Step) deadlock at
-    startup. This lane breaks that cycle.
-  - ``run_action_lane`` — subscribe ``robot-action`` and apply each frame via the
-    injected applier (the in-process RobotEnv ``Step`` path), retrying until the
-    source opens, with an interruptible backoff and clean cancel-on-shutdown.
+Kept dexcontrol-free (only the bridge's own callbacks) so it is unit-testable with
+injected seams. Vega publishes obs only when ``_create_observation`` runs, so the
+bridge must DRIVE it on a clock; otherwise teleop (which needs obs to compute a
+delta) and obs (driven by the resulting action's Step) deadlock at startup. This
+lane breaks that cycle: each tick reads + publishes the observation and applies any
+freshest pulled action. The action subscription itself lives in loop-sdk's
+``RobotActionReceiver`` (its own thread); this lane just pulls + applies.
 """
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import threading
 import time
-from typing import Any, Callable, Optional, Sequence, Tuple
-
-from loop_sdk import SourceConsumer
-
-from loop_bridge.action_consumer import ArmActionBackend, RobotActionConsumer
+from typing import Any, Callable, Optional, Tuple
 
 LOGGER = logging.getLogger("loop_bridge.vega")
-
-# Backoff between action-lane (re)subscribe attempts. ``robot-action`` only exists
-# once the in-loop RCI engine is running, so the bridge may start before it.
-_ACTION_RETRY_S = 2.0
 
 # (observation map, timestamp_us) for one sample.
 ReadObservation = Callable[[], Tuple[Any, int]]
@@ -43,70 +29,28 @@ def run_obs_poll(
     read_observation: ReadObservation,
     publish: Publish,
     period_s: float,
+    apply_actions: Optional[Callable[[], None]] = None,
     sleep: Optional[Callable[[float], None]] = None,
 ) -> None:
-    """Read + publish one observation per ``period_s`` until ``stop_event``.
+    """Read + publish one observation per ``period_s`` (and apply pulled actions).
 
     A failed read/publish on one tick is logged and skipped — a transient hiccup
-    must not kill the lane. Backoff defaults to the stop event's wait so shutdown
-    wakes it immediately; tests inject a non-blocking sleep.
+    must not kill the lane. ``apply_actions`` (optional) is called each tick after
+    the publish to Step the freshest pulled action. Backoff defaults to the stop
+    event's wait so shutdown wakes it immediately; tests inject a sleep.
     """
     wait = sleep if sleep is not None else (lambda seconds: stop_event.wait(seconds))
     while not stop_event.is_set():
         try:
             observation, timestamp_us = read_observation()
             publish(observation, timestamp_us)
+            if apply_actions is not None:
+                apply_actions()
         except Exception:
             LOGGER.exception("robot-obs poll failed; skipping tick")
         if stop_event.is_set():
             return
         wait(period_s)
-
-
-def run_action_lane(
-    *,
-    stop_event: threading.Event,
-    loop_addr: str,
-    backends: Sequence[ArmActionBackend],
-    action_source_id: str,
-    register_consumer: Callable[[Optional[RobotActionConsumer]], None],
-    sleep: Optional[Callable[[float], None]] = None,
-) -> None:
-    """Subscribe ``robot-action`` and apply it to every arm backend, retrying until stop.
-
-    ``register_consumer`` publishes the live consumer to the shutdown path so it
-    can be cancelled mid-subscribe; it is cleared between attempts. The appliers are
-    owned by the caller (the in-process services) and are NOT closed here.
-    """
-    backoff = sleep if sleep is not None else (lambda seconds: stop_event.wait(seconds))
-    while not stop_event.is_set():
-        consumer: Optional[RobotActionConsumer] = None
-        try:
-            consumer = RobotActionConsumer(
-                SourceConsumer.connect(loop_addr), backends, source_id=action_source_id
-            )
-            # Register BEFORE the stop re-check so a stop that lands now can find
-            # and cancel this consumer; then bail before blocking in run().
-            register_consumer(consumer)
-            if stop_event.is_set():
-                return
-            consumer.run()
-        except (
-            Exception
-        ) as exc:  # connect/subscription faulted (e.g. source not open yet)
-            if stop_event.is_set():
-                return
-            LOGGER.warning(
-                "robot-action lane error; retrying in %.1fs: %s", _ACTION_RETRY_S, exc
-            )
-        finally:
-            register_consumer(None)
-            if consumer is not None:
-                with contextlib.suppress(Exception):
-                    consumer.close()
-        if stop_event.is_set():
-            return
-        backoff(_ACTION_RETRY_S)
 
 
 def now_us() -> int:

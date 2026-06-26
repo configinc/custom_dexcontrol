@@ -37,17 +37,23 @@ class _FakeService:
 def _import_source_server(monkeypatch: pytest.MonkeyPatch) -> object:
     fake_server = types.ModuleType("dexcontrol.core.robotenv_vega.server")
     fake_server.robotenv_pb2 = types.SimpleNamespace(StepRequest=_StepRequest)
-    fake_server.robotenv_pb2_grpc = types.SimpleNamespace(add_RobotEnvServicer_to_server=lambda *_: None)
+    fake_server.robotenv_pb2_grpc = types.SimpleNamespace(
+        add_RobotEnvServicer_to_server=lambda *_: None
+    )
     fake_server.VegaRobotEnvService = object
 
     monkeypatch.setitem(sys.modules, "dexcontrol", types.ModuleType("dexcontrol"))
-    monkeypatch.setitem(sys.modules, "dexcontrol.core", types.ModuleType("dexcontrol.core"))
+    monkeypatch.setitem(
+        sys.modules, "dexcontrol.core", types.ModuleType("dexcontrol.core")
+    )
     monkeypatch.setitem(
         sys.modules,
         "dexcontrol.core.robotenv_vega",
         types.ModuleType("dexcontrol.core.robotenv_vega"),
     )
-    monkeypatch.setitem(sys.modules, "dexcontrol.core.robotenv_vega.server", fake_server)
+    monkeypatch.setitem(
+        sys.modules, "dexcontrol.core.robotenv_vega.server", fake_server
+    )
     sys.modules.pop("loop_bridge.source_server", None)
     return importlib.import_module("loop_bridge.source_server")
 
@@ -56,7 +62,9 @@ def test_step_applier_sends_successful_step(monkeypatch: pytest.MonkeyPatch) -> 
     source_server = _import_source_server(monkeypatch)
     service = _FakeService(status="SUCCESS")
 
-    source_server._StepApplier(service).step([1.0, 2.0], "target_cartesian_delta", "position")
+    source_server._StepApplier(service).step(
+        [1.0, 2.0], "target_cartesian_delta", "position"
+    )
 
     assert len(service.requests) == 1
     assert service.requests[0].action == [1.0, 2.0]
@@ -64,7 +72,9 @@ def test_step_applier_sends_successful_step(monkeypatch: pytest.MonkeyPatch) -> 
     assert service.requests[0].gripper_action_space == "position"
 
 
-def test_step_applier_raises_on_non_success_response(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_step_applier_raises_on_non_success_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source_server = _import_source_server(monkeypatch)
     service = _FakeService(status="IK_FAILED", message="unreachable target")
 
