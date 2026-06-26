@@ -177,6 +177,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._cmd_lock = threading.Lock()
         # Set by a new Reset to cancel any in-progress _move_incremental loop.
         self._cancel_move = threading.Event()
+        # Set while Reset is executing; Step checks this to reject commands early.
+        self._resetting = threading.Event()
 
         LOGGER.info(
             "Initialized VegaRobotEnvService model=%s arm=%s gripper=%s frame=%s hz=%s",
@@ -436,6 +438,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
         # Cancel any in-progress _move_incremental from a previous Reset.
         self._cancel_move.set()
+        self._resetting.set()
 
         # Pause the control loop during reset to prevent conflicting commands.
         was_running = self._control_loop_thread is not None and self._control_loop_thread.is_alive()
@@ -477,8 +480,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 # Restart control loop if it was running before reset.
                 if was_running:
                     self._start_control_loop()
+                self._resetting.clear()
 
     def Step(self, request, context):
+        if self._resetting.is_set():
+            observation, timestamp_us = self._safe_observation()
+            return robotenv_pb2.StepResponse(
+                observation=observation,
+                status="RESET_IN_PROGRESS",
+                message="Step rejected: robot is resetting",
+                timestamp_us=timestamp_us,
+            )
+
         action_space = request.action_space
         action_space_for_robot = action_space
         action = np.asarray(request.action, dtype=np.float64)
