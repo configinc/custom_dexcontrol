@@ -22,21 +22,35 @@ class _StepRequest:
         self.gripper_action_space = gripper_action_space
 
 
+class _ResetRequest:
+    def __init__(self, *, mode: str, params: object) -> None:
+        self.mode = mode
+        self.params = params
+
+
 class _FakeService:
     def __init__(self, *, status: str = "SUCCESS", message: str = "") -> None:
         self.status = status
         self.message = message
         self.requests: list[_StepRequest] = []
+        self.resets: list[_ResetRequest] = []
 
     def Step(self, request: _StepRequest, context: object) -> object:
         del context
         self.requests.append(request)
         return types.SimpleNamespace(status=self.status, message=self.message)
 
+    def Reset(self, request: _ResetRequest, context: object) -> object:
+        del context
+        self.resets.append(request)
+        return types.SimpleNamespace(status=self.status, message=self.message)
+
 
 def _import_source_server(monkeypatch: pytest.MonkeyPatch) -> object:
     fake_server = types.ModuleType("dexcontrol.core.robotenv_vega.server")
-    fake_server.robotenv_pb2 = types.SimpleNamespace(StepRequest=_StepRequest)
+    fake_server.robotenv_pb2 = types.SimpleNamespace(
+        StepRequest=_StepRequest, ResetRequest=_ResetRequest
+    )
     fake_server.robotenv_pb2_grpc = types.SimpleNamespace(
         add_RobotEnvServicer_to_server=lambda *_: None
     )
@@ -80,3 +94,23 @@ def test_step_applier_raises_on_non_success_response(
 
     with pytest.raises(RuntimeError, match="IK_FAILED"):
         source_server._StepApplier(service).step([1.0], "target_cartesian_delta", "")
+
+
+def test_step_applier_home_sends_reset_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    source_server = _import_source_server(monkeypatch)
+    service = _FakeService(status="SUCCESS")
+
+    source_server._StepApplier(service).home()
+
+    assert len(service.resets) == 1
+    assert service.resets[0].mode == "home"
+
+
+def test_step_applier_home_raises_on_non_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_server = _import_source_server(monkeypatch)
+    service = _FakeService(status="HOME_FAILED", message="estopped")
+
+    with pytest.raises(RuntimeError, match="HOME_FAILED"):
+        source_server._StepApplier(service).home()

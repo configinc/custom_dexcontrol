@@ -30,7 +30,13 @@ from concurrent import futures
 from typing import Any, Optional, Sequence
 
 import grpc
-from loop_sdk import RobotActionReceiver, RobotConfig, RobotConfigOptions
+from loop_sdk import (
+    HOME,
+    RobotActionReceiver,
+    RobotCommandReceiver,
+    RobotConfig,
+    RobotConfigOptions,
+)
 
 # Importing the upstream module runs its sys.path setup and binds the proto stubs.
 from dexcontrol.core.robotenv_vega import server as _vega_server
@@ -45,6 +51,7 @@ from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 LOGGER = logging.getLogger("loop_bridge.vega")
 
 DEFAULT_ACTION_SOURCE_ID = "robot-action"
+DEFAULT_COMMAND_SOURCE_ID = "robot-command"
 DEFAULT_ACTION_SPACE = "target_cartesian_delta"
 DEFAULT_OBS_HZ = 20.0
 
@@ -96,6 +103,20 @@ class _StepApplier:
                 f"robot-action Step returned {status}: {getattr(response, 'message', '')}"
             )
 
+    def home(self) -> None:
+        """Home this arm: ``Reset(mode="home")`` — moves it to its home pose.
+
+        The operational counterpart to ``step``; surfaces a non-SUCCESS reset the
+        same way (the bus would otherwise treat a stalled home as success).
+        """
+        request = _vega_server.robotenv_pb2.ResetRequest(mode="home", params={})
+        response = self._service.Reset(request, _BusStepContext())
+        status = getattr(response, "status", "") or ""
+        if status and status != "SUCCESS":
+            raise RuntimeError(
+                f"home Reset returned {status}: {getattr(response, 'message', '')}"
+            )
+
 
 class _LockedStepService(_vega_server.VegaRobotEnvService):
     """``VegaRobotEnvService`` whose ``Step`` is serialized on the upstream ``_cmd_lock``.
@@ -123,6 +144,7 @@ class LoopBridge:
         obs_source_id: str = DEFAULT_OBS_SOURCE_ID,
         obs_source_name: str = DEFAULT_OBS_SOURCE_NAME,
         action_source_id: str = DEFAULT_ACTION_SOURCE_ID,
+        command_source_id: str = DEFAULT_COMMAND_SOURCE_ID,
         action_space: str = DEFAULT_ACTION_SPACE,
         gripper_action_space: str = "",
         obs_hz: float = DEFAULT_OBS_HZ,
@@ -170,6 +192,7 @@ class LoopBridge:
         # reconnect thread); the obs poll pulls its latest() each tick and Steps each
         # arm. One per-arm Step applier; latest() is {} when nothing fresh -> hold.
         self._action_receiver: Any = None
+        self._command_receiver: Any = None
         self._appliers: dict[str, _StepApplier] = {}
         if enable_action:
             self._appliers = {
@@ -183,6 +206,10 @@ class LoopBridge:
                 action_space=action_space,
             )
             self._action_receiver.connect()
+            # Operational commands (home between episodes, ...) share the per-arm
+            # appliers to drive the robot, so the lane runs only when actions do.
+            self._command_receiver = RobotCommandReceiver(loop_addr, command_source_id)
+            self._command_receiver.connect()
 
         obs_thread = threading.Thread(
             target=lanes.run_obs_poll,
@@ -191,7 +218,7 @@ class LoopBridge:
                 read_observation=self._read_observations,
                 publish=self._obs_publisher.publish,
                 period_s=lambda: self._period_s,
-                apply_actions=self._apply_actions if enable_action else None,
+                apply_actions=self._apply_bus if enable_action else None,
             ),
             name="robot-obs-poll",
             daemon=True,
@@ -235,6 +262,32 @@ class LoopBridge:
                 timestamp_us = sample_ts
         return observations, int(timestamp_us or 0)
 
+    def _apply_bus(self) -> None:
+        """One tick of bus inputs: run operational commands, then Step actions.
+
+        Commands first so a home is honored before the (held) action of that tick.
+        """
+        self._apply_commands()
+        self._apply_actions()
+
+    def _apply_commands(self) -> None:
+        """Run any operational commands pulled this tick (home each arm on HOME).
+
+        Each drained command runs once; unknown commands and a failed home are
+        logged and skipped, never fatal to the lane.
+        """
+        if self._command_receiver is None:
+            return
+        for command in self._command_receiver.drain():
+            if command != HOME:
+                LOGGER.warning("ignoring unknown robot-command %r", command)
+                continue
+            for arm_prefix, applier in self._appliers.items():
+                try:
+                    applier.home()
+                except Exception as exc:
+                    LOGGER.warning("home failed for %s; skipping: %s", arm_prefix, exc)
+
     def _apply_actions(self) -> None:
         """Step each arm with the freshest pulled action ({} when nothing fresh → hold)."""
         if self._action_receiver is None:
@@ -258,6 +311,9 @@ class LoopBridge:
         if self._action_receiver is not None:
             with contextlib.suppress(Exception):
                 self._action_receiver.disconnect()  # stops its subscribe thread
+        if self._command_receiver is not None:
+            with contextlib.suppress(Exception):
+                self._command_receiver.disconnect()
         for thread in self._threads:
             thread.join(timeout=5.0)
             if thread.is_alive():
@@ -287,6 +343,7 @@ def serve_with_loop(
     obs_source_name: str = DEFAULT_OBS_SOURCE_NAME,
     arm_prefix: str = DEFAULT_ARM_PREFIX,
     action_source_id: str = DEFAULT_ACTION_SOURCE_ID,
+    command_source_id: str = DEFAULT_COMMAND_SOURCE_ID,
     action_space: str = DEFAULT_ACTION_SPACE,
     gripper_action_space: str = "",
     obs_hz: float = DEFAULT_OBS_HZ,
@@ -307,6 +364,7 @@ def serve_with_loop(
         obs_source_id=obs_source_id,
         obs_source_name=obs_source_name,
         action_source_id=action_source_id,
+        command_source_id=command_source_id,
         action_space=action_space,
         gripper_action_space=gripper_action_space,
         obs_hz=obs_hz,
@@ -344,6 +402,7 @@ def serve_dual_arm(
     obs_source_id: str = DEFAULT_OBS_SOURCE_ID,
     obs_source_name: str = DEFAULT_OBS_SOURCE_NAME,
     action_source_id: str = DEFAULT_ACTION_SOURCE_ID,
+    command_source_id: str = DEFAULT_COMMAND_SOURCE_ID,
     action_space: str = DEFAULT_ACTION_SPACE,
     gripper_action_space: str = "",
     obs_hz: float = DEFAULT_OBS_HZ,
@@ -392,6 +451,7 @@ def serve_dual_arm(
         obs_source_id=obs_source_id,
         obs_source_name=obs_source_name,
         action_source_id=action_source_id,
+        command_source_id=command_source_id,
         action_space=action_space,
         gripper_action_space=gripper_action_space,
         obs_hz=obs_hz,

@@ -24,6 +24,7 @@ from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 from loop_bridge.source_server import (
     DEFAULT_ACTION_SOURCE_ID,
     DEFAULT_ACTION_SPACE,
+    DEFAULT_COMMAND_SOURCE_ID,
     DEFAULT_OBS_HZ,
     serve_dual_arm,
     serve_with_loop,
@@ -59,6 +60,11 @@ def main() -> None:
         "--action-source-id",
         default=DEFAULT_ACTION_SOURCE_ID,
         help="robot-action source id",
+    )
+    parser.add_argument(
+        "--command-source-id",
+        default=DEFAULT_COMMAND_SOURCE_ID,
+        help="robot-command source id (operational commands, e.g. home)",
     )
     parser.add_argument(
         "--action-space",
@@ -118,6 +124,7 @@ def main() -> None:
         obs_source_id=args.obs_source_id,
         obs_source_name=args.obs_source_name,
         action_source_id=args.action_source_id,
+        command_source_id=args.command_source_id,
         action_space=args.action_space,
         gripper_action_space=args.gripper_action_space,
         obs_hz=args.obs_hz,
