@@ -106,6 +106,43 @@ def main() -> None:
     parser.add_argument(
         "--control-hz", type=int, default=20, help="Control frequency in Hz"
     )
+    # --- VegaRobotEnvService tuning (forwarded verbatim, mirrors server.py) ---
+    # These reach VegaRobotEnvService unchanged; defaults match server.py so an
+    # omitted flag behaves exactly as the standalone server would.
+    parser.add_argument("--frame-type", default="vega_mobile_base",
+                        choices=["vega_mobile_base", "vega_table_mount", "vega_custom"],
+                        help="Robot mounting frame type")
+    parser.add_argument("--use-velocity-feedforward", action="store_true",
+                        help="Send pos+vel feedforward instead of position-only arm commands")
+    parser.add_argument("--base-frame-rotation", type=float, nargs=3, default=None,
+                        metavar=("ROLL", "PITCH", "YAW"), help="Custom base-frame rotation (deg)")
+    parser.add_argument("--ik-solver", dest="ik_solver_type", default="pink",
+                        choices=["pink", "placo"], help="IK solver backend")
+    parser.add_argument("--gripper-iface", default=None,
+                        help="EtherCAT iface for SR gripper; overrides --robotiq-comport when set")
+    parser.add_argument("--ema-alpha", type=float, default=0.0,
+                        help="Joint-command smoothing responsiveness (0=disabled)")
+    parser.add_argument("--ik-damping-default", type=float, default=1e-3)
+    parser.add_argument("--ik-damping-torso", type=float, default=30000.0)
+    parser.add_argument("--ik-damping-arm-j2", type=float, default=100.0)
+    parser.add_argument("--ik-damping-arm-j3", type=float, default=50.0)
+    parser.add_argument("--interpolation-method", default="none",
+                        choices=["none", "linear", "cubic"], help="Input→control-rate upsampling")
+    parser.add_argument("--interpolation-history", type=int, default=4)
+    parser.add_argument("--control-loop-hz", type=int, default=0,
+                        help="Control loop frequency for interpolation upsampling (0=off)")
+    parser.add_argument("--filter-type", default="none",
+                        choices=["none", "butterworth", "ema"], help="Output filter")
+    parser.add_argument("--filter-cutoff-freq", type=float, default=10.0)
+    parser.add_argument("--filter-order", type=int, default=2)
+    parser.add_argument("--filter-ema-alpha", type=float, default=0.1)
+    parser.add_argument("--vel-smoothing-alpha", type=float, default=0.3)
+    parser.add_argument("--hw-correction-alpha", type=float, default=0.7)
+    parser.add_argument("--max-delta-scale", type=float, default=1.0)
+    parser.add_argument("--max-jerk", type=float, default=0.25)
+    parser.add_argument("--rot-sensitivity", type=float, default=1.0)
+    parser.add_argument("--vel-ratio", type=float, default=1.0)
+    parser.add_argument("--vel-damp-thresh", type=float, default=0.05)
     parser.add_argument(
         "--control-hz-options",
         default="",
@@ -136,11 +173,37 @@ def main() -> None:
             v.strip() for v in args.action_space_options.split(",") if v.strip()
         ),
     )
+    # --gripper-iface (SR EtherCAT) takes precedence over --robotiq-comport, both
+    # feed the one "where is the gripper" slot (mirrors server.py).
+    gripper_addr = args.gripper_iface or args.robotiq_comport
     service_kwargs = dict(
         robot_model=args.robot_model,
         gripper_type=args.gripper_type,
-        robotiq_comport=args.robotiq_comport,
+        frame_type=args.frame_type,
         control_hz=args.control_hz,
+        use_velocity_feedforward=args.use_velocity_feedforward,
+        base_frame_rotation=args.base_frame_rotation,
+        ik_solver_type=args.ik_solver_type,
+        robotiq_comport=gripper_addr,
+        ema_alpha=args.ema_alpha,
+        ik_damping_default=args.ik_damping_default,
+        ik_damping_torso=args.ik_damping_torso,
+        ik_damping_arm_j2=args.ik_damping_arm_j2,
+        ik_damping_arm_j3=args.ik_damping_arm_j3,
+        interpolation_method=args.interpolation_method,
+        interpolation_history=args.interpolation_history,
+        control_loop_hz=args.control_loop_hz,
+        filter_type=args.filter_type,
+        filter_cutoff_freq=args.filter_cutoff_freq,
+        filter_order=args.filter_order,
+        filter_ema_alpha=args.filter_ema_alpha,
+        vel_smoothing_alpha=args.vel_smoothing_alpha,
+        hw_correction_alpha=args.hw_correction_alpha,
+        max_delta_scale=args.max_delta_scale,
+        max_jerk=args.max_jerk,
+        rot_sensitivity=args.rot_sensitivity,
+        vel_ratio=args.vel_ratio,
+        vel_damp_thresh=args.vel_damp_thresh,
     )
 
     if args.dual_arm:
