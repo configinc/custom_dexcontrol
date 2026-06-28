@@ -101,7 +101,15 @@ def main() -> None:
         "--gripper-type", default="default", help="Gripper type (e.g. robotiq)"
     )
     parser.add_argument(
-        "--robotiq-comport", default="/dev/ttyUSB0", help="Robotiq serial port"
+        "--robotiq-comport", default="/dev/ttyUSB0", help="Robotiq serial port (single-arm)"
+    )
+    parser.add_argument(
+        "--robotiq-comport-left", default=None,
+        help="Dual-arm: left arm's Robotiq serial port (distinct from right)",
+    )
+    parser.add_argument(
+        "--robotiq-comport-right", default=None,
+        help="Dual-arm: right arm's Robotiq serial port (distinct from left)",
     )
     parser.add_argument(
         "--control-hz", type=int, default=20, help="Control frequency in Hz"
@@ -208,8 +216,14 @@ def main() -> None:
 
     if args.dual_arm:
         # One Vega, both arms, one robot-obs (robot0+robot1). No gRPC server — the
-        # bridge owns the lifetime and actions arrive via the bus.
-        serve_dual_arm(**loop_kwargs, **service_kwargs)
+        # bridge owns the lifetime and actions arrive via the bus. Each arm opens
+        # its own gripper on its own comport (distinct ports required for serial).
+        serve_dual_arm(
+            left_robotiq_comport=args.robotiq_comport_left,
+            right_robotiq_comport=args.robotiq_comport_right,
+            **loop_kwargs,
+            **service_kwargs,
+        )
     else:
         serve_with_loop(
             grpc_port=args.grpc_port,

@@ -114,3 +114,28 @@ def test_step_applier_home_raises_on_non_success(
 
     with pytest.raises(RuntimeError, match="HOME_FAILED"):
         source_server._StepApplier(service).home()
+
+
+# --- dual-arm per-arm gripper comports -------------------------------------
+
+
+def test_dual_arm_comports_distinct_robotiq_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    source_server = _import_source_server(monkeypatch)
+    kwargs = {"gripper_type": "robotiq", "robotiq_comport": "/dev/ttyUSB0"}
+    left, right = source_server._dual_arm_comports(kwargs, "/dev/ttyUSB1", "/dev/ttyUSB0")
+    assert (left, right) == ("/dev/ttyUSB1", "/dev/ttyUSB0")
+
+
+def test_dual_arm_comports_same_serial_port_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    source_server = _import_source_server(monkeypatch)
+    kwargs = {"gripper_type": "robotiq", "robotiq_comport": "/dev/ttyUSB0"}
+    # Both arms falling back to the same shared port is the footgun → reject.
+    with pytest.raises(ValueError, match="DISTINCT comport"):
+        source_server._dual_arm_comports(kwargs, None, None)
+
+
+def test_dual_arm_comports_non_serial_gripper_unrestricted(monkeypatch: pytest.MonkeyPatch) -> None:
+    source_server = _import_source_server(monkeypatch)
+    # Built-in (non-serial) grippers share no port → same/empty comport is fine.
+    kwargs = {"gripper_type": "default"}
+    assert source_server._dual_arm_comports(kwargs, None, None) == (None, None)

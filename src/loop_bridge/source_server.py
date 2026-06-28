@@ -395,6 +395,35 @@ def serve_with_loop(
     server.wait_for_termination()
 
 
+_SERIAL_GRIPPERS = ("robotiq", "sr_gripper")
+
+
+def _dual_arm_comports(
+    service_kwargs: dict[str, Any],
+    left_robotiq_comport: str | None,
+    right_robotiq_comport: str | None,
+) -> tuple[str | None, str | None]:
+    """Resolve each arm's gripper comport for dual-arm, rejecting the same-port footgun.
+
+    Per-arm overrides win; both fall back to the shared ``robotiq_comport``. A serial
+    gripper (robotiq/sr_gripper) is one physical device per port — two arms on the
+    SAME port would corrupt comms, so that is rejected. Distinct ports are fine: each
+    arm's VegaRobot opens its own gripper independent of the shared arm hardware.
+    """
+    base = service_kwargs.get("robotiq_comport")
+    left = left_robotiq_comport or base
+    right = right_robotiq_comport or base
+    gripper = service_kwargs.get("gripper_type", "default")
+    if gripper == "default":
+        gripper = service_kwargs.get("hand_type", "default")
+    if gripper in _SERIAL_GRIPPERS and left == right:
+        raise ValueError(
+            f"dual-arm with a serial gripper ({gripper!r}) needs a DISTINCT comport per arm; "
+            f"both arms resolved to {left!r}. Pass --robotiq-comport-left / --robotiq-comport-right."
+        )
+    return left, right
+
+
 def serve_dual_arm(
     *,
     loop_addr: str,
@@ -409,6 +438,8 @@ def serve_dual_arm(
     enable_action: bool = True,
     control_hz_options: Sequence[int] = (),
     action_space_options: Sequence[str] = (),
+    left_robotiq_comport: str | None = None,
+    right_robotiq_comport: str | None = None,
     **service_kwargs: Any,
 ) -> None:
     """Bimanual: ONE Vega robot, both arms, presented as one robot-obs/robot-action.
@@ -416,34 +447,26 @@ def serve_dual_arm(
     Builds the left service (which constructs the one ``Robot`` with both arms), then
     a right service that SHARES that Robot (injected), so both arms run over one
     hardware connection. Each service keeps its own per-arm IK/filter/gripper.
+
+    A serial gripper (robotiq/sr_gripper) is a separate device per arm — each arm's
+    ``VegaRobot`` opens its OWN gripper on its OWN comport, independent of the shared
+    arm hardware — so bimanual serial grippers work as long as each arm gets a
+    DISTINCT comport (``left_robotiq_comport`` / ``right_robotiq_comport``). The same
+    comport on both arms is the real footgun and is rejected.
     """
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     left_prefix, right_prefix = arm_prefixes
 
-    # A serial gripper (robotiq/sr_gripper) is one COM port; both arms sharing it
-    # would corrupt gripper comms. Bimanual needs the built-in per-arm grippers
-    # (or per-arm comports, not yet wired) — fail fast rather than open it twice.
-    # VegaRobot resolves ``hand_type`` to ``gripper_type`` when the latter is
-    # "default", so a programmatic caller can request a serial gripper via either
-    # key — guard both so neither path slips past.
-    serial_grippers = ("robotiq", "sr_gripper")
-    if (
-        service_kwargs.get("gripper_type", "default") in serial_grippers
-        or service_kwargs.get("hand_type") in serial_grippers
-    ):
-        requested = service_kwargs.get("gripper_type", "default")
-        if requested == "default":
-            requested = service_kwargs.get("hand_type")
-        raise ValueError(
-            f"dual-arm needs per-arm grippers; a shared serial gripper "
-            f"({requested!r}) can't be opened by both arms"
-        )
-
-    left = _LockedStepService(arm_side="left", **service_kwargs)
+    left_comport, right_comport = _dual_arm_comports(
+        service_kwargs, left_robotiq_comport, right_robotiq_comport
+    )
+    left = _LockedStepService(arm_side="left", **{**service_kwargs, "robotiq_comport": left_comport})
     shared_robot = left._robot.robot  # the one hardware unit (both arms) left built
-    right = _LockedStepService(arm_side="right", robot=shared_robot, **service_kwargs)
+    right = _LockedStepService(
+        arm_side="right", robot=shared_robot, **{**service_kwargs, "robotiq_comport": right_comport}
+    )
 
     bridge = LoopBridge(
         [(left_prefix, left), (right_prefix, right)],
