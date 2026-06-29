@@ -180,7 +180,8 @@ class LoopBridge:
 
         # One bus object owns the whole link: publish robot-obs + (when enabled)
         # consume robot-action + robot-command. The obs poll pulls actions()/commands()
-        # each tick and Steps/homes each arm via a per-arm _StepApplier.
+        # each tick and Steps/homes each arm via a per-arm _StepApplier. Obs-only
+        # (enable_action=False) wires neither input lane (no idle subscribe thread).
         self._link = LoopRobotClient(
             loop_addr,
             arms=tuple(arm_prefixes),
@@ -191,6 +192,7 @@ class LoopBridge:
             command_source_id=command_source_id,
             options=options,
             on_config=apply_config,
+            enable_action=enable_action,
         )
         self._link.connect()
 
