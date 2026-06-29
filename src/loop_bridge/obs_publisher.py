@@ -13,9 +13,6 @@ from typing import Any, Mapping
 
 from loop_bridge.robot_obs import observation_to_step
 
-DEFAULT_OBS_SOURCE_ID = "robot-obs"
-DEFAULT_OBS_SOURCE_NAME = "vega robot state"
-
 
 def merge_observations(observations: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     """Merge each arm's RobotEnv observation into one namespaced ``robot-obs`` dict.

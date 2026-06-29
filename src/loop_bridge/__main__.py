@@ -16,15 +16,9 @@ from __future__ import annotations
 
 import argparse
 
-from loop_bridge.obs_publisher import (
-    DEFAULT_OBS_SOURCE_ID,
-    DEFAULT_OBS_SOURCE_NAME,
-)
 from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 from loop_bridge.source_server import (
-    DEFAULT_ACTION_SOURCE_ID,
     DEFAULT_ACTION_SPACE,
-    DEFAULT_COMMAND_SOURCE_ID,
     DEFAULT_OBS_HZ,
     serve_dual_arm,
     serve_with_loop,
@@ -42,29 +36,12 @@ def main() -> None:
         default=DEFAULT_ARM_PREFIX,
         help="Channel arm prefix (e.g. robot0)",
     )
-    parser.add_argument(
-        "--obs-source-id", default=DEFAULT_OBS_SOURCE_ID, help="robot-obs source id"
-    )
-    parser.add_argument(
-        "--obs-source-name",
-        default=DEFAULT_OBS_SOURCE_NAME,
-        help="robot-obs source name",
-    )
+    # Source ids/name are pinned by the SDK (our lane convention) — not CLI-configurable.
     parser.add_argument(
         "--obs-hz",
         type=float,
         default=DEFAULT_OBS_HZ,
         help="robot-obs publish rate (Hz)",
-    )
-    parser.add_argument(
-        "--action-source-id",
-        default=DEFAULT_ACTION_SOURCE_ID,
-        help="robot-action source id",
-    )
-    parser.add_argument(
-        "--command-source-id",
-        default=DEFAULT_COMMAND_SOURCE_ID,
-        help="robot-command source id (operational commands, e.g. home)",
     )
     parser.add_argument(
         "--action-space",
@@ -166,10 +143,6 @@ def main() -> None:
 
     loop_kwargs = dict(
         loop_addr=args.loop_addr,
-        obs_source_id=args.obs_source_id,
-        obs_source_name=args.obs_source_name,
-        action_source_id=args.action_source_id,
-        command_source_id=args.command_source_id,
         action_space=args.action_space,
         gripper_action_space=args.gripper_action_space,
         obs_hz=args.obs_hz,

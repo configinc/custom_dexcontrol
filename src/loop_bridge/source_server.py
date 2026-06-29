@@ -39,18 +39,12 @@ from loop_sdk import (
 # Importing the upstream module runs its sys.path setup and binds the proto stubs.
 from dexcontrol.core.robotenv_vega import server as _vega_server
 from loop_bridge import lanes
-from loop_bridge.obs_publisher import (
-    DEFAULT_OBS_SOURCE_ID,
-    DEFAULT_OBS_SOURCE_NAME,
-    merge_observations,
-)
+from loop_bridge.obs_publisher import merge_observations
 from loop_bridge.robot_action import HOME, decode_action
 from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 
 LOGGER = logging.getLogger("loop_bridge.vega")
 
-DEFAULT_ACTION_SOURCE_ID = "robot-action"
-DEFAULT_COMMAND_SOURCE_ID = "robot-command"
 DEFAULT_ACTION_SPACE = "target_cartesian_delta"
 DEFAULT_OBS_HZ = 20.0
 
@@ -140,10 +134,6 @@ class LoopBridge:
         arm_services: Sequence[tuple[str, Any]],
         *,
         loop_addr: str,
-        obs_source_id: str = DEFAULT_OBS_SOURCE_ID,
-        obs_source_name: str = DEFAULT_OBS_SOURCE_NAME,
-        action_source_id: str = DEFAULT_ACTION_SOURCE_ID,
-        command_source_id: str = DEFAULT_COMMAND_SOURCE_ID,
         action_space: str = DEFAULT_ACTION_SPACE,
         gripper_action_space: str = "",
         obs_hz: float = DEFAULT_OBS_HZ,
@@ -185,7 +175,6 @@ class LoopBridge:
         # per-arm _StepApplier. Obs-only (enable_action=False) wires neither input lane.
         self._link = LoopRobotClient(
             loop_addr,
-            name=obs_source_name,
             options=options,
             on_config=apply_config,
             enable_action=enable_action,
@@ -216,11 +205,11 @@ class LoopBridge:
 
         LOGGER.info(
             "loop bridge enabled: robot-obs %r (%s, %.1f Hz) -> %s%s",
-            obs_source_id,
+            LoopRobotClient.OBS_SOURCE_ID,
             arm_prefixes,
             obs_hz,
             loop_addr,
-            f"; robot-action {action_source_id!r} -> Step({action_space})"
+            f"; robot-action {LoopRobotClient.ACTION_SOURCE_ID!r} -> Step({action_space})"
             if enable_action
             else "",
         )
@@ -333,11 +322,7 @@ def serve_with_loop(
     *,
     loop_addr: str,
     grpc_port: int = 50061,
-    obs_source_id: str = DEFAULT_OBS_SOURCE_ID,
-    obs_source_name: str = DEFAULT_OBS_SOURCE_NAME,
     arm_prefix: str = DEFAULT_ARM_PREFIX,
-    action_source_id: str = DEFAULT_ACTION_SOURCE_ID,
-    command_source_id: str = DEFAULT_COMMAND_SOURCE_ID,
     action_space: str = DEFAULT_ACTION_SPACE,
     gripper_action_space: str = "",
     obs_hz: float = DEFAULT_OBS_HZ,
@@ -355,10 +340,6 @@ def serve_with_loop(
     bridge = LoopBridge(
         [(arm_prefix, service)],
         loop_addr=loop_addr,
-        obs_source_id=obs_source_id,
-        obs_source_name=obs_source_name,
-        action_source_id=action_source_id,
-        command_source_id=command_source_id,
         action_space=action_space,
         gripper_action_space=gripper_action_space,
         obs_hz=obs_hz,
@@ -374,7 +355,7 @@ def serve_with_loop(
     LOGGER.info(
         "Vega RobotEnv+Loop server on 0.0.0.0:%d (robot-obs=%r)",
         grpc_port,
-        obs_source_id,
+        LoopRobotClient.OBS_SOURCE_ID,
     )
 
     def cleanup() -> None:
@@ -422,10 +403,6 @@ def serve_dual_arm(
     *,
     loop_addr: str,
     arm_prefixes: tuple[str, str] = ("robot0", "robot1"),
-    obs_source_id: str = DEFAULT_OBS_SOURCE_ID,
-    obs_source_name: str = DEFAULT_OBS_SOURCE_NAME,
-    action_source_id: str = DEFAULT_ACTION_SOURCE_ID,
-    command_source_id: str = DEFAULT_COMMAND_SOURCE_ID,
     action_space: str = DEFAULT_ACTION_SPACE,
     gripper_action_space: str = "",
     obs_hz: float = DEFAULT_OBS_HZ,
@@ -465,10 +442,6 @@ def serve_dual_arm(
     bridge = LoopBridge(
         [(left_prefix, left), (right_prefix, right)],
         loop_addr=loop_addr,
-        obs_source_id=obs_source_id,
-        obs_source_name=obs_source_name,
-        action_source_id=action_source_id,
-        command_source_id=command_source_id,
         action_space=action_space,
         gripper_action_space=gripper_action_space,
         obs_hz=obs_hz,
@@ -479,7 +452,7 @@ def serve_dual_arm(
     LOGGER.info(
         "Vega dual-arm bridge running: arms=%s robot-obs=%r",
         list(arm_prefixes),
-        obs_source_id,
+        LoopRobotClient.OBS_SOURCE_ID,
     )
 
     def cleanup() -> None:
