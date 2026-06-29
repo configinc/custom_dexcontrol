@@ -38,7 +38,6 @@ from loop_sdk import (
 
 # Importing the upstream module runs its sys.path setup and binds the proto stubs.
 from dexcontrol.core.robotenv_vega import server as _vega_server
-from loop_bridge import lanes
 from loop_bridge.obs_publisher import merge_observations
 from loop_bridge.robot_action import HOME, decode_action
 from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
@@ -179,7 +178,6 @@ class LoopBridge:
             on_config=apply_config,
             enable_action=enable_action,
         )
-        self._link.connect()
 
         self._appliers: dict[str, _StepApplier] = {}
         if enable_action:
@@ -188,20 +186,24 @@ class LoopBridge:
                 for arm_prefix, service in self._arm_services
             }
 
-        obs_thread = threading.Thread(
-            target=lanes.run_obs_poll,
+        # The SDK owns the loop. Vega is in-process with the RobotEnv gRPC server, so
+        # run() goes on a daemon thread (the main thread serves Step + waits for shutdown);
+        # it connects the link, drives obs on the clock (read_obs — what breaks the
+        # obs/action startup cycle), and hands fresh action/command to the callbacks.
+        loop_thread = threading.Thread(
+            target=self._link.run,
             kwargs=dict(
-                stop_event=self._lane_stop,
-                read_observation=self._read_observations,
-                publish=self._publish_obs,
-                period_s=lambda: self._period_s,
-                apply_actions=self._apply_bus if enable_action else None,
+                obs_callback=self._read_obs,
+                action_callback=self._apply_action if enable_action else None,
+                command_callback=self._apply_command if enable_action else None,
+                hz=lambda: 1.0 / self._period_s,
+                stop=self._lane_stop,
             ),
             name="robot-obs-poll",
             daemon=True,
         )
-        obs_thread.start()
-        self._threads: list[threading.Thread] = [obs_thread]
+        loop_thread.start()
+        self._threads: list[threading.Thread] = [loop_thread]
 
         LOGGER.info(
             "loop bridge enabled: robot-obs %r (%s, %.1f Hz) -> %s%s",
@@ -228,8 +230,12 @@ class LoopBridge:
         if action_space:
             self._action_space = action_space
 
-    def _read_observations(self) -> tuple[dict[str, Any], int]:
-        """Read every arm's observation in one tick (paired) → {prefix: obs}, timestamp."""
+    def _read_obs(self) -> tuple[int, dict[str, Any]]:
+        """``obs_callback``: read every arm's observation (paired) and merge into one robot-obs.
+
+        Returns ``(timestamp_us, merged payload)`` for ``run()`` to publish — the first
+        arm's sample timestamp.
+        """
         observations: dict[str, Any] = {}
         timestamp_us: Optional[int] = None
         for arm_prefix, service in self._arm_services:
@@ -237,48 +243,24 @@ class LoopBridge:
             observations[arm_prefix] = observation
             if timestamp_us is None:
                 timestamp_us = sample_ts
-        return observations, int(timestamp_us or 0)
+        return int(timestamp_us or 0), merge_observations(observations)
 
-    def _publish_obs(self, observations: dict[str, Any], timestamp_us: int) -> bool:
-        """Merge each arm's observation into one ``robot-obs`` sample and publish it."""
-        return self._link.publish_obs(timestamp_us, merge_observations(observations))
-
-    def _apply_bus(self) -> None:
-        """One tick of bus inputs: run operational commands, then Step actions.
-
-        Commands first so a home is honored before the (held) action of that tick.
-        """
-        self._apply_commands()
-        self._apply_actions()
-
-    def _apply_commands(self) -> None:
-        """Run any operational commands pulled this tick (home each arm on HOME).
-
-        Each drained command runs once; unknown commands and a failed home are
-        logged and skipped, never fatal to the lane.
-        """
+    def _apply_command(self, command: dict[str, Any]) -> None:
+        """``command_callback``: home each arm on a HOME command (unknown/failed logged + skipped)."""
         if not self._appliers:
             return
-        for command in self._link.drain_commands():  # raw payload dicts
-            if command.get("command") != HOME:
-                LOGGER.warning("ignoring unknown robot-command %r", command)
-                continue
-            for arm_prefix, applier in self._appliers.items():
-                try:
-                    applier.home()
-                except Exception as exc:
-                    LOGGER.warning("home failed for %s; skipping: %s", arm_prefix, exc)
-
-    def _apply_actions(self) -> None:
-        """Step each arm with the freshest pulled action (nothing fresh → hold).
-
-        ``poll_action`` hands back the raw ``robot-action`` payload once (a delta is
-        not replayed when nothing new arrived); we decode each arm's vector out of it.
-        """
-        if not self._appliers:
+        if command.get("command") != HOME:
+            LOGGER.warning("ignoring unknown robot-command %r", command)
             return
-        payload = self._link.poll_action(once=True)
-        if not payload:
+        for arm_prefix, applier in self._appliers.items():
+            try:
+                applier.home()
+            except Exception as exc:
+                LOGGER.warning("home failed for %s; skipping: %s", arm_prefix, exc)
+
+    def _apply_action(self, payload: dict[str, Any]) -> None:
+        """``action_callback``: decode each arm's vector from the raw robot-action and Step it."""
+        if not self._appliers:
             return
         for arm_prefix, applier in self._appliers.items():
             action = decode_action(payload, arm_prefix, self._action_space)

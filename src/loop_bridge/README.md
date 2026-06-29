@@ -11,27 +11,30 @@ our addition on top of the upstream-synced `dexcontrol` tree, and keeping it
 separate (a) minimizes upstream-sync merge conflicts and (b) lets the bus logic
 be unit-tested without the heavy `dexcontrol` import.
 
-## Two lanes
+## The loop
 
-- **obs lane** — an `robot-obs` poll thread reads the current observation on a
-  clock and publishes it. Vega computes obs only inside `_create_observation`, so
-  the bridge must drive it on a clock: otherwise teleop (which needs obs to
-  compute a delta) and obs (driven by the resulting action's `Step`) deadlock at
-  startup. This lane breaks that cycle, so obs streams independently of actions.
-- **action lane** — a thread subscribes `robot-action` and replays each frame
-  through the service's own `Step` (reusing its teleop-gain / frame-transform /
-  interpolation logic), retrying until the source opens.
+The control loop lives in loop-sdk's `LoopRobotClient.run` (timing, connect/disconnect,
+the poll/drain/publish wiring). `LoopBridge` just supplies its device callbacks and,
+because the bridge runs **in-process** with the RobotEnv gRPC server, starts `run()` on
+a daemon thread while the main thread serves `Step`:
+
+- `read_obs` (`obs_callback`) reads the current observation on the clock and returns it
+  to publish. Vega computes obs only inside `_create_observation`, so the bridge drives
+  it on a clock — that's what bootstraps obs from tick 0 with no input, so a relative-delta
+  teleop can start (obs gated on an action's `Step` would never produce the first sample).
+- `apply_action` (`action_callback`) decodes each arm's vector from the raw `robot-action`
+  payload and replays it through the service's own `Step` (reusing its teleop-gain /
+  frame-transform / interpolation logic).
+- `apply_command` (`command_callback`) homes each arm on a `HOME` command.
 
 ## Layout
 
 | Module | Role | Depends on |
 |---|---|---|
 | `robot_obs.py` | `robot-obs` channel layout + observation→step-dict projection | loop-sdk only |
-| `robot_action.py` | `robot-action` decode (`<arm>.action.<space>[i]` → action vector) | loop-sdk only |
-| `obs_publisher.py` | `RobotObsPublisher` — wraps a loop-sdk `RobotStepSender` | loop-sdk only |
-| `action_consumer.py` | `ArmActionBackend` (per-arm decode→Step) + `RobotActionConsumer` (one source → N backends) | loop-sdk only |
-| `lanes.py` | `run_obs_poll` + `run_action_lane` (the two thread bodies) | loop-sdk only |
-| `source_server.py` | `_LockedStepService` + `LoopBridge` (N arm services → one robot-obs) + `serve_with_loop` (single) / `serve_dual_arm` (bimanual) | dexcontrol + loop-sdk |
+| `robot_action.py` | `robot-action` decode (`<arm>.action.<space>` → action vector) + `HOME` | loop-sdk only |
+| `obs_publisher.py` | `merge_observations` — merge each arm's obs into one `robot-obs` dict | loop-sdk only |
+| `source_server.py` | `_LockedStepService` + `LoopBridge` (N arm services → callbacks for `LoopRobotClient.run`, on a thread) + `serve_with_loop` (single) / `serve_dual_arm` (bimanual) | dexcontrol + loop-sdk |
 | `__main__.py` | CLI launcher | the above |
 
 Every module except `source_server` has no `dexcontrol` import, so the tests in
