@@ -193,9 +193,9 @@ class LoopBridge:
         loop_thread = threading.Thread(
             target=self._run_link,
             kwargs=dict(
-                obs_callback=self._read_obs,
-                action_callback=self._apply_action if enable_action else None,
-                command_callback=self._apply_command if enable_action else None,
+                publish_obs_callback=self._read_obs,
+                poll_action_callback=self._apply_action if enable_action else None,
+                drain_commands_callback=self._apply_command if enable_action else None,
                 hz=lambda: 1.0 / self._period_s,
                 stop=self._lane_stop,
             ),
@@ -239,7 +239,7 @@ class LoopBridge:
             LOGGER.exception("loop bridge run() thread exited with an error")
 
     def _read_obs(self) -> tuple[int, dict[str, Any]]:
-        """``obs_callback``: read every arm's observation (paired) and merge into one robot-obs.
+        """``publish_obs_callback``: read every arm's observation (paired) and merge into one robot-obs.
 
         Returns ``(timestamp_us, merged payload)`` for ``run()`` to publish — the first
         arm's sample timestamp.
@@ -254,7 +254,7 @@ class LoopBridge:
         return int(timestamp_us or 0), merge_observations(observations)
 
     def _apply_command(self, command: dict[str, Any]) -> None:
-        """``command_callback``: home each arm on a HOME command (unknown/failed logged + skipped)."""
+        """``drain_commands_callback``: home each arm on a HOME command (unknown/failed logged + skipped)."""
         if not self._appliers:
             return
         if command.get("command") != HOME:
@@ -267,7 +267,7 @@ class LoopBridge:
                 LOGGER.warning("home failed for %s; skipping: %s", arm_prefix, exc)
 
     def _apply_action(self, payload: dict[str, Any]) -> None:
-        """``action_callback``: decode each arm's vector from the raw robot-action and Step it."""
+        """``poll_action_callback``: decode each arm's vector from the raw robot-action and Step it."""
         if not self._appliers:
             return
         for arm_prefix, applier in self._appliers.items():

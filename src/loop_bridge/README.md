@@ -18,14 +18,15 @@ the poll/drain/publish wiring). `LoopBridge` just supplies its device callbacks 
 because the bridge runs **in-process** with the RobotEnv gRPC server, starts `run()` on
 a daemon thread while the main thread serves `Step`:
 
-- `read_obs` (`obs_callback`) reads the current observation on the clock and returns it
-  to publish. Vega computes obs only inside `_create_observation`, so the bridge drives
-  it on a clock — that's what bootstraps obs from tick 0 with no input, so a relative-delta
-  teleop can start (obs gated on an action's `Step` would never produce the first sample).
-- `apply_action` (`action_callback`) decodes each arm's vector from the raw `robot-action`
-  payload and replays it through the service's own `Step` (reusing its teleop-gain /
-  frame-transform / interpolation logic).
-- `apply_command` (`command_callback`) homes each arm on a `HOME` command.
+- `_read_obs` (`publish_obs_callback`) reads the current observation on the clock and
+  returns it to publish. Vega computes obs only inside `_create_observation`, so the
+  bridge drives it on a clock — that's what bootstraps obs from tick 0 with no input, so a
+  relative-delta teleop can start (obs gated on an action's `Step` would never produce the
+  first sample).
+- `_apply_action` (`poll_action_callback`) decodes each arm's vector from the raw
+  `robot-action` payload and replays it through the service's own `Step` (reusing its
+  teleop-gain / frame-transform / interpolation logic).
+- `_apply_command` (`drain_commands_callback`) homes each arm on a `HOME` command.
 
 ## Layout
 
