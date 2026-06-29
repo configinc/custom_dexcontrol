@@ -191,7 +191,7 @@ class LoopBridge:
         # it connects the link, drives obs on the clock (read_obs — what breaks the
         # obs/action startup cycle), and hands fresh action/command to the callbacks.
         loop_thread = threading.Thread(
-            target=self._link.run,
+            target=self._run_link,
             kwargs=dict(
                 obs_callback=self._read_obs,
                 action_callback=self._apply_action if enable_action else None,
@@ -229,6 +229,14 @@ class LoopBridge:
             self._period_s = 1.0 / control_hz
         if action_space:
             self._action_space = action_space
+
+    def _run_link(self, **kwargs: Any) -> None:
+        """Thread body: drive the SDK loop, surfacing a fatal exit (live robot — a silent
+        daemon-thread death would freeze obs/action with no signal)."""
+        try:
+            self._link.run(**kwargs)
+        except Exception:
+            LOGGER.exception("loop bridge run() thread exited with an error")
 
     def _read_obs(self) -> tuple[int, dict[str, Any]]:
         """``obs_callback``: read every arm's observation (paired) and merge into one robot-obs.
