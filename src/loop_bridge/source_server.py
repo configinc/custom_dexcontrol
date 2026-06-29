@@ -175,7 +175,7 @@ class LoopBridge:
         self._loop_robot_client = LoopRobotClient(
             loop_addr,
             options=options,
-            apply_open_config=apply_config,
+            apply_config_callback=apply_config,
             enable_action=enable_action,
         )
 
