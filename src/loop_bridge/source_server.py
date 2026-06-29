@@ -31,7 +31,6 @@ from typing import Any, Optional, Sequence
 
 import grpc
 from loop_sdk import (
-    HOME,
     LoopRobotClient,
     RobotConfig,
     RobotConfigOptions,
@@ -45,6 +44,7 @@ from loop_bridge.obs_publisher import (
     DEFAULT_OBS_SOURCE_NAME,
     merge_observations,
 )
+from loop_bridge.robot_action import HOME, decode_action
 from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 
 LOGGER = logging.getLogger("loop_bridge.vega")
@@ -179,17 +179,13 @@ class LoopBridge:
             return config
 
         # One bus object owns the whole link: publish robot-obs + (when enabled)
-        # consume robot-action + robot-command. The obs poll pulls actions()/commands()
-        # each tick and Steps/homes each arm via a per-arm _StepApplier. Obs-only
-        # (enable_action=False) wires neither input lane (no idle subscribe thread).
+        # consume robot-action + robot-command. Source ids are pinned by the SDK facade
+        # (our lane convention); the bridge owns the per-arm action decode. The obs poll
+        # pulls poll_action()/drain_commands() each tick and Steps/homes each arm via a
+        # per-arm _StepApplier. Obs-only (enable_action=False) wires neither input lane.
         self._link = LoopRobotClient(
             loop_addr,
-            arms=tuple(arm_prefixes),
-            action_space=action_space,
-            obs_source_id=obs_source_id,
-            obs_name=obs_source_name,
-            action_source_id=action_source_id,
-            command_source_id=command_source_id,
+            name=obs_source_name,
             options=options,
             on_config=apply_config,
             enable_action=enable_action,
@@ -274,8 +270,8 @@ class LoopBridge:
         """
         if not self._appliers:
             return
-        for command in self._link.commands():
-            if command != HOME:
+        for command in self._link.drain_commands():  # raw payload dicts
+            if command.get("command") != HOME:
                 LOGGER.warning("ignoring unknown robot-command %r", command)
                 continue
             for arm_prefix, applier in self._appliers.items():
@@ -285,12 +281,19 @@ class LoopBridge:
                     LOGGER.warning("home failed for %s; skipping: %s", arm_prefix, exc)
 
     def _apply_actions(self) -> None:
-        """Step each arm with the freshest pulled action ({} when nothing fresh → hold)."""
+        """Step each arm with the freshest pulled action (nothing fresh → hold).
+
+        ``poll_action`` hands back the raw ``robot-action`` payload once (a delta is
+        not replayed when nothing new arrived); we decode each arm's vector out of it.
+        """
         if not self._appliers:
             return
-        for arm_prefix, action in self._link.actions().items():
-            applier = self._appliers.get(arm_prefix)
-            if applier is None:
+        payload = self._link.poll_action(once=True)
+        if not payload:
+            return
+        for arm_prefix, applier in self._appliers.items():
+            action = decode_action(payload, arm_prefix, self._action_space)
+            if action is None:
                 continue
             try:
                 applier.step(action, self._action_space, self._gripper_action_space)

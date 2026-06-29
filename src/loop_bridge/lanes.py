@@ -6,7 +6,7 @@ bridge must DRIVE it on a clock; otherwise teleop (which needs obs to compute a
 delta) and obs (driven by the resulting action's Step) deadlock at startup. This
 lane breaks that cycle: each tick reads + publishes the observation and applies any
 freshest pulled action. The action subscription itself lives in loop-sdk's
-``RobotActionReceiver`` (its own thread); this lane just pulls + applies.
+``LoopRobotClient`` (its own thread); this lane just pulls + decodes + applies.
 """
 
 from __future__ import annotations
