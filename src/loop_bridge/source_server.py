@@ -1,4 +1,4 @@
-"""In-process Source Bus bridge for the Vega RobotEnv server.
+"""In-process Source Bus presence for the Vega RobotEnv.
 
 Presents a Vega robot — single- or bimanual — as ONE ``robot-obs`` source and
 executes ONE ``robot-action``, per the robot source contract. The combiner of the
@@ -7,10 +7,10 @@ arms lives here (the robot's own repo), not in loop or loop-sdk.
 - ``_LockedStepService`` is the upstream ``VegaRobotEnvService`` plus one fix: it
   serializes ``Step`` on the upstream ``_cmd_lock`` (upstream guards only ``Reset``),
   so the bus action lane can't race a Reset on shared IK/filter state.
-- ``LoopBridge`` owns the bus I/O over N arm services that share ONE hardware unit:
+- ``LoopRobotEnv`` owns the bus I/O over N arm services that share ONE hardware unit:
   an **obs poll** reads each arm's ``_create_observation`` on a clock and publishes
   the merged ``robot-obs`` (Vega computes obs only inside ``_create_observation``, so
-  the bridge must drive it — else teleop, which needs obs for a delta, and obs,
+  ``LoopRobotEnv`` must drive it — else teleop, which needs obs for a delta, and obs,
   driven by the resulting action's Step, deadlock at startup); an **action lane**
   subscribes ``robot-action`` and dispatches each arm's slice to that arm's Step.
 
@@ -125,8 +125,8 @@ class _LockedStepService(_vega_server.VegaRobotEnvService):
             return super().Step(request, context)
 
 
-class LoopBridge:
-    """Bus I/O (one robot-obs + one robot-action) over N arm services sharing a robot."""
+class LoopRobotEnv:
+    """A Vega RobotEnv presented on loop: one robot-obs out, one robot-action in, over N arm services sharing a robot."""
 
     def __init__(
         self,
@@ -155,7 +155,7 @@ class LoopBridge:
         self._lane_stop = threading.Event()
 
         # Advertise the configs this robot can open with (control_hz / action_space);
-        # default to the configured values. apply_config re-paces the live bridge.
+        # default to the configured values. apply_config re-paces the live env.
         options = RobotConfigOptions(
             control_hz=tuple(control_hz_options) or (int(obs_hz),),
             action_space=tuple(action_space_options) or (action_space,),
@@ -169,7 +169,7 @@ class LoopBridge:
 
         # One bus object owns the whole link: publish robot-obs + (when enabled)
         # consume robot-action + robot-command. Source ids are pinned by the SDK facade
-        # (our lane convention); the bridge owns the per-arm action decode. The obs poll
+        # (our lane convention); LoopRobotEnv owns the per-arm action decode. The obs poll
         # pulls poll_action()/drain_commands() each tick and Steps/homes each arm via a
         # per-arm _StepApplier. Obs-only (enable_action=False) wires neither input lane.
         self._loop_robot_client = LoopRobotClient(
@@ -191,7 +191,7 @@ class LoopBridge:
         # it connects the link, drives obs on the clock (read_obs — what breaks the
         # obs/action startup cycle), and hands fresh action/command to the callbacks.
         loop_thread = threading.Thread(
-            target=self._run_link,
+            target=self._run_loop_client,
             kwargs=dict(
                 publish_obs_callback=self._read_obs,
                 poll_action_callback=self._apply_action if enable_action else None,
@@ -206,7 +206,7 @@ class LoopBridge:
         self._threads: list[threading.Thread] = [loop_thread]
 
         LOGGER.info(
-            "loop bridge enabled: robot-obs %r (%s, %.1f Hz) -> %s%s",
+            "loop robot env enabled: robot-obs %r (%s, %.1f Hz) -> %s%s",
             LoopRobotClient.OBS_SOURCE_ID,
             arm_prefixes,
             obs_hz,
@@ -230,13 +230,13 @@ class LoopBridge:
         if action_space:
             self._action_space = action_space
 
-    def _run_link(self, **kwargs: Any) -> None:
+    def _run_loop_client(self, **kwargs: Any) -> None:
         """Thread body: drive the SDK loop, surfacing a fatal exit (live robot — a silent
         daemon-thread death would freeze obs/action with no signal)."""
         try:
             self._loop_robot_client.run(**kwargs)
         except Exception:
-            LOGGER.exception("loop bridge run() thread exited with an error")
+            LOGGER.exception("loop robot env run() thread exited with an error")
 
     def _read_obs(self) -> tuple[int, dict[str, Any]]:
         """``publish_obs_callback``: read every arm's observation (paired) and merge into one robot-obs.
@@ -299,7 +299,7 @@ class LoopBridge:
 def _install_signal_shutdown(cleanup) -> None:
     def shutdown_handler(signum, frame):
         del signum, frame
-        LOGGER.info("Shutting down Vega RobotEnv+Loop bridge")
+        LOGGER.info("Shutting down Vega RobotEnv+Loop server")
         with contextlib.suppress(Exception):
             cleanup()
         sys.exit(0)
@@ -327,7 +327,7 @@ def serve_with_loop(
     )
 
     service = _LockedStepService(**service_kwargs)  # builds its own one-arm Robot
-    bridge = LoopBridge(
+    env = LoopRobotEnv(
         [(arm_prefix, service)],
         loop_addr=loop_addr,
         action_space=action_space,
@@ -350,7 +350,7 @@ def serve_with_loop(
 
     def cleanup() -> None:
         # Lanes first (no Step/obs read in flight), then control loop, then robot.
-        bridge.close()
+        env.close()
         for teardown in (service._stop_control_loop, service._robot.close):
             with contextlib.suppress(Exception):
                 teardown()
@@ -429,7 +429,7 @@ def serve_dual_arm(
         arm_side="right", robot=shared_robot, **{**service_kwargs, "robotiq_comport": right_comport}
     )
 
-    bridge = LoopBridge(
+    env = LoopRobotEnv(
         [(left_prefix, left), (right_prefix, right)],
         loop_addr=loop_addr,
         action_space=action_space,
@@ -440,7 +440,7 @@ def serve_dual_arm(
         action_space_options=action_space_options,
     )
     LOGGER.info(
-        "Vega dual-arm bridge running: arms=%s robot-obs=%r",
+        "Vega dual-arm robot env running: arms=%s robot-obs=%r",
         list(arm_prefixes),
         LoopRobotClient.OBS_SOURCE_ID,
     )
@@ -451,7 +451,7 @@ def serve_dual_arm(
         # calls the shared Robot.shutdown() (idempotent, so the second call is a no-op
         # but still stops the right arm's gripper). Using the raw shared_robot.close()
         # would only release the comm node, leaving both arms energized + threads leaked.
-        bridge.close()
+        env.close()
         for service in (left, right):
             with contextlib.suppress(Exception):
                 service._stop_control_loop()
@@ -461,5 +461,5 @@ def serve_dual_arm(
 
     _install_signal_shutdown(cleanup)
     # No gRPC server here: actions arrive via the bus, obs leave via the bus. The
-    # bridge owns the lifetime; block until a shutdown signal.
+    # the loop robot env owns the lifetime; block until a shutdown signal.
     threading.Event().wait()

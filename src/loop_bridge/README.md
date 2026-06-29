@@ -14,8 +14,8 @@ be unit-tested without the heavy `dexcontrol` import.
 ## The loop
 
 The control loop lives in loop-sdk's `LoopRobotClient.run` (timing, connect/disconnect,
-the poll/drain/publish wiring). `LoopBridge` just supplies its device callbacks and,
-because the bridge runs **in-process** with the RobotEnv gRPC server, starts `run()` on
+the poll/drain/publish wiring). `LoopRobotEnv` just supplies its device callbacks and,
+because it runs **in-process** with the RobotEnv gRPC server, starts `run()` on
 a daemon thread while the main thread serves `Step`:
 
 - `_read_obs` (`publish_obs_callback`) reads the current observation on the clock and
@@ -35,7 +35,7 @@ a daemon thread while the main thread serves `Step`:
 | `robot_obs.py` | `robot-obs` channel layout + observation→step-dict projection | loop-sdk only |
 | `robot_action.py` | `robot-action` decode (`<arm>.action.<space>` → action vector) + `HOME` | loop-sdk only |
 | `obs_publisher.py` | `merge_observations` — merge each arm's obs into one `robot-obs` dict | loop-sdk only |
-| `source_server.py` | `_LockedStepService` + `LoopBridge` (N arm services → callbacks for `LoopRobotClient.run`, on a thread) + `serve_with_loop` (single) / `serve_dual_arm` (bimanual) | dexcontrol + loop-sdk |
+| `source_server.py` | `_LockedStepService` + `LoopRobotEnv` (N arm services → callbacks for `LoopRobotClient.run`, on a thread) + `serve_with_loop` (single) / `serve_dual_arm` (bimanual) | dexcontrol + loop-sdk |
 | `__main__.py` | CLI launcher | the above |
 
 Every module except `source_server` has no `dexcontrol` import, so the tests in
