@@ -32,8 +32,7 @@ from typing import Any, Optional, Sequence
 import grpc
 from loop_sdk import (
     HOME,
-    RobotActionReceiver,
-    RobotCommandReceiver,
+    LoopRobotClient,
     RobotConfig,
     RobotConfigOptions,
 )
@@ -44,7 +43,7 @@ from loop_bridge import lanes
 from loop_bridge.obs_publisher import (
     DEFAULT_OBS_SOURCE_ID,
     DEFAULT_OBS_SOURCE_NAME,
-    RobotObsPublisher,
+    merge_observations,
 )
 from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 
@@ -179,44 +178,35 @@ class LoopBridge:
             )
             return config
 
-        self._obs_publisher = RobotObsPublisher.connect(
-            loop_addr=loop_addr,
-            source_id=obs_source_id,
-            name=obs_source_name,
-            arm_prefixes=arm_prefixes,
+        # One bus object owns the whole link: publish robot-obs + (when enabled)
+        # consume robot-action + robot-command. The obs poll pulls actions()/commands()
+        # each tick and Steps/homes each arm via a per-arm _StepApplier.
+        self._link = LoopRobotClient(
+            loop_addr,
+            arms=tuple(arm_prefixes),
+            action_space=action_space,
+            obs_source_id=obs_source_id,
+            obs_name=obs_source_name,
+            action_source_id=action_source_id,
+            command_source_id=command_source_id,
             options=options,
-            apply_config=apply_config,
+            on_config=apply_config,
         )
+        self._link.connect()
 
-        # Action consume is a loop-sdk RobotActionReceiver (its own subscribe +
-        # reconnect thread); the obs poll pulls its latest() each tick and Steps each
-        # arm. One per-arm Step applier; latest() is {} when nothing fresh -> hold.
-        self._action_receiver: Any = None
-        self._command_receiver: Any = None
         self._appliers: dict[str, _StepApplier] = {}
         if enable_action:
             self._appliers = {
                 arm_prefix: _StepApplier(service)
                 for arm_prefix, service in self._arm_services
             }
-            self._action_receiver = RobotActionReceiver(
-                loop_addr,
-                action_source_id,
-                arms=tuple(arm_prefixes),
-                action_space=action_space,
-            )
-            self._action_receiver.connect()
-            # Operational commands (home between episodes, ...) share the per-arm
-            # appliers to drive the robot, so the lane runs only when actions do.
-            self._command_receiver = RobotCommandReceiver(loop_addr, command_source_id)
-            self._command_receiver.connect()
 
         obs_thread = threading.Thread(
             target=lanes.run_obs_poll,
             kwargs=dict(
                 stop_event=self._lane_stop,
                 read_observation=self._read_observations,
-                publish=self._obs_publisher.publish,
+                publish=self._publish_obs,
                 period_s=lambda: self._period_s,
                 apply_actions=self._apply_bus if enable_action else None,
             ),
@@ -262,6 +252,10 @@ class LoopBridge:
                 timestamp_us = sample_ts
         return observations, int(timestamp_us or 0)
 
+    def _publish_obs(self, observations: dict[str, Any], timestamp_us: int) -> bool:
+        """Merge each arm's observation into one ``robot-obs`` sample and publish it."""
+        return self._link.publish_obs(timestamp_us, merge_observations(observations))
+
     def _apply_bus(self) -> None:
         """One tick of bus inputs: run operational commands, then Step actions.
 
@@ -276,9 +270,9 @@ class LoopBridge:
         Each drained command runs once; unknown commands and a failed home are
         logged and skipped, never fatal to the lane.
         """
-        if self._command_receiver is None:
+        if not self._appliers:
             return
-        for command in self._command_receiver.drain():
+        for command in self._link.commands():
             if command != HOME:
                 LOGGER.warning("ignoring unknown robot-command %r", command)
                 continue
@@ -290,9 +284,9 @@ class LoopBridge:
 
     def _apply_actions(self) -> None:
         """Step each arm with the freshest pulled action ({} when nothing fresh → hold)."""
-        if self._action_receiver is None:
+        if not self._appliers:
             return
-        for arm_prefix, action in self._action_receiver.latest().items():
+        for arm_prefix, action in self._link.actions().items():
             applier = self._appliers.get(arm_prefix)
             if applier is None:
                 continue
@@ -306,21 +300,16 @@ class LoopBridge:
                 )
 
     def close(self) -> None:
-        """Stop the lane + action receiver and close the publisher (BEFORE closing the robot)."""
+        """Stop the lane and close the bus link (BEFORE closing the robot)."""
         self._lane_stop.set()
-        if self._action_receiver is not None:
-            with contextlib.suppress(Exception):
-                self._action_receiver.disconnect()  # stops its subscribe thread
-        if self._command_receiver is not None:
-            with contextlib.suppress(Exception):
-                self._command_receiver.disconnect()
         for thread in self._threads:
             thread.join(timeout=5.0)
             if thread.is_alive():
                 LOGGER.warning(
                     "lane thread %r did not stop within timeout", thread.name
                 )
-        self._obs_publisher.close()
+        with contextlib.suppress(Exception):
+            self._link.disconnect()  # stops sender + action/command subscribe threads
 
 
 def _install_signal_shutdown(cleanup) -> None:

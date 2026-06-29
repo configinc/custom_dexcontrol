@@ -12,10 +12,10 @@ stack; the bus-only modules below do not, so they stay unit-testable on their ow
 
 from __future__ import annotations
 
-from loop_bridge.obs_publisher import RobotObsPublisher
+from loop_bridge.obs_publisher import merge_observations
 from loop_bridge.robot_obs import observation_to_step
 
 __all__ = [
-    "RobotObsPublisher",
+    "merge_observations",
     "observation_to_step",
 ]

@@ -1,34 +1,21 @@
-"""Tests for RobotObsPublisher — the bus-facing publish logic (no hardware)."""
+"""Tests for merge_observations — the device-side robot-obs merge (no hardware/bus)."""
 
 from __future__ import annotations
 
-from conftest import FakeSender, make_observation
+from conftest import make_observation
 
-from loop_bridge.obs_publisher import RobotObsPublisher
+from loop_bridge.obs_publisher import merge_observations
 from loop_bridge.robot_obs import observation_to_step
 
 
-def test_publish_sends_projected_step():
-    sender = FakeSender()
-    publisher = RobotObsPublisher(sender, arm_prefixes=["robot0"])
+def test_merge_single_arm():
     obs = make_observation()
-
-    assert publisher.publish({"robot0": obs}, timestamp_us=111) is True
-
-    call = sender.sent[0]
-    assert call["timestamp_us"] == 111
-    assert call["sequence"] == 0
-    assert call["step"] == observation_to_step(obs, "robot0")
+    assert merge_observations({"robot0": obs}) == observation_to_step(obs, "robot0")
 
 
-def test_publish_merges_two_arms_into_one_sample():
-    sender = FakeSender()
-    publisher = RobotObsPublisher(sender, arm_prefixes=["robot0", "robot1"])
+def test_merge_two_arms_into_one_sample():
     obs0, obs1 = make_observation(), make_observation()
-
-    publisher.publish({"robot0": obs0, "robot1": obs1}, timestamp_us=5)
-
-    step = sender.sent[0]["step"]
+    step = merge_observations({"robot0": obs0, "robot1": obs1})
     assert step == {
         **observation_to_step(obs0, "robot0"),
         **observation_to_step(obs1, "robot1"),
@@ -37,28 +24,6 @@ def test_publish_merges_two_arms_into_one_sample():
     assert any(k.startswith("robot1.") for k in step)
 
 
-def test_publish_lets_sender_assign_monotonic_sequence():
-    sender = FakeSender()
-    publisher = RobotObsPublisher(sender, arm_prefixes=["robot0"])
-
-    for ts in (10, 20, 30):
-        publisher.publish({"robot0": make_observation()}, timestamp_us=ts)
-
-    assert [c["sequence"] for c in sender.sent] == [0, 1, 2]
-    assert [c["timestamp_us"] for c in sender.sent] == [10, 20, 30]
-
-
-def test_publish_uses_configured_arm_prefix():
-    sender = FakeSender()
-    publisher = RobotObsPublisher(sender, arm_prefixes=["robot1"])
-    publisher.publish({"robot1": make_observation()}, timestamp_us=5)
-    assert all(
-        k.startswith("robot1.observation.state.") for k in sender.sent[0]["step"]
-    )
-
-
-def test_close_disconnects_sender():
-    sender = FakeSender()
-    publisher = RobotObsPublisher(sender, arm_prefixes=["robot0"])
-    publisher.close()
-    assert sender.disconnected is True
+def test_merge_namespaces_by_arm_prefix():
+    step = merge_observations({"robot1": make_observation()})
+    assert all(k.startswith("robot1.observation.state.") for k in step)

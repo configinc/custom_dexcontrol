@@ -44,26 +44,6 @@ def make_observation() -> dict[str, Any]:
     }
 
 
-class FakeSender:
-    """Records send / disconnect in place of a loop-sdk RobotStepSender."""
-
-    def __init__(self) -> None:
-        self.sent: list[dict[str, Any]] = []
-        self.disconnected = False
-        self._seq = 0
-
-    def send(self, timestamp_us, step, *, sequence=None) -> bool:
-        seq = self._seq if sequence is None else sequence
-        self.sent.append(
-            {"timestamp_us": timestamp_us, "step": dict(step), "sequence": seq}
-        )
-        self._seq = seq + 1
-        return True
-
-    def disconnect(self) -> None:
-        self.disconnected = True
-
-
 class FakeApplier:
     """Stand-in for the in-process Step applier. Optionally fails the first N steps."""
 
