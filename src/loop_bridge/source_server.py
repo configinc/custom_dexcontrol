@@ -172,7 +172,7 @@ class LoopBridge:
         # (our lane convention); the bridge owns the per-arm action decode. The obs poll
         # pulls poll_action()/drain_commands() each tick and Steps/homes each arm via a
         # per-arm _StepApplier. Obs-only (enable_action=False) wires neither input lane.
-        self._link = LoopRobotClient(
+        self._loop_robot_client = LoopRobotClient(
             loop_addr,
             options=options,
             on_config=apply_config,
@@ -234,7 +234,7 @@ class LoopBridge:
         """Thread body: drive the SDK loop, surfacing a fatal exit (live robot — a silent
         daemon-thread death would freeze obs/action with no signal)."""
         try:
-            self._link.run(**kwargs)
+            self._loop_robot_client.run(**kwargs)
         except Exception:
             LOGGER.exception("loop bridge run() thread exited with an error")
 
@@ -293,7 +293,7 @@ class LoopBridge:
                     "lane thread %r did not stop within timeout", thread.name
                 )
         with contextlib.suppress(Exception):
-            self._link.disconnect()  # stops sender + action/command subscribe threads
+            self._loop_robot_client.disconnect()  # stops sender + action/command subscribe threads
 
 
 def _install_signal_shutdown(cleanup) -> None:
