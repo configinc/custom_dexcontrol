@@ -974,6 +974,16 @@ def serve(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    _log_path = os.path.expanduser("~/custom_dexcontrol/src/dexcontrol/logs/robotenv_vega.log")
+    os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+    from core.robotenv_vega.circular_file_handler import CircularFileHandler
+    _file_handler = CircularFileHandler(_log_path)
+    _file_handler.setLevel(logging.getLogger().level)
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(name)s [%(filename)s:%(lineno)d]: %(message)s"
+    ))
+    logging.getLogger().addHandler(_file_handler)
+
     service = VegaRobotEnvService(
         robot_model=robot_model,
         arm_side=arm_side,
