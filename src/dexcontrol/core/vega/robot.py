@@ -857,20 +857,12 @@ class VegaRobot:
             jerk_mask = np.abs(accel) > jerk_limit
             jerk_count = int(np.count_nonzero(jerk_mask))
             if np.any(jerk_mask):
-                # #region agent log
-                self._agent_debug_log(
-                    run_id=run_id,
-                    hypothesis_id="H7",
-                    location="dexcontrol/core/vega/robot.py:update_joints",
-                    message="jerk_limit_applied",
-                    data={
-                        "arm_side": self.arm_side,
-                        "indices": np.where(jerk_mask)[0].tolist(),
-                        "raw_accel": np.round(accel[jerk_mask], 6).tolist(),
-                        "jerk_limit": float(jerk_limit),
-                    },
+                _logger.debug(
+                    "[JerkLimit] joints=%s raw_accel=%s limit=%.6f",
+                    np.where(jerk_mask)[0].tolist(),
+                    np.round(accel[jerk_mask], 6).tolist(),
+                    float(jerk_limit),
                 )
-                # #endregion
                 accel = np.clip(accel, -jerk_limit, jerk_limit)
                 diff = self._prev_cmd_delta + accel
                 target_joint_pos = current + diff
