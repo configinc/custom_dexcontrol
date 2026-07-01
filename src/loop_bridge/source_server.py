@@ -45,7 +45,14 @@ from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 LOGGER = logging.getLogger("loop_bridge.vega")
 
 DEFAULT_ACTION_SPACE = "target_cartesian_delta"
-DEFAULT_OBS_HZ = 20.0
+# robot-obs publish rate. The RCI engine owns the control clock and samples the freshest
+# obs each of its (slower) control ticks, so obs runs WELL ABOVE control_hz — a few times
+# faster — to keep what the engine (and the teleop servo) sees ~fresh. NOT re-paced to the
+# negotiated control_hz.
+DEFAULT_OBS_HZ = 100.0
+# Control rate the engine ticks at (what the recorder picks from the advertised menu),
+# decoupled from the obs publish rate above.
+DEFAULT_CONTROL_HZ = 20
 
 
 class _BusStepContext:
@@ -151,13 +158,13 @@ class LoopRobotEnv:
 
         self._action_space = action_space
         self._gripper_action_space = gripper_action_space
-        self._period_s = 1.0 / obs_hz  # mutable: reconfigure() re-paces the obs poll
+        self._period_s = 1.0 / obs_hz  # fixed obs publish period (NOT re-paced to control_hz)
         self._lane_stop = threading.Event()
 
         # Advertise the configs this robot can open with (control_hz / action_space);
-        # default to the configured values. apply_config re-paces the live env.
+        # control_hz is the engine's tick rate (decoupled from the obs publish rate above).
         options = RobotConfigOptions(
-            control_hz=tuple(control_hz_options) or (int(obs_hz),),
+            control_hz=tuple(control_hz_options) or (DEFAULT_CONTROL_HZ,),
             action_space=tuple(action_space_options) or (action_space,),
         )
 
@@ -219,14 +226,15 @@ class LoopRobotEnv:
     def reconfigure(
         self, control_hz: float | None = None, action_space: str = ""
     ) -> None:
-        """Apply a Source-Bus-selected config: re-pace the obs poll / re-target Step.
+        """Apply a Source-Bus-selected config: re-target Step's action space.
 
         Called from the obs sender's ``apply_config`` when the recorder picks a config.
-        ``_period_s`` is read by the obs poll each tick (via a callable) and
-        ``_action_space`` by each Step apply, so the change takes effect next tick.
+        The selected ``control_hz`` paces the RCI ENGINE, not this robot: the obs publish
+        rate stays fixed (fast) so the engine always samples a fresh pose — re-pacing obs
+        down to control_hz would re-introduce the stale-feedback servo shake. Only the
+        action space is re-targeted here; it is read by each Step apply next tick.
         """
-        if control_hz and control_hz > 0:
-            self._period_s = 1.0 / control_hz
+        del control_hz  # engine's clock, not the robot's obs rate
         if action_space:
             self._action_space = action_space
 
