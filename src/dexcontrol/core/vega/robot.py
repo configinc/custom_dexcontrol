@@ -47,13 +47,9 @@ class _RobotWithCustomHeadPose(Robot):
         super().__init__(*args, **kwargs)
 
     def _set_default_state(self) -> None:
-        import logging as _logging
-
-        _log = _logging.getLogger("robotenv_vega")
-
         estop = getattr(self, "estop", None)
         if estop is not None and estop.is_software_estop_enabled():
-            _log.warning(
+            _logger.warning(
                 "Software E-Stop is active. "
                 "Head cannot be enabled and control features are not functional. "
                 "Call robot.estop.deactivate() to release the software E-Stop "
@@ -73,7 +69,7 @@ class _RobotWithCustomHeadPose(Robot):
                 init_pos = self.compensate_torso_pitch(
                     np.asarray(self._head_init_pos, dtype=np.float32).copy(), "head"
                 )
-                _log.info("Setting custom head init pos: %s", init_pos.tolist())
+                _logger.info("Setting custom head init pos: %s", init_pos.tolist())
             else:
                 init_pos = self.compensate_torso_pitch(
                     head.get_predefined_pose("home"), "head"
@@ -857,20 +853,12 @@ class VegaRobot:
             jerk_mask = np.abs(accel) > jerk_limit
             jerk_count = int(np.count_nonzero(jerk_mask))
             if np.any(jerk_mask):
-                # #region agent log
-                self._agent_debug_log(
-                    run_id=run_id,
-                    hypothesis_id="H7",
-                    location="dexcontrol/core/vega/robot.py:update_joints",
-                    message="jerk_limit_applied",
-                    data={
-                        "arm_side": self.arm_side,
-                        "indices": np.where(jerk_mask)[0].tolist(),
-                        "raw_accel": np.round(accel[jerk_mask], 6).tolist(),
-                        "jerk_limit": float(jerk_limit),
-                    },
+                _logger.debug(
+                    "[JerkLimit] joints=%s raw_accel=%s limit=%.6f",
+                    np.where(jerk_mask)[0].tolist(),
+                    np.round(accel[jerk_mask], 6).tolist(),
+                    float(jerk_limit),
                 )
-                # #endregion
                 accel = np.clip(accel, -jerk_limit, jerk_limit)
                 diff = self._prev_cmd_delta + accel
                 target_joint_pos = current + diff

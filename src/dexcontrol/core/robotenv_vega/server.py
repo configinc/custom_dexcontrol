@@ -497,7 +497,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 _grip_cmd = float(action[7]) if action.shape[0] > 7 else 0.0
             else:
                 _grip_cmd = float(action[6]) if action.shape[0] > 6 else 0.0
-            LOGGER.info(
+            LOGGER.debug(
                 "[Gripper] cmd=%.4f  space=%s  gripper_space=%s  cur_raw=%.4f  cur_norm=%.4f",
                 _grip_cmd, action_space, gripper_action_space, _cur_grip_raw, _cur_grip_norm,
             )
@@ -514,7 +514,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 raw_rot_norm = float(np.linalg.norm(raw_action[3:6]))
                 action = self._cartesian_velocity_to_delta(action)
                 action_space_for_robot = "cartesian_delta"
-                LOGGER.info(
+                LOGGER.debug(
                     "Converted cartesian_velocity -> cartesian_delta: lin_norm=%.4f rot_norm=%.4f max_lin_delta=%.6f max_rot_delta=%.6f",
                     raw_lin_norm, raw_rot_norm, self._max_lin_delta, self._max_rot_delta,
                 )
@@ -533,6 +533,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
             # Get robot_state BEFORE executing action (needed for create_action_dict)
             pre_action_state, _ = self._robot.get_robot_state()
+            LOGGER.debug(
+                "[CartesianPos] %s",
+                np.round(np.asarray(pre_action_state["cartesian_position"], dtype=np.float64), 4).tolist(),
+            )
 
             if self._robot.interpolation_enabled and self._control_loop_hz > 0:
                 # Interpolation mode: buffer command; control loop dispatches.
@@ -818,6 +822,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         deadline = time.time() + t_max
         settle_start = None
         prev_actual = None
+        _tick = 0  # [BUG PROBE]
 
         while time.time() < deadline:
             if self._cancel_move.is_set():
@@ -825,6 +830,13 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 return
 
             actual = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
+            # [BUG PROBE] 첫 tick 위치를 기록해 stale 여부를 사후 분석에 활용
+            if _tick == 0:
+                LOGGER.info(
+                    "_move_incremental[%s][BUG_PROBE] tick=0 actual=%s target=%s",
+                    self.arm_side, actual.round(4).tolist(), target.round(4).tolist(),
+                )
+            _tick += 1
             diff = target - actual
             max_err = float(np.max(np.abs(diff)))
             if max_err < tol:
@@ -961,6 +973,16 @@ def serve(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    _log_path = os.path.expanduser("~/custom_dexcontrol/src/dexcontrol/logs/robotenv_vega.log")
+    os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+    from core.robotenv_vega.circular_file_handler import CircularFileHandler
+    _file_handler = CircularFileHandler(_log_path)
+    _file_handler.setLevel(logging.getLogger().level)
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(name)s [%(filename)s:%(lineno)d]: %(message)s"
+    ))
+    logging.getLogger().addHandler(_file_handler)
 
     service = VegaRobotEnvService(
         robot_model=robot_model,
