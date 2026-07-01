@@ -50,9 +50,6 @@ DEFAULT_ACTION_SPACE = "target_cartesian_delta"
 # faster — to keep what the engine (and the teleop servo) sees ~fresh. NOT re-paced to the
 # negotiated control_hz.
 DEFAULT_OBS_HZ = 100.0
-# Control rate the engine ticks at (what the recorder picks from the advertised menu),
-# decoupled from the obs publish rate above.
-DEFAULT_CONTROL_HZ = 20
 
 
 class _BusStepContext:
@@ -144,7 +141,6 @@ class LoopRobotEnv:
         gripper_action_space: str = "",
         obs_hz: float = DEFAULT_OBS_HZ,
         enable_action: bool = True,
-        control_hz_options: Sequence[int] = (),
         action_space_options: Sequence[str] = (),
     ) -> None:
         if obs_hz <= 0:
@@ -161,10 +157,10 @@ class LoopRobotEnv:
         self._period_s = 1.0 / obs_hz  # fixed obs publish period (NOT re-paced to control_hz)
         self._lane_stop = threading.Event()
 
-        # Advertise the configs this robot can open with (control_hz / action_space);
-        # control_hz is the engine's tick rate (decoupled from the obs publish rate above).
+        # Advertise only what this robot owns — the action space. control_hz is NOT the
+        # robot's axis anymore: obs publishes fast and the RCI engine owns the control rate
+        # (picked on the robot-control panel), so the robot must not advertise it.
         options = RobotConfigOptions(
-            control_hz=tuple(control_hz_options) or (DEFAULT_CONTROL_HZ,),
             action_space=tuple(action_space_options) or (action_space,),
         )
 
