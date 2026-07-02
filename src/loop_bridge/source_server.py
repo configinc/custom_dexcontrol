@@ -321,7 +321,6 @@ def serve_with_loop(
     gripper_action_space: str = "",
     obs_hz: float = DEFAULT_OBS_HZ,
     enable_action: bool = True,
-    control_hz_options: Sequence[int] = (),
     action_space_options: Sequence[str] = (),
     **service_kwargs: Any,
 ) -> None:
@@ -338,7 +337,6 @@ def serve_with_loop(
         gripper_action_space=gripper_action_space,
         obs_hz=obs_hz,
         enable_action=enable_action,
-        control_hz_options=control_hz_options,
         action_space_options=action_space_options,
     )
 
@@ -401,7 +399,6 @@ def serve_dual_arm(
     gripper_action_space: str = "",
     obs_hz: float = DEFAULT_OBS_HZ,
     enable_action: bool = True,
-    control_hz_options: Sequence[int] = (),
     action_space_options: Sequence[str] = (),
     left_robotiq_comport: str | None = None,
     right_robotiq_comport: str | None = None,
@@ -440,7 +437,6 @@ def serve_dual_arm(
         gripper_action_space=gripper_action_space,
         obs_hz=obs_hz,
         enable_action=enable_action,
-        control_hz_options=control_hz_options,
         action_space_options=action_space_options,
     )
     LOGGER.info(
