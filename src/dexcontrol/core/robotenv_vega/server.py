@@ -176,6 +176,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         # Set by a new Reset to cancel any in-progress _move_incremental loop.
         self._cancel_move = threading.Event()
 
+        # Timestamp of the most recent Step() call, used to compute the
+        # actual RPC interval for gripper velocity → position conversion.
+        self._last_step_time: float | None = None
+        # Cap on dt to avoid large gripper jumps after network hiccups.
+        self._gripper_dt_cap: float = 0.15
+
         LOGGER.info(
             "Initialized VegaRobotEnvService model=%s arm=%s gripper=%s frame=%s hz=%s",
             robot_model,
@@ -504,6 +510,33 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             # -- end gripper debug --
 
             t_step_start = time.time()
+
+            # --- Gripper velocity → position conversion ---
+            # The 100 Hz control loop reuses _latest_gripper_action on every
+            # tick, so a stale velocity command keeps integrating after the
+            # client stops sending RPCs (stick released). Converting to a
+            # position target here ensures the control loop holds position
+            # between RPCs and stops immediately when RPCs cease.
+            if gripper_action_space == "velocity":
+                now_mono = time.perf_counter()
+                if self._last_step_time is not None:
+                    dt = min(now_mono - self._last_step_time, self._gripper_dt_cap)
+                else:
+                    dt = 1.0 / 15.0  # conservative default for the first RPC
+                self._last_step_time = now_mono
+
+                grip_idx = 7 if action_space.startswith("joint") else 6
+                if action.shape[0] > grip_idx:
+                    current_grip = self._robot.get_cached_gripper_position()
+                    new_grip = float(np.clip(
+                        current_grip + action[grip_idx] * dt, 0.0, 1.0
+                    ))
+                    action = action.copy()
+                    action[grip_idx] = new_grip
+                gripper_action_space = "position"
+            else:
+                self._last_step_time = time.perf_counter()
+
             if self.R_world_to_robot is not None and (
                 "cartesian" in action_space or action_space == "target_cartesian_delta"
             ):
