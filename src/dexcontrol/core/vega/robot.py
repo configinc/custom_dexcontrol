@@ -286,6 +286,13 @@ class VegaRobot:
         self._latest_gripper_action_space: str = "position"
         self._interp_lock = threading.Lock()
 
+        # Gripper stale-command timeout: stop sending gripper commands when no
+        # new add_command_point() has arrived for longer than 2 RPC intervals.
+        # Prevents the 100 Hz loop from repeatedly commanding the last position
+        # target after the client stops sending RPCs (stick released).
+        self._last_gripper_cmd_time: float = 0.0
+        self._gripper_cmd_timeout_s: float = 2.0 / max(1, self.control_hz)
+
         if self.hand is not None:
             self._refresh_gripper_state()
             self._start_gripper_worker()
@@ -666,6 +673,7 @@ class VegaRobot:
             self._latest_target_joint_pos = target_joint_pos.copy()
             self._latest_gripper_action = gripper_action
             self._latest_gripper_action_space = gripper_action_space
+            self._last_gripper_cmd_time = timestamp
 
     def execute_interpolated_tick(self) -> bool:
         """Run one control-loop tick using interpolated position.
@@ -711,7 +719,9 @@ class VegaRobot:
 
         try:
             self.update_joints(pos, velocity=False, blocking=False)
-            self.update_gripper(gripper_action, velocity=gripper_vel, blocking=False)
+            elapsed = _time.perf_counter() - self._last_gripper_cmd_time
+            if elapsed < self._gripper_cmd_timeout_s:
+                self.update_gripper(gripper_action, velocity=gripper_vel, blocking=False)
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
             self._prev_command_successful = False
