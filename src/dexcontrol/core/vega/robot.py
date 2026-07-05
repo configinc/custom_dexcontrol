@@ -141,7 +141,7 @@ class VegaRobot:
         vel_smoothing_alpha: float = 0.3,
         hw_correction_alpha: float = 0.7,
         max_delta_scale: float = 1.0,
-        max_jerk: float = 0.25,
+        max_accel_delta: float = 0.25,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
         head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
@@ -219,11 +219,11 @@ class VegaRobot:
         self._prev_joint_vel: np.ndarray | None = None
         self._vel_smoothing_alpha = float(np.clip(vel_smoothing_alpha, 0.0, 1.0))
         self._last_cmd_joint_pos: np.ndarray | None = None  # Track last sent command for delta clipping
-        self._prev_cmd_delta: np.ndarray | None = None  # Previous step delta for jerk limiting
+        self._prev_cmd_delta: np.ndarray | None = None  # Previous step delta for accel limiting
         self._HW_CORRECTION_ALPHA = float(np.clip(hw_correction_alpha, 0.0, 1.0))
         self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
         self._max_delta_scale = float(max(0.1, max_delta_scale))
-        self._MOTOR_MAX_JERK_RAD = float(max(0.0, max_jerk))
+        self._MOTOR_MAX_ACCEL_DELTA_RAD = float(max(0.0, max_accel_delta))
         self._vel_ratio = float(max(0.0, vel_ratio))
         self._vel_damp_thresh = float(max(0.001, vel_damp_thresh))
 
@@ -768,15 +768,15 @@ class VegaRobot:
             target_joint_pos = current + clipped
             diff = clipped
 
-        # Jerk limit: restrict how fast the per-step delta can change between
+        # Accel limit: restrict how fast the per-step delta can change between
         # consecutive steps.  Smooths acceleration/deceleration to prevent
         # the abrupt velocity changes that cause oscillation on stop.
-        if self._prev_cmd_delta is not None and self._MOTOR_MAX_JERK_RAD > 0:
+        if self._prev_cmd_delta is not None and self._MOTOR_MAX_ACCEL_DELTA_RAD > 0:
             accel = diff - self._prev_cmd_delta
-            jerk_limit = self._MOTOR_MAX_JERK_RAD
-            jerk_mask = np.abs(accel) > jerk_limit
-            if np.any(jerk_mask):
-                accel = np.clip(accel, -jerk_limit, jerk_limit)
+            accel_limit = self._MOTOR_MAX_ACCEL_DELTA_RAD
+            accel_mask = np.abs(accel) > accel_limit
+            if np.any(accel_mask):
+                accel = np.clip(accel, -accel_limit, accel_limit)
                 diff = self._prev_cmd_delta + accel
                 target_joint_pos = current + diff
         self._prev_cmd_delta = diff.copy()

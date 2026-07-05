@@ -74,7 +74,7 @@ TrajectoryInterpolator           interpolate(now) -> pos, vel
                                           |
                                           v
                                   update_joints() -> hardware
-                                  (delta clip, jerk limit,
+                                  (delta clip, accel limit,
                                    hw correction, vel feedforward)
 ```
 
@@ -95,7 +95,7 @@ python src/dexcontrol/core/robotenv_vega/server.py \
     --filter-cutoff-freq 15.0 \
     --vel-smoothing-alpha 0.15 \
     --hw-correction-alpha 0.4 \
-    --max-jerk 0.15
+    --max-accel-delta 0.15
 
 # Right arm
 python src/dexcontrol/core/robotenv_vega/server.py \
@@ -111,7 +111,7 @@ python src/dexcontrol/core/robotenv_vega/server.py \
     --filter-cutoff-freq 15.0 \
     --vel-smoothing-alpha 0.15 \
     --hw-correction-alpha 0.4 \
-    --max-jerk 0.15
+    --max-accel-delta 0.15
 ```
 
 ### CLI Parameters
@@ -140,14 +140,14 @@ python src/dexcontrol/core/robotenv_vega/server.py \
 | `--vel-smoothing-alpha` | `0.3` | Velocity feedforward EMA (0=smooth, 1=raw). Lower = smoother velocity |
 | `--hw-correction-alpha` | `0.7` | HW feedback correction blend (0=ignore hw, 1=snap to hw). Lower = less position correction |
 | `--max-delta-scale` | `1.0` | Scale factor for per-joint max delta clipping. >1 = allow larger steps |
-| `--max-jerk` | `0.25` | Max acceleration change per step (rad/step^2). 0 = disable jerk limiting |
+| `--max-accel-delta` | `0.25` | Max acceleration change per step (rad/step^2). 0 = disable accel limiting |
 
 ### Tuning Guide
 
 | Goal | Key flags |
 |---|---|
 | Faster response | `--filter-cutoff-freq 20` `--interpolation-history 3` |
-| Smoother motion | `--filter-cutoff-freq 5` `--vel-smoothing-alpha 0.1` `--max-jerk 0.15` |
+| Smoother motion | `--filter-cutoff-freq 5` `--vel-smoothing-alpha 0.1` `--max-accel-delta 0.15` |
 | Less HW correction drift | `--hw-correction-alpha 0.3` |
 | Disable filtering (interp only) | `--filter-type none` |
 | Legacy mode (no interp) | Omit `--interpolation-method` and `--control-loop-hz` |
