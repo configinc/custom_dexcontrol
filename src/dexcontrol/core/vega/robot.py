@@ -46,13 +46,9 @@ class _RobotWithCustomHeadPose(Robot):
         super().__init__(*args, **kwargs)
 
     def _set_default_state(self) -> None:
-        import logging as _logging
-
-        _log = _logging.getLogger("robotenv_vega")
-
         estop = getattr(self, "estop", None)
         if estop is not None and estop.is_software_estop_enabled():
-            _log.warning(
+            _logger.warning(
                 "Software E-Stop is active. "
                 "Head cannot be enabled and control features are not functional. "
                 "Call robot.estop.deactivate() to release the software E-Stop "
@@ -72,7 +68,7 @@ class _RobotWithCustomHeadPose(Robot):
                 init_pos = self.compensate_torso_pitch(
                     np.asarray(self._head_init_pos, dtype=np.float32).copy(), "head"
                 )
-                _log.info("Setting custom head init pos: %s", init_pos.tolist())
+                _logger.info("Setting custom head init pos: %s", init_pos.tolist())
             else:
                 init_pos = self.compensate_torso_pitch(
                     head.get_predefined_pose("home"), "head"
@@ -775,7 +771,14 @@ class VegaRobot:
             accel = diff - self._prev_cmd_delta
             accel_limit = self._MOTOR_MAX_ACCEL_DELTA_RAD
             accel_mask = np.abs(accel) > accel_limit
+            jerk_count = int(np.count_nonzero(accel_mask))
             if np.any(accel_mask):
+                _logger.debug(
+                    "[AccelLimit] joints=%s raw_accel=%s limit=%.6f",
+                    np.where(accel_mask)[0].tolist(),
+                    np.round(accel[accel_mask], 6).tolist(),
+                    float(accel_limit),
+                )
                 accel = np.clip(accel, -accel_limit, accel_limit)
                 diff = self._prev_cmd_delta + accel
                 target_joint_pos = current + diff
