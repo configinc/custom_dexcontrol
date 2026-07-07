@@ -19,7 +19,7 @@ import argparse
 from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 from loop_bridge.source_server import (
     DEFAULT_ACTION_SPACE,
-    DEFAULT_OBS_HZ,
+    DEFAULT_HEARTBEAT_HZ,
     serve_dual_arm,
     serve_with_loop,
 )
@@ -38,10 +38,14 @@ def main() -> None:
     )
     # Source ids/name are pinned by the SDK (our lane convention) — not CLI-configurable.
     parser.add_argument(
-        "--obs-hz",
+        "--heartbeat-hz",
         type=float,
-        default=DEFAULT_OBS_HZ,
-        help="robot-obs publish rate (Hz)",
+        default=DEFAULT_HEARTBEAT_HZ,
+        help=(
+            "Fallback robot-obs publish rate (Hz) when the action lane is idle. "
+            "In steady state obs cadence follows each robot-action's post-step; this "
+            "rate only paces the boot lull and teleop-hold gaps."
+        ),
     )
     parser.add_argument(
         "--action-space",
@@ -140,7 +144,7 @@ def main() -> None:
         loop_addr=args.loop_addr,
         action_space=args.action_space,
         gripper_action_space=args.gripper_action_space,
-        obs_hz=args.obs_hz,
+        heartbeat_hz=args.heartbeat_hz,
         enable_action=not args.no_action,
         action_space_options=tuple(
             v.strip() for v in args.action_space_options.split(",") if v.strip()

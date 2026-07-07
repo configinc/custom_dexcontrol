@@ -45,11 +45,13 @@ from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 LOGGER = logging.getLogger("loop_bridge.vega")
 
 DEFAULT_ACTION_SPACE = "target_cartesian_delta"
-# robot-obs publish rate. The RCI engine owns the control clock and samples the freshest
-# obs each of its (slower) control ticks, so obs runs WELL ABOVE control_hz — a few times
-# faster — to keep what the engine (and the teleop servo) sees ~fresh. NOT re-paced to the
-# negotiated control_hz.
-DEFAULT_OBS_HZ = 100.0
+# Fallback obs publish rate when the action lane is idle. In steady state obs is now
+# driven by robot-action arrivals (each Step is followed by a fresh post-step obs), so
+# this rate governs only the boot lull and any teleop-hold gaps where actions stop
+# flowing. Kept at the engine's default control_hz so obs never falls below the rate
+# the engine expects to sample — dropping under control_hz would stall the engine's
+# per-tick obs de-dup guard. See ``LoopRobotClient.run_action_driven`` for the model.
+DEFAULT_HEARTBEAT_HZ = 20.0
 
 
 class _BusStepContext:
@@ -130,7 +132,15 @@ class _LockedStepService(_vega_server.VegaRobotEnvService):
 
 
 class LoopRobotEnv:
-    """A Vega RobotEnv presented on loop: one robot-obs out, one robot-action in, over N arm services sharing a robot."""
+    """A Vega RobotEnv presented on loop: one robot-obs out, one robot-action in, over N arm services sharing a robot.
+
+    Obs cadence is now driven by robot-action arrivals — each incoming action is Stepped
+    and the post-step observation is republished immediately, so obs rate collapses to
+    control rate rather than the previous 100 Hz free-run. ``heartbeat_hz`` is the
+    fallback rate for the boot lull (before any action) and for teleop-hold gaps where
+    no action is flowing; when actions arrive at or above that rate the heartbeat obs
+    is suppressed. See ``LoopRobotClient.run_action_driven`` in loop-sdk.
+    """
 
     def __init__(
         self,
@@ -139,12 +149,12 @@ class LoopRobotEnv:
         loop_addr: str,
         action_space: str = DEFAULT_ACTION_SPACE,
         gripper_action_space: str = "",
-        obs_hz: float = DEFAULT_OBS_HZ,
+        heartbeat_hz: float = DEFAULT_HEARTBEAT_HZ,
         enable_action: bool = True,
         action_space_options: Sequence[str] = (),
     ) -> None:
-        if obs_hz <= 0:
-            raise ValueError(f"obs_hz must be > 0, got {obs_hz}")
+        if heartbeat_hz <= 0:
+            raise ValueError(f"heartbeat_hz must be > 0, got {heartbeat_hz}")
         if not arm_services:
             raise ValueError("at least one (arm_prefix, service) is required")
         self._arm_services = tuple(arm_services)
@@ -154,7 +164,7 @@ class LoopRobotEnv:
 
         self._action_space = action_space
         self._gripper_action_space = gripper_action_space
-        self._period_s = 1.0 / obs_hz  # fixed obs publish period (NOT re-paced to control_hz)
+        self._heartbeat_hz = heartbeat_hz  # fallback obs rate when the action lane is idle
         self._lane_stop = threading.Event()
 
         # Advertise only what this robot owns — the action space. control_hz is NOT the
@@ -190,18 +200,15 @@ class LoopRobotEnv:
             }
 
         # The SDK owns the loop. Vega is in-process with the RobotEnv gRPC server, so
-        # run() goes on a daemon thread (the main thread serves Step + waits for shutdown);
-        # it connects the link, drives obs on the clock (read_obs — what breaks the
-        # obs/action startup cycle), and hands fresh action/command to the callbacks.
+        # ``run_action_driven`` goes on a daemon thread (the main thread serves Step +
+        # waits for shutdown). It publishes the bootstrap obs on connect (that first
+        # publish is what breaks the obs/action startup cycle), then republishes obs
+        # after each Step / home, and falls back to ``heartbeat_hz`` when actions stall.
+        # Obs-only mode (``enable_action=False``) has no action lane, so we still fall
+        # back to the legacy clock-driven ``run`` in that mode — see ``_run_loop_client``.
         loop_thread = threading.Thread(
             target=self._run_loop_client,
-            kwargs=dict(
-                publish_obs_callback=self._read_obs,
-                poll_action_callback=self._apply_action if enable_action else None,
-                drain_commands_callback=self._apply_command if enable_action else None,
-                hz=lambda: 1.0 / self._period_s,
-                stop=self._lane_stop,
-            ),
+            kwargs=dict(enable_action=enable_action),
             name="robot-obs-poll",
             daemon=True,
         )
@@ -209,10 +216,10 @@ class LoopRobotEnv:
         self._threads: list[threading.Thread] = [loop_thread]
 
         LOGGER.info(
-            "loop robot env enabled: robot-obs %r (%s, %.1f Hz) -> %s%s",
+            "loop robot env enabled: robot-obs %r (%s, heartbeat=%.1f Hz, action-driven) -> %s%s",
             LoopRobotClient.OBS_SOURCE_ID,
             arm_prefixes,
-            obs_hz,
+            heartbeat_hz,
             loop_addr,
             f"; robot-action {LoopRobotClient.ACTION_SOURCE_ID!r} -> Step({action_space})"
             if enable_action
@@ -234,11 +241,29 @@ class LoopRobotEnv:
         if action_space:
             self._action_space = action_space
 
-    def _run_loop_client(self, **kwargs: Any) -> None:
+    def _run_loop_client(self, *, enable_action: bool) -> None:
         """Thread body: drive the SDK loop, surfacing a fatal exit (live robot — a silent
-        daemon-thread death would freeze obs/action with no signal)."""
+        daemon-thread death would freeze obs/action with no signal).
+
+        With the action lane enabled we take the event-driven path so obs cadence follows
+        each incoming ``robot-action``. Obs-only mode has no action lane to hang the
+        cadence on, so we fall back to the clock-driven ``run`` at ``heartbeat_hz``.
+        """
         try:
-            self._loop_robot_client.run(**kwargs)
+            if enable_action:
+                self._loop_robot_client.run_action_driven(
+                    publish_obs_callback=self._read_obs,
+                    apply_action_callback=self._apply_action,
+                    handle_command_callback=self._apply_command,
+                    heartbeat_hz=self._heartbeat_hz,
+                    stop=self._lane_stop,
+                )
+                return
+            self._loop_robot_client.run(
+                publish_obs_callback=self._read_obs,
+                hz=self._heartbeat_hz,
+                stop=self._lane_stop,
+            )
         except Exception:
             LOGGER.exception("loop robot env run() thread exited with an error")
 
@@ -319,7 +344,7 @@ def serve_with_loop(
     arm_prefix: str = DEFAULT_ARM_PREFIX,
     action_space: str = DEFAULT_ACTION_SPACE,
     gripper_action_space: str = "",
-    obs_hz: float = DEFAULT_OBS_HZ,
+    heartbeat_hz: float = DEFAULT_HEARTBEAT_HZ,
     enable_action: bool = True,
     action_space_options: Sequence[str] = (),
     **service_kwargs: Any,
@@ -335,7 +360,7 @@ def serve_with_loop(
         loop_addr=loop_addr,
         action_space=action_space,
         gripper_action_space=gripper_action_space,
-        obs_hz=obs_hz,
+        heartbeat_hz=heartbeat_hz,
         enable_action=enable_action,
         action_space_options=action_space_options,
     )
@@ -397,7 +422,7 @@ def serve_dual_arm(
     arm_prefixes: tuple[str, str] = ("robot0", "robot1"),
     action_space: str = DEFAULT_ACTION_SPACE,
     gripper_action_space: str = "",
-    obs_hz: float = DEFAULT_OBS_HZ,
+    heartbeat_hz: float = DEFAULT_HEARTBEAT_HZ,
     enable_action: bool = True,
     action_space_options: Sequence[str] = (),
     left_robotiq_comport: str | None = None,
@@ -435,7 +460,7 @@ def serve_dual_arm(
         loop_addr=loop_addr,
         action_space=action_space,
         gripper_action_space=gripper_action_space,
-        obs_hz=obs_hz,
+        heartbeat_hz=heartbeat_hz,
         enable_action=enable_action,
         action_space_options=action_space_options,
     )
