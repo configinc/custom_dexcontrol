@@ -36,11 +36,6 @@ from proto import robotenv_pb2
 from proto import robotenv_pb2_grpc
 
 class _RobotProxy:
-    # Gains applied by teleop master before emitting cartesian_velocity.
-    # Used to recover the original gain-free target_cartesian_delta.
-    _TELEOP_POS_ACTION_GAIN = 5.0
-    _TELEOP_ROT_ACTION_GAIN = 2.0
-
     """Proxy that mimics Robot for attributes accessed by policy_runner.
 
     Provides create_action_dict() using a local IK solver so the control
@@ -57,7 +52,9 @@ class _RobotProxy:
     or intervention path, expect logged cartesian_delta to be approximate only.
     """
 
-    def __init__(self, control_hz: int = 20):
+    def __init__(self, control_hz: int = 20, teleop_pos_gain: float = 5.0, teleop_rot_gain: float = 2.0):
+        self._teleop_pos_gain = teleop_pos_gain
+        self._teleop_rot_gain = teleop_rot_gain
         # Try to import robot-specific IK solver if available
         try:
             from core.robot_ik.robot_ik_solver import RobotIKSolver
@@ -126,8 +123,8 @@ class _RobotProxy:
             if action_space == "target_cartesian_delta":
                 cart_action = action[:-1]
                 cart_vel = np.empty(6, dtype=np.float64)
-                cart_vel[:3] = np.asarray(cart_action[:3]) * self._TELEOP_POS_ACTION_GAIN
-                cart_vel[3:6] = np.asarray(cart_action[3:6]) * self._TELEOP_ROT_ACTION_GAIN
+                cart_vel[:3] = np.asarray(cart_action[:3]) * self._teleop_pos_gain
+                cart_vel[3:6] = np.asarray(cart_action[3:6]) * self._teleop_rot_gain
                 action_dict["cartesian_velocity"] = cart_vel.tolist()
                 action_dict["target_cartesian_delta"] = list(action)
                 if self._ik_solver is not None:

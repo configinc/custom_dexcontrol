@@ -99,8 +99,23 @@ SUPPORTED_ACTION_SPACES = (
 
 # Gains applied by Oculus controller to raw deltas before emitting
 # cartesian_velocity.  Used to recover the original (gain-free) delta.
+# Kept as module-level constants for backward compatibility; VegaRobot
+# uses instance variables (_teleop_pos_gain / _teleop_rot_gain) so these
+# values can be overridden via yaml without changing call sites.
 _TELEOP_POS_ACTION_GAIN = 5.0
 _TELEOP_ROT_ACTION_GAIN = 2.0
+
+# Fallback IK damping override dict used when no yaml config is provided.
+_DEFAULT_IK_OVERRIDE: dict[str, float] = {
+    "torso_j1": 30000.0, "torso_j2": 30000.0, "torso_j3": 30000.0,
+    "R_arm_j1": 50.0,    "L_arm_j1": 50.0,
+    "R_arm_j2": 75.0,    "L_arm_j2": 75.0,
+    "R_arm_j3": 50.0,    "L_arm_j3": 50.0,
+    "R_arm_j4": 50.0,    "L_arm_j4": 50.0,
+    "R_arm_j5": 120.0,   "L_arm_j5": 120.0,
+    "R_arm_j6": 120.0,   "L_arm_j6": 120.0,
+    "R_arm_j7": 120.0,   "L_arm_j7": 120.0,
+}
 
 
 class JointLimitExceededError(RuntimeError):
@@ -141,6 +156,11 @@ class VegaRobot:
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
         head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
+        teleop_pos_gain: float = 5.0,
+        teleop_rot_gain: float = 2.0,
+        motor_max_delta_rad: list[float] | None = None,
+        ik_damping_default: float = 1e-3,
+        ik_damping_override: dict[str, float] | None = None,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -151,6 +171,17 @@ class VegaRobot:
             gripper_type = hand_type
         self._robotiq_comport = robotiq_comport
         self._ik_solver_type = ik_solver_type
+        self._teleop_pos_gain = float(teleop_pos_gain)
+        self._teleop_rot_gain = float(teleop_rot_gain)
+        self._ik_damping_default = float(ik_damping_default)
+        self._ik_damping_override = ik_damping_override if ik_damping_override is not None else _DEFAULT_IK_OVERRIDE
+        if motor_max_delta_rad is not None:
+            arr = np.array(motor_max_delta_rad, dtype=np.float64)
+            if arr.shape != (7,):
+                raise ValueError(
+                    f"motor_max_delta_rad must have exactly 7 values, got {arr.shape[0]}"
+                )
+            self._MOTOR_MAX_DELTA_RAD_BASE = arr
 
         if arm_side not in ("left", "right"):
             raise ValueError(f"arm_side must be 'left' or 'right', got: {arm_side}")
@@ -305,26 +336,8 @@ class VegaRobot:
                 qp_solver="proxqp",
                 safety_buffer=0.2,
                 damping_weights=IKDampingWeightsConfig(
-                    default=1e-3,
-                    override={
-                        "torso_j1": 30000.0,
-                        "torso_j2": 30000.0,
-                        "torso_j3": 30000.0,
-                        "R_arm_j1": 50,
-                        "L_arm_j1": 50,
-                        "R_arm_j2": 75,
-                        "L_arm_j2": 75,
-                        "R_arm_j3": 50.0,
-                        "L_arm_j3": 50.0,
-                        "R_arm_j4": 50.0,
-                        "L_arm_j4": 50.0,
-                        "R_arm_j5": 120.0,
-                        "L_arm_j5": 120.0,
-                        "R_arm_j6": 120.0,
-                        "L_arm_j6": 120.0,
-                        "R_arm_j7": 120.0,
-                        "L_arm_j7": 120.0,
-                    },
+                    default=self._ik_damping_default,
+                    override=self._ik_damping_override,
                 ),
             )
         except Exception:
@@ -1123,8 +1136,8 @@ class VegaRobot:
             if action_space == "target_cartesian_delta":
                 # target_cartesian_delta → recover velocity by multiplying gains
                 cart_velocity = np.empty(6, dtype=np.float64)
-                cart_velocity[:3] = cart_action[:3] * _TELEOP_POS_ACTION_GAIN
-                cart_velocity[3:6] = cart_action[3:6] * _TELEOP_ROT_ACTION_GAIN
+                cart_velocity[:3] = cart_action[:3] * self._teleop_pos_gain
+                cart_velocity[3:6] = cart_action[3:6] * self._teleop_rot_gain
                 action_dict["cartesian_velocity"] = cart_velocity.tolist()
                 action_dict["target_cartesian_delta"] = np.concatenate(
                     [cart_action, [gripper_position]]
@@ -1164,8 +1177,8 @@ class VegaRobot:
                     else action_dict["cartesian_velocity"]
                 )
                 tcd = np.empty(7, dtype=np.float64)
-                tcd[:3] = np.asarray(vel_for_tcd[:3]) / _TELEOP_POS_ACTION_GAIN
-                tcd[3:6] = np.asarray(vel_for_tcd[3:6]) / _TELEOP_ROT_ACTION_GAIN
+                tcd[:3] = np.asarray(vel_for_tcd[:3]) / self._teleop_pos_gain
+                tcd[3:6] = np.asarray(vel_for_tcd[3:6]) / self._teleop_rot_gain
                 tcd[6] = gripper_position
                 action_dict["target_cartesian_delta"] = tcd.tolist()
 

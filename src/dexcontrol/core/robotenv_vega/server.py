@@ -29,8 +29,6 @@ from core.vega.robot import (  # noqa: E402
     IKFailedError,
     JointLimitExceededError,
     VegaRobot,
-    _TELEOP_POS_ACTION_GAIN,
-    _TELEOP_ROT_ACTION_GAIN,
 )
 from proto import robotenv_pb2, robotenv_pb2_grpc  # noqa: E402
 
@@ -52,15 +50,15 @@ def _to_proto_value(val: Any) -> robotenv_pb2.Value:
     return robotenv_pb2.Value(string_value=str(val))
 
 
-# Per-arm init (home) and reset middle waypoints.
-# Left→Right mirroring: [-v0, -v1, -v2, v3, -v4, -v5, -v6]
-_INIT_JOINTS = {
+# Per-arm init (home) and reset middle waypoints — hardcoded fallback values
+# used when no yaml config is loaded.
+_DEFAULT_INIT_JOINTS = {
     "left":  np.array([-1.4234,  1.3524,  2.8707, -1.981,   0.6751, -0.1662,  0.068]),
     "right": np.array([ 1.4234, -1.3524, -2.8707, -1.981,  -0.1515,  0.1662, -0.068]),
 }
-_RESET_MIDDLE_JOINTS = {
-    "left":  np.array([-2.7592,   1.3579,   2.8643, -1.8855, 0.6702, -0.1592, 0.2338]),
-    "right": np.array([ 2.7592,   -1.3579,   -2.8643, -1.8855, -0.6702, 0.1592, -0.2338]),
+_DEFAULT_RESET_MIDDLE_JOINTS = {
+    "left":  np.array([-2.7592,  1.3579,  2.8643, -1.8855,  0.6702, -0.1592,  0.2338]),
+    "right": np.array([ 2.7592, -1.3579, -2.8643, -1.8855, -0.6702,  0.1592, -0.2338]),
 }
 
 
@@ -80,9 +78,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         robotiq_comport: str = "/dev/ttyUSB0",
         ema_alpha: float = 0.0,
         ik_damping_default: float = 1e-3,
-        ik_damping_torso: float = 30000.0,
-        ik_damping_arm_j2: float = 100.0,
-        ik_damping_arm_j3: float = 50.0,
+        ik_damping_override: Optional[dict] = None,
         interpolation_method: str = "none",
         interpolation_history: int = 4,
         control_loop_hz: int = 0,
@@ -98,6 +94,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
         head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),  # head_j1 limit: ±1.483 rad
+        init_joints: Optional[list[float]] = None,
+        middle_joints: Optional[list[float]] = None,
+        teleop_pos_gain: float = 5.0,
+        teleop_rot_gain: float = 2.0,
+        motor_max_delta_rad: Optional[list[float]] = None,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -140,6 +141,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             vel_ratio=vel_ratio,
             vel_damp_thresh=vel_damp_thresh,
             head_init_pos=head_init_pos,
+            teleop_pos_gain=teleop_pos_gain,
+            teleop_rot_gain=teleop_rot_gain,
+            motor_max_delta_rad=motor_max_delta_rad,
+            ik_damping_default=ik_damping_default,
+            ik_damping_override=ik_damping_override,
         )
         self._robot.launch_robot()
 
@@ -159,9 +165,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 self._control_loop_hz,
             )
 
-        # Override home position with per-arm init joints.
-        self.reset_joints = _INIT_JOINTS[arm_side].copy()
-        self.reset_middle_joints = _RESET_MIDDLE_JOINTS[arm_side].copy()
+        # Override home position with per-arm init joints (yaml > hardcoded fallback).
+        self.reset_joints = (
+            np.array(init_joints, dtype=np.float64) if init_joints is not None
+            else _DEFAULT_INIT_JOINTS[arm_side].copy()
+        )
+        self.reset_middle_joints = (
+            np.array(middle_joints, dtype=np.float64) if middle_joints is not None
+            else _DEFAULT_RESET_MIDDLE_JOINTS[arm_side].copy()
+        )
         self.safe_transit_pose = self._robot.safe_transit_pose.copy()
 
         if base_frame_rotation is not None:
@@ -193,12 +205,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             "position+velocity feedforward" if self.use_velocity_feedforward else "position-only",
         )
         LOGGER.info(
-            "IK config: solver=%s damping(default=%.6f torso=%.1f arm_j2=%.1f arm_j3=%.1f)",
+            "IK config: solver=%s damping_default=%.6f override_keys=%s",
             ik_solver_type,
             ik_damping_default,
-            ik_damping_torso,
-            ik_damping_arm_j2,
-            ik_damping_arm_j3,
+            list((ik_damping_override or {}).keys()),
         )
         LOGGER.info(
             "Cartesian velocity normalization enabled: max_lin_delta=%.6f max_rot_delta=%.6f",
@@ -534,8 +544,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             elif action_space == "target_cartesian_delta":
                 # Recover cartesian_velocity by re-applying teleop gains,
                 # then convert to motor delta via the standard path.
-                action[:3] *= _TELEOP_POS_ACTION_GAIN
-                action[3:6] *= _TELEOP_ROT_ACTION_GAIN
+                action[:3] *= self._robot._teleop_pos_gain
+                action[3:6] *= self._robot._teleop_rot_gain
                 action = self._cartesian_velocity_to_delta(action)
                 action_space_for_robot = "cartesian_delta"
             t_after_xform = time.time()
@@ -838,7 +848,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 return
 
             actual = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
-            # [BUG PROBE] 첫 tick 위치를 기록해 stale 여부를 사후 분석에 활용
+            # [BUG PROBE] Record the first tick's position to use for post-hoc staleness analysis
             if _tick == 0:
                 LOGGER.info(
                     "_move_incremental[%s][BUG_PROBE] tick=0 actual=%s target=%s",
@@ -949,9 +959,7 @@ def serve(
     robotiq_comport: str = "/dev/ttyUSB0",
     ema_alpha: float = 0.0,
     ik_damping_default: float = 1e-3,
-    ik_damping_torso: float = 30000.0,
-    ik_damping_arm_j2: float = 100.0,
-    ik_damping_arm_j3: float = 50.0,
+    ik_damping_override: Optional[dict] = None,
     interpolation_method: str = "none",
     interpolation_history: int = 4,
     control_loop_hz: int = 0,
@@ -966,7 +974,12 @@ def serve(
     rot_sensitivity: float = 1.0,
     vel_ratio: float = 1.0,
     vel_damp_thresh: float = 0.05,
-    head_init_pos: tuple[float, ...] | list[float] = (1.48, 0.0, -0.3),
+    head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
+    init_joints: Optional[list[float]] = None,
+    middle_joints: Optional[list[float]] = None,
+    teleop_pos_gain: float = 5.0,
+    teleop_rot_gain: float = 2.0,
+    motor_max_delta_rad: Optional[list[float]] = None,
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
@@ -1004,9 +1017,7 @@ def serve(
         robotiq_comport=robotiq_comport,
         ema_alpha=ema_alpha,
         ik_damping_default=ik_damping_default,
-        ik_damping_torso=ik_damping_torso,
-        ik_damping_arm_j2=ik_damping_arm_j2,
-        ik_damping_arm_j3=ik_damping_arm_j3,
+        ik_damping_override=ik_damping_override,
         interpolation_method=interpolation_method,
         interpolation_history=interpolation_history,
         control_loop_hz=control_loop_hz,
@@ -1022,6 +1033,11 @@ def serve(
         vel_ratio=vel_ratio,
         vel_damp_thresh=vel_damp_thresh,
         head_init_pos=head_init_pos,
+        init_joints=init_joints,
+        middle_joints=middle_joints,
+        teleop_pos_gain=teleop_pos_gain,
+        teleop_rot_gain=teleop_rot_gain,
+        motor_max_delta_rad=motor_max_delta_rad,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -1128,36 +1144,18 @@ def main() -> None:
              "Ignored for non-EtherCAT grippers.",
     )
     parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to control_params.yaml. Defaults to src/dexcontrol/config/control_params.yaml",
+    )
+    parser.add_argument(
         "--ema-alpha",
         type=float,
-        default=0.0,
+        default=None,
         help="Smoothing responsiveness for joint commands (0.0=disabled, 0.3~0.8=typical). "
              "Uses a critically damped 2nd-order filter: higher = faster tracking, "
-             "lower = smoother. No overshoot at any setting. (default: 0.0)",
-    )
-    parser.add_argument(
-        "--ik-damping-default",
-        type=float,
-        default=1e-3,
-        help="Pink IK default damping weight (default: 1e-3)",
-    )
-    parser.add_argument(
-        "--ik-damping-torso",
-        type=float,
-        default=30000.0,
-        help="Pink IK damping override for torso_j1~j3 (default: 30000)",
-    )
-    parser.add_argument(
-        "--ik-damping-arm-j2",
-        type=float,
-        default=100.0,
-        help="Pink IK damping override for L/R_arm_j2 (default: 100)",
-    )
-    parser.add_argument(
-        "--ik-damping-arm-j3",
-        type=float,
-        default=50.0,
-        help="Pink IK damping override for L/R_arm_j3 (default: 50)",
+             "lower = smoother. No overshoot at any setting.",
     )
     # --- Interpolation & filtering ---
     parser.add_argument(
@@ -1186,52 +1184,51 @@ def main() -> None:
     parser.add_argument(
         "--filter-type",
         type=str,
-        default="none",
+        default=None,
         choices=["none", "butterworth", "ema"],
-        help="Output filter applied after interpolation/EMA smoothing. "
-             "(default: none)",
+        help="Output filter applied after interpolation/EMA smoothing.",
     )
     parser.add_argument(
         "--filter-cutoff-freq",
         type=float,
-        default=10.0,
-        help="Butterworth filter cutoff frequency in Hz (default: 10.0)",
+        default=None,
+        help="Butterworth filter cutoff frequency in Hz",
     )
     parser.add_argument(
         "--filter-order",
         type=int,
-        default=2,
-        help="Butterworth filter order (default: 2)",
+        default=None,
+        help="Butterworth filter order",
     )
     parser.add_argument(
         "--filter-ema-alpha",
         type=float,
-        default=0.1,
-        help="EMA filter alpha (0=fully smooth, 1=no smoothing) when --filter-type=ema (default: 0.1)",
+        default=None,
+        help="EMA filter alpha (0=fully smooth, 1=no smoothing) when --filter-type=ema",
     )
     parser.add_argument(
         "--vel-smoothing-alpha",
         type=float,
-        default=0.3,
-        help="Velocity feedforward EMA factor (0=fully smooth, 1=no smoothing, default: 0.3)",
+        default=None,
+        help="Velocity feedforward EMA factor (0=fully smooth, 1=no smoothing)",
     )
     parser.add_argument(
         "--hw-correction-alpha",
         type=float,
-        default=0.7,
-        help="HW feedback correction blend (0=ignore hw, 1=snap to hw, default: 0.7)",
+        default=None,
+        help="HW feedback correction blend (0=ignore hw, 1=snap to hw)",
     )
     parser.add_argument(
         "--max-delta-scale",
         type=float,
-        default=1.0,
-        help="Scale factor for per-joint max delta clipping (>1=faster, <1=slower, default: 1.0)",
+        default=None,
+        help="Scale factor for per-joint max delta clipping (>1=faster, <1=slower)",
     )
     parser.add_argument(
         "--max-accel-delta",
         type=float,
-        default=0.25,
-        help="Max per-step accel change (rad/step^2) for acceleration limiting (0=disable, default: 0.25)",
+        default=None,
+        help="Max per-step accel change (rad/step^2) for acceleration limiting (0=disable)",
     )
     parser.add_argument(
         "--rot-sensitivity",
@@ -1242,25 +1239,38 @@ def main() -> None:
     parser.add_argument(
         "--vel-ratio",
         type=float,
-        default=1.0,
-        help="Velocity feedforward ratio (0.5=half speed, 1.0=full, default: 1.0)",
+        default=None,
+        help="Velocity feedforward ratio (0.5=half speed, 1.0=full)",
     )
     parser.add_argument(
         "--vel-damp-thresh",
         type=float,
-        default=0.05,
-        help="Velocity damping threshold in rad. Velocity tapers linearly from 0→100%% over this distance to target (default: 0.05). Smaller=less damping, larger=more damping.",
+        default=None,
+        help="Velocity damping threshold in rad.",
     )
     parser.add_argument(
         "--head-init-pos",
         type=float,
         nargs=3,
-        default=[2.0, 0.0, -0.3],
+        default=None,
         metavar=("YAW", "PITCH", "ROLL"),
-        help="Head joint init position in radians [yaw, pitch, roll]. "
-             "Defaults to [1.48, 0.0, -0.3] (head_j1 limit: ±1.483 rad).",
+        help="Head joint init position in radians [yaw, pitch, roll].",
     )
     args = parser.parse_args()
+
+    # Load yaml config and merge with CLI args (CLI wins over yaml).
+    # Use relative import pattern (src/dexcontrol/ is in sys.path via parents[2]).
+    from config.loader import load_control_params, merge_args
+    cfg = load_control_params(args.config)
+    params = merge_args(args, cfg)
+
+    # init_joints / middle_joints in yaml are {left: [...], right: [...]}; select arm_side.
+    side = args.arm_side
+    init_joints_list   = (params.get("init_joints")   or {}).get(side)
+    middle_joints_list = (params.get("middle_joints") or {}).get(side)
+
+    # head_init_pos: CLI list or yaml list; fall back to server default if neither present.
+    head_init_pos = params.get("head_init_pos") or (2.0, 0.0, -0.3)
 
     # Both flags feed the same downstream "where is the gripper attached"
     # slot. --gripper-iface is the canonical name for SR; --robotiq-comport
@@ -1270,7 +1280,7 @@ def main() -> None:
     serve(
         grpc_port=args.grpc_port,
         robot_model=args.robot_model,
-        arm_side=args.arm_side,
+        arm_side=side,
         gripper_type=args.gripper_type,
         frame_type=args.frame_type,
         control_hz=args.control_hz,
@@ -1278,26 +1288,29 @@ def main() -> None:
         base_frame_rotation=args.base_frame_rotation,
         ik_solver_type=args.ik_solver,
         robotiq_comport=gripper_addr,
-        ema_alpha=args.ema_alpha,
-        ik_damping_default=args.ik_damping_default,
-        ik_damping_torso=args.ik_damping_torso,
-        ik_damping_arm_j2=args.ik_damping_arm_j2,
-        ik_damping_arm_j3=args.ik_damping_arm_j3,
+        ema_alpha=params["ema_alpha"],
+        ik_damping_default=params["ik_damping_default"],
+        ik_damping_override=params["ik_damping_override"],
         interpolation_method=args.interpolation_method,
         interpolation_history=args.interpolation_history,
         control_loop_hz=args.control_loop_hz,
-        filter_type=args.filter_type,
-        filter_cutoff_freq=args.filter_cutoff_freq,
-        filter_order=args.filter_order,
-        filter_ema_alpha=args.filter_ema_alpha,
-        vel_smoothing_alpha=args.vel_smoothing_alpha,
-        hw_correction_alpha=args.hw_correction_alpha,
-        max_delta_scale=args.max_delta_scale,
-        max_accel_delta=args.max_accel_delta,
+        filter_type=params["filter_type"],
+        filter_cutoff_freq=params["filter_cutoff_freq"],
+        filter_order=params["filter_order"],
+        filter_ema_alpha=params["filter_ema_alpha"],
+        vel_smoothing_alpha=params["vel_smoothing_alpha"],
+        hw_correction_alpha=params["hw_correction_alpha"],
+        max_delta_scale=params["max_delta_scale"],
+        max_accel_delta=params["max_accel_delta"],
         rot_sensitivity=args.rot_sensitivity,
-        vel_ratio=args.vel_ratio,
-        vel_damp_thresh=args.vel_damp_thresh,
-        head_init_pos=args.head_init_pos,
+        vel_ratio=params["vel_ratio"],
+        vel_damp_thresh=params["vel_damp_thresh"],
+        head_init_pos=head_init_pos,
+        init_joints=init_joints_list,
+        middle_joints=middle_joints_list,
+        teleop_pos_gain=params["teleop_pos_gain"],
+        teleop_rot_gain=params["teleop_rot_gain"],
+        motor_max_delta_rad=params["motor_max_delta_rad"],
     )
 
 
