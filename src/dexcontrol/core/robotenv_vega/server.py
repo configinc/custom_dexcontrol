@@ -50,18 +50,6 @@ def _to_proto_value(val: Any) -> robotenv_pb2.Value:
     return robotenv_pb2.Value(string_value=str(val))
 
 
-# Per-arm init (home) and reset middle waypoints — hardcoded fallback values
-# used when no yaml config is loaded.
-_DEFAULT_INIT_JOINTS = {
-    "left":  np.array([-1.4234,  1.3524,  2.8707, -1.981,   0.6751, -0.1662,  0.068]),
-    "right": np.array([ 1.4234, -1.3524, -2.8707, -1.981,  -0.1515,  0.1662, -0.068]),
-}
-_DEFAULT_RESET_MIDDLE_JOINTS = {
-    "left":  np.array([-2.7592,  1.3579,  2.8643, -1.8855,  0.6702, -0.1592,  0.2338]),
-    "right": np.array([ 2.7592, -1.3579, -2.8643, -1.8855, -0.6702,  0.1592, -0.2338]),
-}
-
-
 class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     """RobotEnv service implementation for one Vega arm."""
 
@@ -165,15 +153,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 self._control_loop_hz,
             )
 
-        # Override home position with per-arm init joints (yaml > hardcoded fallback).
-        self.reset_joints = (
-            np.array(init_joints, dtype=np.float64) if init_joints is not None
-            else _DEFAULT_INIT_JOINTS[arm_side].copy()
-        )
-        self.reset_middle_joints = (
-            np.array(middle_joints, dtype=np.float64) if middle_joints is not None
-            else _DEFAULT_RESET_MIDDLE_JOINTS[arm_side].copy()
-        )
+        if init_joints is None:
+            raise ValueError(
+                f"init_joints missing for arm_side={arm_side!r}: "
+                "set init_joints.left/right in control_params.yaml."
+            )
+        if middle_joints is None:
+            raise ValueError(
+                f"middle_joints missing for arm_side={arm_side!r}: "
+                "set middle_joints.left/right in control_params.yaml."
+            )
+        self.reset_joints = np.array(init_joints, dtype=np.float64)
+        self.reset_middle_joints = np.array(middle_joints, dtype=np.float64)
         self.safe_transit_pose = self._robot.safe_transit_pose.copy()
 
         if base_frame_rotation is not None:
@@ -439,6 +430,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "robot_model": self.robot_model,
                 "control_hz": str(self.control_hz),
                 "arm_side": self.arm_side,
+                "teleop_pos_gain": str(self._robot._teleop_pos_gain),
+                "teleop_rot_gain": str(self._robot._teleop_rot_gain),
             },
         )
 

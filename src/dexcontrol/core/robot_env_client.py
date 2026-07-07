@@ -276,9 +276,14 @@ class RobotEnvClient:
 
         # ----- Compatibility attributes (match RobotEnv) -----
 
-        # control_hz from server config metadata
+        # control_hz / teleop gains from server config metadata, so the client
+        # never diverges from the gains the server actually applies.
         self.control_hz = int(self._robot_config.metadata.get("control_hz", "20")) \
             if self._robot_config else 20
+        teleop_pos_gain = float(self._robot_config.metadata.get("teleop_pos_gain", "5.0")) \
+            if self._robot_config else 5.0
+        teleop_rot_gain = float(self._robot_config.metadata.get("teleop_rot_gain", "2.0")) \
+            if self._robot_config else 2.0
 
         # DoF: 7 for cartesian action spaces, 8 for joint
         self.DoF = 7 if ("cartesian" in action_space) else 8
@@ -291,7 +296,11 @@ class RobotEnvClient:
         self.camera = None
 
         # _robot proxy for create_action_dict() and other attribute access
-        self._robot = _RobotProxy(control_hz=self.control_hz)
+        self._robot = _RobotProxy(
+            control_hz=self.control_hz,
+            teleop_pos_gain=teleop_pos_gain,
+            teleop_rot_gain=teleop_rot_gain,
+        )
 
         # Initial reset (matches RobotEnv.__init__ do_reset behavior)
         if do_reset:
