@@ -107,6 +107,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self.control_hz, rot_sensitivity=rot_sensitivity,
         )
 
+        self._teleop_pos_gain = float(teleop_pos_gain)
+        self._teleop_rot_gain = float(teleop_rot_gain)
+
         self._robot = VegaRobot(
             robot_model=robot_model,
             arm_side=arm_side,
@@ -430,8 +433,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "robot_model": self.robot_model,
                 "control_hz": str(self.control_hz),
                 "arm_side": self.arm_side,
-                "teleop_pos_gain": str(self._robot._teleop_pos_gain),
-                "teleop_rot_gain": str(self._robot._teleop_rot_gain),
+                "teleop_pos_gain": str(self._teleop_pos_gain),
+                "teleop_rot_gain": str(self._teleop_rot_gain),
             },
         )
 
@@ -537,8 +540,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             elif action_space == "target_cartesian_delta":
                 # Recover cartesian_velocity by re-applying teleop gains,
                 # then convert to motor delta via the standard path.
-                action[:3] *= self._robot._teleop_pos_gain
-                action[3:6] *= self._robot._teleop_rot_gain
+                action[:3] *= self._teleop_pos_gain
+                action[3:6] *= self._teleop_rot_gain
                 action = self._cartesian_velocity_to_delta(action)
                 action_space_for_robot = "cartesian_delta"
             t_after_xform = time.time()
