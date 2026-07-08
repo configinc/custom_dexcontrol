@@ -50,7 +50,7 @@ DEFAULT_ACTION_SPACE = "target_cartesian_delta"
 # this rate governs only the boot lull and any teleop-hold gaps where actions stop
 # flowing. Kept at the engine's default control_hz so obs never falls below the rate
 # the engine expects to sample — dropping under control_hz would stall the engine's
-# per-tick obs de-dup guard. See ``LoopRobotClient.run_action_driven`` for the model.
+# per-tick obs de-dup guard. See ``LoopRobotClient.run`` for the model.
 DEFAULT_HEARTBEAT_HZ = 20.0
 
 
@@ -139,7 +139,7 @@ class LoopRobotEnv:
     control rate rather than the previous 100 Hz free-run. ``heartbeat_hz`` is the
     fallback rate for the boot lull (before any action) and for teleop-hold gaps where
     no action is flowing; when actions arrive at or above that rate the heartbeat obs
-    is suppressed. See ``LoopRobotClient.run_action_driven`` in loop-sdk.
+    is suppressed. See ``LoopRobotClient.run`` in loop-sdk.
     """
 
     def __init__(
@@ -200,7 +200,7 @@ class LoopRobotEnv:
             }
 
         # The SDK owns the loop. Vega is in-process with the RobotEnv gRPC server, so
-        # ``run_action_driven`` goes on a daemon thread (the main thread serves Step +
+        # ``run`` goes on a daemon thread (the main thread serves Step +
         # waits for shutdown). It publishes the bootstrap obs on connect (that first
         # publish is what breaks the obs/action startup cycle), then republishes obs
         # after each Step / home, and falls back to ``heartbeat_hz`` when actions stall.
@@ -245,13 +245,14 @@ class LoopRobotEnv:
         """Thread body: drive the SDK loop, surfacing a fatal exit (live robot — a silent
         daemon-thread death would freeze obs/action with no signal).
 
-        With the action lane enabled we take the event-driven path so obs cadence follows
-        each incoming ``robot-action``. Obs-only mode has no action lane to hang the
-        cadence on, so we fall back to the clock-driven ``run`` at ``heartbeat_hz``.
+        With the action lane enabled we take the event-driven path (``LoopRobotClient.run``)
+        so obs cadence follows each incoming ``robot-action``. Obs-only mode has no action
+        lane to hang the cadence on, so we fall back to the clock-driven ``stream_obs`` at
+        ``heartbeat_hz``.
         """
         try:
             if enable_action:
-                self._loop_robot_client.run_action_driven(
+                self._loop_robot_client.run(
                     publish_obs_callback=self._read_obs,
                     apply_action_callback=self._apply_action,
                     handle_command_callback=self._apply_command,
@@ -259,7 +260,7 @@ class LoopRobotEnv:
                     stop=self._lane_stop,
                 )
                 return
-            self._loop_robot_client.run(
+            self._loop_robot_client.stream_obs(
                 publish_obs_callback=self._read_obs,
                 hz=self._heartbeat_hz,
                 stop=self._lane_stop,
