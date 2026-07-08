@@ -27,6 +27,7 @@ import signal
 import sys
 import threading
 from concurrent import futures
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Sequence
 
 import grpc
@@ -45,6 +46,17 @@ from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 LOGGER = logging.getLogger("loop_bridge.vega")
 
 DEFAULT_ACTION_SPACE = "target_cartesian_delta"
+
+# The installed dexcontrol build we run against. Advertised on ``robot-obs`` so a
+# recording pins the robot-server version it was captured with (mirrors the HW
+# ``robot_firmware_version`` axis, for the software side). Resolved from the
+# installed package metadata so a release automatically flows through — no
+# separate manual bump. Falls back to a sentinel when the package is not
+# installed (e.g. running from an editable checkout without a wheel resolve).
+try:
+    _ROBOT_SERVER_VERSION = f"dexcontrol-{version('dexcontrol')}"
+except PackageNotFoundError:
+    _ROBOT_SERVER_VERSION = "dexcontrol-unknown"
 # Fallback obs publish rate when the action lane is idle. In steady state obs is now
 # driven by robot-action arrivals (each Step is followed by a fresh post-step obs), so
 # this rate governs only the boot lull and any teleop-hold gaps where actions stop
@@ -167,17 +179,18 @@ class LoopRobotEnv:
         self._heartbeat_hz = heartbeat_hz  # fallback obs rate when the action lane is idle
         self._lane_stop = threading.Event()
 
-        # Advertise only what this robot owns — the action space. control_hz is NOT the
-        # robot's axis anymore: obs publishes fast and the RCI engine owns the control rate
-        # (picked on the robot-control panel), so the robot must not advertise it.
+        # Advertise the axes this robot owns: action_space + robot_server_version. The
+        # control clock is NOT the robot's axis anymore — the RCI engine owns it via its
+        # own GUI-side selector. robot_server_version reports the dexcontrol build the
+        # bus link is running against, so a recording can pin the version it was
+        # captured with (mirrors robot_firmware_version reporting for HW).
         options = RobotConfigOptions(
             action_space=tuple(action_space_options) or (action_space,),
+            robot_server_version=(_ROBOT_SERVER_VERSION,),
         )
 
         def apply_config(config: RobotConfig) -> RobotConfig:
-            self.reconfigure(
-                control_hz=config.control_hz, action_space=config.action_space
-            )
+            self.reconfigure(action_space=config.action_space)
             return config
 
         # One bus object owns the whole link: publish robot-obs + (when enabled)
@@ -226,18 +239,14 @@ class LoopRobotEnv:
             else "",
         )
 
-    def reconfigure(
-        self, control_hz: float | None = None, action_space: str = ""
-    ) -> None:
+    def reconfigure(self, action_space: str = "") -> None:
         """Apply a Source-Bus-selected config: re-target Step's action space.
 
         Called from the obs sender's ``apply_config`` when the recorder picks a config.
-        The selected ``control_hz`` paces the RCI ENGINE, not this robot: the obs publish
-        rate stays fixed (fast) so the engine always samples a fresh pose — re-pacing obs
-        down to control_hz would re-introduce the stale-feedback servo shake. Only the
-        action space is re-targeted here; it is read by each Step apply next tick.
+        The RCI engine's control clock is no longer part of this negotiation (the GUI
+        selects it directly on the engine). Only the action space is re-targeted here;
+        it is read by each Step apply next tick.
         """
-        del control_hz  # engine's clock, not the robot's obs rate
         if action_space:
             self._action_space = action_space
 
