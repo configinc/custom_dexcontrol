@@ -281,7 +281,7 @@ class LoopRobotEnv:
         return merge_observations(observations)
 
     def _apply_command(self, command: dict[str, Any]) -> None:
-        """``drain_commands_callback``: home each arm on a HOME command (unknown/failed logged + skipped)."""
+        """``handle_command_callback``: home each arm on a HOME command (unknown/failed logged + skipped)."""
         if not self._appliers:
             return
         if command.get("command") != HOME:
