@@ -33,6 +33,49 @@ for _path in (_DEXCONTROL_SRC, _DEXCONTROL_TELEOP):
 from dexcontrol import Robot
 from dexbot_utils.configs import get_robot_config
 
+
+class _RobotWithCustomHeadPose(Robot):
+    """Robot subclass that skips the default head home pose on startup.
+
+    head_init_pos is passed via __init__ so that _set_default_state() moves
+    the head directly to the desired position instead of the predefined "home"
+    pose.
+    """
+
+    def __init__(self, *args, head_init_pos: np.ndarray | None = None, **kwargs):
+        self._head_init_pos = head_init_pos
+        super().__init__(*args, **kwargs)
+
+    def _set_default_state(self) -> None:
+        estop = getattr(self, "estop", None)
+        if estop is not None and estop.is_software_estop_enabled():
+            _logger.warning(
+                "Software E-Stop is active. "
+                "Head cannot be enabled and control features are not functional. "
+                "Call robot.estop.deactivate() to release the software E-Stop "
+                "before controlling the robot."
+            )
+            return
+
+        for arm in ["left_arm", "right_arm"]:
+            component = getattr(self, arm, None)
+            if component is not None:
+                component.set_modes(["position"] * 7)
+
+        head = getattr(self, "head", None)
+        if head is not None:
+            head.set_mode("enable")
+            if self._head_init_pos is not None:
+                init_pos = self.compensate_torso_pitch(
+                    np.asarray(self._head_init_pos, dtype=np.float32).copy(), "head"
+                )
+                _logger.info("Setting custom head init pos: %s", init_pos.tolist())
+            else:
+                init_pos = self.compensate_torso_pitch(
+                    head.get_predefined_pose("home"), "head"
+                )
+            head.set_joint_pos(init_pos)
+
 _base_arm_teleop_error = None
 try:
     from base_arm_teleop import BaseIKController
@@ -98,6 +141,7 @@ class VegaRobot:
         max_jerk: float = 0.25,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
+        head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -127,7 +171,10 @@ class VegaRobot:
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
 
         configs = get_robot_config(robot_model)
-        self.robot = Robot(configs=configs)
+        self.robot = _RobotWithCustomHeadPose(
+            configs=configs,
+            head_init_pos=np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None,
+        )
         self.arm = getattr(self.robot, f"{arm_side}_arm")
         hand_component = f"{arm_side}_hand"
 
@@ -897,20 +944,12 @@ class VegaRobot:
             jerk_mask = np.abs(accel) > jerk_limit
             jerk_count = int(np.count_nonzero(jerk_mask))
             if np.any(jerk_mask):
-                # #region agent log
-                self._agent_debug_log(
-                    run_id=run_id,
-                    hypothesis_id="H7",
-                    location="dexcontrol/core/vega/robot.py:update_joints",
-                    message="jerk_limit_applied",
-                    data={
-                        "arm_side": self.arm_side,
-                        "indices": np.where(jerk_mask)[0].tolist(),
-                        "raw_accel": np.round(accel[jerk_mask], 6).tolist(),
-                        "jerk_limit": float(jerk_limit),
-                    },
+                _logger.debug(
+                    "[JerkLimit] joints=%s raw_accel=%s limit=%.6f",
+                    np.where(jerk_mask)[0].tolist(),
+                    np.round(accel[jerk_mask], 6).tolist(),
+                    float(jerk_limit),
                 )
-                # #endregion
                 accel = np.clip(accel, -jerk_limit, jerk_limit)
                 diff = self._prev_cmd_delta + accel
                 target_joint_pos = current + diff

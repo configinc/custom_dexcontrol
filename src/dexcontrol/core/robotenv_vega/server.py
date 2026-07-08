@@ -95,6 +95,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         rot_sensitivity: float = 1.0,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
+        head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),  # head_j1 limit: ±1.483 rad
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -146,6 +147,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             max_jerk=max_jerk,
             vel_ratio=vel_ratio,
             vel_damp_thresh=vel_damp_thresh,
+            head_init_pos=head_init_pos,
         )
         self._robot.launch_robot()
 
@@ -221,6 +223,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         # Move to init position on startup.
         LOGGER.info("Moving to init position on startup (arm=%s)", arm_side)
         self._execute_reset_sequence(self.reset_joints)
+
+        # Fetch and cache robot firmware version once at startup.
+        self._firmware_version = self._fetch_firmware_version()
 
     # ------------------------------------------------------------------
     # Background control loop (for interpolation upsampling)
@@ -511,8 +516,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 _cur_grip_norm = 0.0
             _arm_dof = 7 if action_space.startswith("joint") else 6
             # End-effector slice: scalar gripper (1) or multi-finger hand (N).
+            # Keep the full slice (5-finger hand support) from our branch, but log
+            # at DEBUG (per main's hot-path log demotion) to avoid per-step INFO.
             _hand_cmd = action[_arm_dof:].tolist() if action.shape[0] > _arm_dof else []
-            LOGGER.info(
+            LOGGER.debug(
                 "[Gripper] cmd=%s  space=%s  gripper_space=%s  cur_raw=%.4f  cur_norm=%.4f",
                 _hand_cmd, action_space, gripper_action_space, _cur_grip_raw, _cur_grip_norm,
             )
@@ -529,7 +536,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 raw_rot_norm = float(np.linalg.norm(raw_action[3:6]))
                 action = self._cartesian_velocity_to_delta(action)
                 action_space_for_robot = "cartesian_delta"
-                LOGGER.info(
+                LOGGER.debug(
                     "Converted cartesian_velocity -> cartesian_delta: lin_norm=%.4f rot_norm=%.4f max_lin_delta=%.6f max_rot_delta=%.6f",
                     raw_lin_norm, raw_rot_norm, self._max_lin_delta, self._max_rot_delta,
                 )
@@ -548,6 +555,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
             # Get robot_state BEFORE executing action (needed for create_action_dict)
             pre_action_state, _ = self._robot.get_robot_state()
+            LOGGER.debug(
+                "[CartesianPos] %s",
+                np.round(np.asarray(pre_action_state["cartesian_position"], dtype=np.float64), 4).tolist(),
+            )
 
             if self._robot.interpolation_enabled and self._control_loop_hz > 0:
                 # Interpolation mode: buffer command; control loop dispatches.
@@ -663,7 +674,29 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             branch=info.get("branch", "unknown"),
             commit=info.get("commit", "unknown"),
             tag=info.get("tag", "unknown"),
+            firmware_version=self._firmware_version,
         )
+
+    def _fetch_firmware_version(self) -> str:
+        """Query robot firmware version via Zenoh at server startup and return it.
+
+        Calls Robot.get_version_info() which queries the hardware's JSON version
+        endpoint over DexComm/Zenoh. The result is cached in self._firmware_version
+        and served through GetVersion RPC for the lifetime of the server process.
+
+        Returns empty string if the firmware version cannot be retrieved.
+        """
+        try:
+            version_info = self._robot.robot.get_version_info(show=False)
+            firmware_version = version_info.get("version", "")
+            if firmware_version:
+                LOGGER.info("Robot firmware version: %s", firmware_version)
+            else:
+                LOGGER.warning("Firmware version field missing in version_info response")
+            return firmware_version
+        except Exception as exc:
+            LOGGER.warning("Failed to fetch robot firmware version: %s", exc)
+            return ""
 
     def _load_version_info(self) -> dict[str, str]:
         """Load version info from version_info.txt."""
@@ -829,6 +862,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         deadline = time.time() + t_max
         settle_start = None
         prev_actual = None
+        _tick = 0  # [BUG PROBE]
 
         while time.time() < deadline:
             if self._cancel_move.is_set():
@@ -836,6 +870,13 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 return
 
             actual = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
+            # [BUG PROBE] 첫 tick 위치를 기록해 stale 여부를 사후 분석에 활용
+            if _tick == 0:
+                LOGGER.info(
+                    "_move_incremental[%s][BUG_PROBE] tick=0 actual=%s target=%s",
+                    self.arm_side, actual.round(4).tolist(), target.round(4).tolist(),
+                )
+            _tick += 1
             diff = target - actual
             max_err = float(np.max(np.abs(diff)))
             if max_err < tol:
@@ -957,6 +998,7 @@ def serve(
     rot_sensitivity: float = 1.0,
     vel_ratio: float = 1.0,
     vel_damp_thresh: float = 0.05,
+    head_init_pos: tuple[float, ...] | list[float] = (1.48, 0.0, -0.3),
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
@@ -971,6 +1013,16 @@ def serve(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    _log_path = os.path.expanduser("~/custom_dexcontrol/src/dexcontrol/logs/robotenv_vega.log")
+    os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+    from core.robotenv_vega.circular_file_handler import CircularFileHandler
+    _file_handler = CircularFileHandler(_log_path)
+    _file_handler.setLevel(logging.getLogger().level)
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(name)s [%(filename)s:%(lineno)d]: %(message)s"
+    ))
+    logging.getLogger().addHandler(_file_handler)
 
     service = VegaRobotEnvService(
         robot_model=robot_model,
@@ -1001,6 +1053,7 @@ def serve(
         rot_sensitivity=rot_sensitivity,
         vel_ratio=vel_ratio,
         vel_damp_thresh=vel_damp_thresh,
+        head_init_pos=head_init_pos,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -1230,6 +1283,15 @@ def main() -> None:
         default=0.05,
         help="Velocity damping threshold in rad. Velocity tapers linearly from 0→100%% over this distance to target (default: 0.05). Smaller=less damping, larger=more damping.",
     )
+    parser.add_argument(
+        "--head-init-pos",
+        type=float,
+        nargs=3,
+        default=[2.0, 0.0, -0.3],
+        metavar=("YAW", "PITCH", "ROLL"),
+        help="Head joint init position in radians [yaw, pitch, roll]. "
+             "Defaults to [1.48, 0.0, -0.3] (head_j1 limit: ±1.483 rad).",
+    )
     args = parser.parse_args()
 
     # Both flags feed the same downstream "where is the gripper attached"
@@ -1267,6 +1329,7 @@ def main() -> None:
         rot_sensitivity=args.rot_sensitivity,
         vel_ratio=args.vel_ratio,
         vel_damp_thresh=args.vel_damp_thresh,
+        head_init_pos=args.head_init_pos,
     )
 
 
