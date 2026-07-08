@@ -27,7 +27,7 @@ import signal
 import sys
 import threading
 from concurrent import futures
-from typing import Any, Optional, Sequence
+from typing import Any, Sequence
 
 import grpc
 from loop_sdk import (
@@ -268,20 +268,17 @@ class LoopRobotEnv:
         except Exception:
             LOGGER.exception("loop robot env run() thread exited with an error")
 
-    def _read_obs(self) -> tuple[int, dict[str, Any]]:
+    def _read_obs(self) -> dict[str, Any]:
         """``publish_obs_callback``: read every arm's observation (paired) and merge into one robot-obs.
 
-        Returns ``(timestamp_us, merged payload)`` for ``run()`` to publish — the first
-        arm's sample timestamp.
+        Returns the merged payload for ``run()`` to publish. The SDK stamps the
+        timestamp itself — the per-arm sample timestamp is not preserved on the wire.
         """
         observations: dict[str, Any] = {}
-        timestamp_us: Optional[int] = None
         for arm_prefix, service in self._arm_services:
-            observation, sample_ts = service._create_observation()
+            observation, _sample_ts = service._create_observation()
             observations[arm_prefix] = observation
-            if timestamp_us is None:
-                timestamp_us = sample_ts
-        return int(timestamp_us or 0), merge_observations(observations)
+        return merge_observations(observations)
 
     def _apply_command(self, command: dict[str, Any]) -> None:
         """``drain_commands_callback``: home each arm on a HOME command (unknown/failed logged + skipped)."""
