@@ -255,15 +255,41 @@ class LoopRobotEnv:
         )
 
     def reconfigure(self, action_space: str = "") -> None:
-        """Apply a Source-Bus-selected config: re-target Step's action space.
+        """Apply a Source-Bus-selected config: re-target Step's action space AND
+        the vector-schema (``action_channels``) that decoders slice against.
 
         Called from the obs sender's ``apply_config`` when the recorder picks a config.
-        The RCI engine's control clock is no longer part of this negotiation (the GUI
-        selects it directly on the engine). Only the action space is re-targeted here;
-        it is read by each Step apply next tick.
+        The RCI engine's control clock is no longer part of this negotiation. If the
+        new ``action_space`` matches the current one, this is a no-op. If it has
+        DIFFERENT ``arm_dim`` than the initial space, the wire-side declared
+        ``action_channels`` (pinned at connect) becomes stale — we refuse the change
+        loudly rather than silently cross-wire (older ``target_cartesian_delta``
+        vectors would decode against fresh joint-space channels and step wrong
+        slices). Reconnect the robot server to pick up the new layout in that case.
         """
-        if action_space:
-            self._action_space = action_space
+        if not action_space or action_space == self._action_space:
+            return
+        try:
+            new_dim = arm_dim_for_action_space(action_space)
+        except KeyError:
+            LOGGER.warning(
+                "reconfigure: unknown action_space %r; keeping %r",
+                action_space, self._action_space,
+            )
+            return
+        old_dim = arm_dim_for_action_space(self._action_space)
+        if new_dim != old_dim:
+            LOGGER.warning(
+                "reconfigure: action_space %r has arm_dim=%d, initial %r had %d; "
+                "the wire-side action_channels layout was pinned at connect and "
+                "cannot be resized live — REJECTING the change. Reconnect the robot "
+                "server if the recorder needs the new space.",
+                action_space, new_dim, self._action_space, old_dim,
+            )
+            return
+        arm_prefixes = tuple(arm_prefix for arm_prefix, _ in self._arm_services)
+        self._action_channels = build_action_channels(arm_prefixes, action_space, new_dim)
+        self._action_space = action_space
 
     def _run_loop_client(self, *, enable_action: bool) -> None:
         """Thread body: drive the SDK loop, surfacing a fatal exit (live robot — a silent
@@ -320,13 +346,25 @@ class LoopRobotEnv:
     def _apply_action_frame(self, frame: RobotActionFrame) -> None:
         """``apply_action_callback``: split the vector across arms via declared
         action_channels and Step each arm. ``frame.values`` is aligned to the
-        ``action_channels`` this server declared on connect."""
+        ``action_channels`` this server declared on connect.
+
+        A per-arm wiring bug (non-contiguous action indices → decode raises
+        ValueError) must NOT collapse the other arms' steps or the obs-driven
+        cadence — catch inside the loop and skip only that arm this tick.
+        """
         if not self._appliers:
             return
         for arm_prefix, applier in self._appliers.items():
-            action = decode_action(
-                frame.values, self._action_channels, arm_prefix, self._action_space
-            )
+            try:
+                action = decode_action(
+                    frame.values, self._action_channels, arm_prefix, self._action_space
+                )
+            except ValueError as exc:
+                LOGGER.warning(
+                    "robot-action decode failed for %s; skipping this arm this tick: %s",
+                    arm_prefix, exc,
+                )
+                continue
             if action is None:
                 continue
             try:
