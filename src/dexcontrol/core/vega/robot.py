@@ -537,10 +537,12 @@ class VegaRobot:
         elif action_space == "joint_delta":
             target_joint_pos = current_joint_pos + arm_action
         elif action_space == "cartesian_velocity":
-            target_joint_pos = self._solve_cartesian_delta(arm_action[:3] * dt, arm_action[3:6] * dt)
+            target_joint_pos = self._solve_cartesian_delta(
+                arm_action[:3] * dt, arm_action[3:6] * dt, hw_pos=current_joint_pos)
             self._last_ik_joint_pos = target_joint_pos.copy()
         else:  # cartesian_delta
-            target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
+            target_joint_pos = self._solve_cartesian_delta(
+                arm_action[:3], arm_action[3:6], hw_pos=current_joint_pos)
             self._last_ik_joint_pos = target_joint_pos.copy()
 
         # Log per-joint delta from IK (before smoothing/clipping)
@@ -643,10 +645,12 @@ class VegaRobot:
         elif action_space == "joint_delta":
             target_joint_pos = current_joint_pos + arm_action
         elif action_space == "cartesian_velocity":
-            target_joint_pos = self._solve_cartesian_delta(arm_action[:3] * dt, arm_action[3:6] * dt)
+            target_joint_pos = self._solve_cartesian_delta(
+                arm_action[:3] * dt, arm_action[3:6] * dt, hw_pos=current_joint_pos)
             self._last_ik_joint_pos = target_joint_pos.copy()
         else:  # cartesian_delta
-            target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
+            target_joint_pos = self._solve_cartesian_delta(
+                arm_action[:3], arm_action[3:6], hw_pos=current_joint_pos)
             self._last_ik_joint_pos = target_joint_pos.copy()
 
         timestamp = _time.perf_counter()
@@ -986,9 +990,17 @@ class VegaRobot:
         except Exception:
             pass
 
-    def _solve_cartesian_delta(self, delta_xyz: np.ndarray, delta_rpy: np.ndarray) -> np.ndarray:
+    def _solve_cartesian_delta(
+        self,
+        delta_xyz: np.ndarray,
+        delta_rpy: np.ndarray,
+        hw_pos: np.ndarray | None = None,
+    ) -> np.ndarray:
         # Gradual correction: use last command + outlier-rejected hw correction as IK start
-        hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        if hw_pos is None:
+            hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        else:
+            hw_pos = np.asarray(hw_pos, dtype=np.float64)
         if self._last_cmd_joint_pos is not None:
             raw_error = hw_pos - self._last_cmd_joint_pos
             outlier_mask = np.abs(raw_error) > self._HW_CORRECTION_OUTLIER_THRESH
@@ -1219,7 +1231,8 @@ class VegaRobot:
                 if self._last_ik_joint_pos is not None:
                     target_joints = self._last_ik_joint_pos
                 else:
-                    target_joints = self._solve_cartesian_delta(cartesian_delta[:3], cartesian_delta[3:6])
+                    target_joints = self._solve_cartesian_delta(
+                        cartesian_delta[:3], cartesian_delta[3:6], hw_pos=current_joint_pos)
                 action_dict["joint_position"] = target_joints.tolist()
                 joint_delta = target_joints - current_joint_pos
                 action_dict["joint_velocity"] = (joint_delta / dt).tolist()
