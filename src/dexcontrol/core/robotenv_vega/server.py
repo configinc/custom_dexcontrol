@@ -485,6 +485,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             finally:
                 # Restart control loop if it was running before reset.
                 if was_running:
+                    # Clear any command points buffered during the reset sequence
+                    # before restarting the loop, preventing unintended motion.
+                    self._robot.reset_filter_state()
                     self._start_control_loop()
                 self._resetting.clear()
 
