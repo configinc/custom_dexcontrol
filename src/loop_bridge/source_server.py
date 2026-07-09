@@ -278,7 +278,7 @@ class LoopRobotEnv:
             if enable_action:
                 self._loop_robot_client.run(
                     publish_obs_callback=self._read_obs,
-                    apply_action_frame_callback=self._apply_action_frame,
+                    apply_action_callback=self._apply_action_frame,
                     handle_command_callback=self._apply_command,
                     heartbeat_hz=self._heartbeat_hz,
                     stop=self._lane_stop,
@@ -318,7 +318,7 @@ class LoopRobotEnv:
                 LOGGER.warning("home failed for %s; skipping: %s", arm_prefix, exc)
 
     def _apply_action_frame(self, frame: RobotActionFrame) -> None:
-        """``apply_action_frame_callback``: split the vector across arms via declared
+        """``apply_action_callback``: split the vector across arms via declared
         action_channels and Step each arm. ``frame.values`` is aligned to the
         ``action_channels`` this server declared on connect."""
         if not self._appliers:
