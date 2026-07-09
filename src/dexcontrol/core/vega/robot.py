@@ -247,6 +247,7 @@ class VegaRobot:
         self._vel_smoothing_alpha = float(np.clip(vel_smoothing_alpha, 0.0, 1.0))
         self._last_cmd_joint_pos: np.ndarray | None = None  # Track last sent command for delta clipping
         self._prev_cmd_delta: np.ndarray | None = None  # Previous step delta for accel limiting
+        self._last_ik_joint_pos: np.ndarray | None = None  # IK result cache — reused by create_action_dict
         self._HW_CORRECTION_ALPHA = float(np.clip(hw_correction_alpha, 0.0, 1.0))
         self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
         self._max_delta_scale = float(max(0.1, max_delta_scale))
@@ -353,6 +354,7 @@ class VegaRobot:
         self._filter_vel = None
         self._last_cmd_joint_pos = None
         self._prev_cmd_delta = None
+        self._last_ik_joint_pos = None
         if self._interpolator is not None:
             self._interpolator.clear()
         if self._output_filter is not None:
@@ -502,6 +504,7 @@ class VegaRobot:
         action_space: str,
         gripper_action_space: str = "position",
         blocking: bool = False,
+        hw_state: dict | None = None,
     ) -> None:
         if action_space not in SUPPORTED_ACTION_SPACES:
             raise ValueError(f"Unsupported action_space '{action_space}'")
@@ -510,7 +513,10 @@ class VegaRobot:
 
         action = np.asarray(command, dtype=np.float64).reshape(-1)
         dt = 1.0 / max(1, self.control_hz)
-        state_dict, _ = self.get_robot_state()
+        if hw_state is not None:
+            state_dict = hw_state
+        else:
+            state_dict, _ = self.get_robot_state()
         current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
 
         if action_space.startswith("joint"):
@@ -532,8 +538,10 @@ class VegaRobot:
             target_joint_pos = current_joint_pos + arm_action
         elif action_space == "cartesian_velocity":
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3] * dt, arm_action[3:6] * dt)
+            self._last_ik_joint_pos = target_joint_pos.copy()
         else:  # cartesian_delta
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
+            self._last_ik_joint_pos = target_joint_pos.copy()
 
         # Log per-joint delta from IK (before smoothing/clipping)
         ik_delta = target_joint_pos - current_joint_pos
@@ -567,7 +575,8 @@ class VegaRobot:
                 target_joint_pos = self._filter_pos.copy()
 
         try:
-            self.update_joints(target_joint_pos, velocity=False, blocking=blocking)
+            self.update_joints(target_joint_pos, velocity=False, blocking=blocking,
+                               hw_pos=current_joint_pos)
             self.update_gripper(
                 gripper_action,
                 velocity=(gripper_action_space == "velocity"),
@@ -590,6 +599,7 @@ class VegaRobot:
         command: np.ndarray,
         action_space: str,
         gripper_action_space: str = "position",
+        hw_state: dict | None = None,
     ) -> None:
         """Buffer a command at input rate for later interpolation.
 
@@ -602,13 +612,17 @@ class VegaRobot:
         """
         if self._interpolator is None:
             # No interpolation — direct execution (legacy path).
-            self.update_command(command, action_space, gripper_action_space, blocking=False)
+            self.update_command(command, action_space, gripper_action_space, blocking=False,
+                                hw_state=hw_state)
             return
 
         # Resolve action → joint-space target (same logic as update_command).
         action = np.asarray(command, dtype=np.float64).reshape(-1)
         dt = 1.0 / max(1, self.control_hz)
-        state_dict, _ = self.get_robot_state()
+        if hw_state is not None:
+            state_dict = hw_state
+        else:
+            state_dict, _ = self.get_robot_state()
         current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
 
         if action_space.startswith("joint"):
@@ -630,8 +644,10 @@ class VegaRobot:
             target_joint_pos = current_joint_pos + arm_action
         elif action_space == "cartesian_velocity":
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3] * dt, arm_action[3:6] * dt)
+            self._last_ik_joint_pos = target_joint_pos.copy()
         else:  # cartesian_delta
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
+            self._last_ik_joint_pos = target_joint_pos.copy()
 
         timestamp = _time.perf_counter()
         with self._interp_lock:
@@ -726,12 +742,21 @@ class VegaRobot:
         joint_pos_command: np.ndarray,
         velocity: bool = False,
         blocking: bool = False,
+        hw_pos: np.ndarray | None = None,
     ) -> None:
         target_joint_pos = np.asarray(joint_pos_command, dtype=np.float64)
+
+        # Read hw position once; reused for velocity→position conversion and
+        # HW correction below. Callers may pass a cached value to avoid a
+        # redundant hardware read within the same Step.
+        if hw_pos is None:
+            hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        else:
+            hw_pos = np.asarray(hw_pos, dtype=np.float64)
+
         if velocity:
             dt = 1.0 / max(1, self.control_hz)
-            current_joint_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
-            target_joint_pos = current_joint_pos + target_joint_pos * dt
+            target_joint_pos = hw_pos + target_joint_pos * dt
 
         # Clip small IK numerical errors within tolerance before hard validation
         limits = self.arm.joint_pos_limit
@@ -753,7 +778,6 @@ class VegaRobot:
         # Gradual correction: use _last_cmd_joint_pos as the base for delta
         # clipping, blending a fraction of hw feedback error each step to
         # prevent drift without causing discontinuous jumps.
-        hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
         if self._last_cmd_joint_pos is not None:
             raw_error = hw_pos - self._last_cmd_joint_pos
             # Per-joint outlier rejection: skip correction for joints where
@@ -1188,9 +1212,14 @@ class VegaRobot:
             target_cart[3:6] += cartesian_delta[3:6]  # rpy
             action_dict["cartesian_position"] = target_cart.tolist()
 
-            # Use IK to get joint positions
+            # Use IK to get joint positions — reuse the cached result from the
+            # update_command() / add_command_point() call that preceded this in
+            # the same Step to avoid a duplicate IK solve.
             try:
-                target_joints = self._solve_cartesian_delta(cartesian_delta[:3], cartesian_delta[3:6])
+                if self._last_ik_joint_pos is not None:
+                    target_joints = self._last_ik_joint_pos
+                else:
+                    target_joints = self._solve_cartesian_delta(cartesian_delta[:3], cartesian_delta[3:6])
                 action_dict["joint_position"] = target_joints.tolist()
                 joint_delta = target_joints - current_joint_pos
                 action_dict["joint_velocity"] = (joint_delta / dt).tolist()

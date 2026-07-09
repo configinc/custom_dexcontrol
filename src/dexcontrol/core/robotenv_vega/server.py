@@ -559,6 +559,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     action,
                     action_space=action_space_for_robot,
                     gripper_action_space=gripper_action_space,
+                    hw_state=pre_action_state,
                 )
             else:
                 # Legacy synchronous path.
@@ -567,6 +568,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     action_space=action_space_for_robot,
                     gripper_action_space=gripper_action_space,
                     blocking=False,
+                    hw_state=pre_action_state,
                 )
             t_after_cmd = time.time()
 
