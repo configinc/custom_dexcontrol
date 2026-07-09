@@ -33,6 +33,7 @@ from typing import Any, Sequence
 import grpc
 from loop_sdk import (
     LoopRobotClient,
+    RobotActionFrame,
     RobotConfig,
     RobotConfigOptions,
 )
@@ -40,7 +41,12 @@ from loop_sdk import (
 # Importing the upstream module runs its sys.path setup and binds the proto stubs.
 from dexcontrol.core.robotenv_vega import server as _vega_server
 from loop_bridge.obs_publisher import merge_observations
-from loop_bridge.robot_action import HOME, decode_action
+from loop_bridge.robot_action import (
+    HOME,
+    arm_dim_for_action_space,
+    build_action_channels,
+    decode_action,
+)
 from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
 
 LOGGER = logging.getLogger("loop_bridge.vega")
@@ -189,18 +195,27 @@ class LoopRobotEnv:
             robot_server_version=(_ROBOT_SERVER_VERSION,),
         )
 
+        # Vector-symmetric layout: the robot server is authoritative for the ordered
+        # channel keys used across robot-action / teleop-action / policy-action lanes.
+        # Teleop and policy scan robot-obs's SourceInfo.action_channels to build a
+        # vector matching THIS layout — that's how the wire stays consistent even when
+        # the robot geometry / action_space is device-specific.
+        self._action_channels = build_action_channels(
+            arm_prefixes, action_space, arm_dim_for_action_space(action_space)
+        )
+
         def apply_config(config: RobotConfig) -> RobotConfig:
             self.reconfigure(action_space=config.action_space)
             return config
 
-        # One bus object owns the whole link: publish robot-obs + (when enabled)
-        # consume robot-action + robot-command. Source ids are pinned by the SDK facade
-        # (our lane convention); LoopRobotEnv owns the per-arm action decode. The obs poll
-        # pulls poll_action()/drain_commands() each tick and Steps/homes each arm via a
-        # per-arm _StepApplier. Obs-only (enable_action=False) wires neither input lane.
+        # One bus object owns the whole link: publish robot-obs (declaring the vector
+        # action_channels) + (when enabled) consume robot-action + robot-command. Source
+        # ids are pinned by the SDK facade (our lane convention); LoopRobotEnv owns the
+        # per-arm action decode. Obs-only (enable_action=False) wires neither input lane.
         self._loop_robot_client = LoopRobotClient(
             loop_addr,
             options=options,
+            action_channels=self._action_channels,
             apply_config_callback=apply_config,
             enable_action=enable_action,
         )
@@ -263,7 +278,7 @@ class LoopRobotEnv:
             if enable_action:
                 self._loop_robot_client.run(
                     publish_obs_callback=self._read_obs,
-                    apply_action_callback=self._apply_action,
+                    apply_action_frame_callback=self._apply_action_frame,
                     handle_command_callback=self._apply_command,
                     heartbeat_hz=self._heartbeat_hz,
                     stop=self._lane_stop,
@@ -302,19 +317,21 @@ class LoopRobotEnv:
             except Exception as exc:
                 LOGGER.warning("home failed for %s; skipping: %s", arm_prefix, exc)
 
-    def _apply_action(self, payload: dict[str, Any]) -> None:
-        """``poll_action_callback``: decode each arm's vector from the raw robot-action and Step it."""
+    def _apply_action_frame(self, frame: RobotActionFrame) -> None:
+        """``apply_action_frame_callback``: split the vector across arms via declared
+        action_channels and Step each arm. ``frame.values`` is aligned to the
+        ``action_channels`` this server declared on connect."""
         if not self._appliers:
             return
         for arm_prefix, applier in self._appliers.items():
-            action = decode_action(payload, arm_prefix, self._action_space)
+            action = decode_action(
+                frame.values, self._action_channels, arm_prefix, self._action_space
+            )
             if action is None:
                 continue
             try:
                 applier.step(action, self._action_space, self._gripper_action_space)
-            except (
-                Exception
-            ) as exc:  # _StepApplier raises on non-SUCCESS Step; skip the tick
+            except Exception as exc:  # _StepApplier raises on non-SUCCESS Step; skip
                 LOGGER.warning(
                     "robot-action Step failed for %s; skipping: %s", arm_prefix, exc
                 )
