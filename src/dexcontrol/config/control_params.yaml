@@ -25,7 +25,7 @@ motion_filter:
   vel_smoothing_alpha: 0.3
   hw_correction_alpha: 0.7
   max_delta_scale: 1.0
-  max_jerk: 0.25
+  max_accel_delta: 0.25
   vel_ratio: 1.0
   vel_damp_thresh: 0.05
 

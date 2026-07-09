@@ -57,7 +57,7 @@ def merge_args(args_ns: argparse.Namespace, cfg: dict) -> dict:
         "vel_smoothing_alpha": _cli("vel_smoothing_alpha", mf.get("vel_smoothing_alpha", 0.3)),
         "hw_correction_alpha": _cli("hw_correction_alpha", mf.get("hw_correction_alpha", 0.7)),
         "max_delta_scale":     _cli("max_delta_scale",     mf.get("max_delta_scale", 1.0)),
-        "max_accel_delta":     _cli("max_accel_delta",     mf.get("max_jerk", 0.25)),
+        "max_accel_delta":     _cli("max_accel_delta",     mf.get("max_accel_delta", 0.25)),
         "vel_ratio":           _cli("vel_ratio",           mf.get("vel_ratio", 1.0)),
         "vel_damp_thresh":     _cli("vel_damp_thresh",     mf.get("vel_damp_thresh", 0.05)),
 
