@@ -4,8 +4,8 @@ init_joints:
   right: [ 1.4234, -1.3524, -2.8707, -1.981,  -0.1515,  0.1662, -0.068]
 
 middle_joints:
-  left:  [-2.7592,  1.3579,  2.8643, -1.8855,  0.6702, -0.1592,  0.2338]
-  right: [ 2.7592, -1.3579, -2.8643, -1.8855, -0.6702,  0.1592, -0.2338]
+  left:  [-0.9548,  0.9862, -0.3738, -1.4169,  0.6624, -0.2987, -0.0650]
+  right: [ 0.9548, -0.9862,  0.3738, -1.4169, -0.6624,  0.2987,  0.0650]
 
 # ── Head initial position [yaw, pitch, roll] ──────────────────────────
 head_init_pos: [2.0, 0.0, -0.3]
@@ -44,19 +44,19 @@ ik_damping:
     L_arm_j3: 50.0
     R_arm_j4: 50.0
     L_arm_j4: 50.0
-    R_arm_j5: 120.0
-    L_arm_j5: 120.0
-    R_arm_j6: 120.0
-    L_arm_j6: 120.0
-    R_arm_j7: 120.0
-    L_arm_j7: 120.0
+    R_arm_j5: 103.0
+    L_arm_j5: 103.0
+    R_arm_j6: 103.0
+    L_arm_j6: 103.0
+    R_arm_j7: 103.0
+    L_arm_j7: 103.0
 
 # ── Motor max delta (per joint, rad/step) ─────────────────────────────
 motor_max_delta_rad:
-  - 0.35   # j1 – base rotation
-  - 0.35   # j2 – shoulder
-  - 0.35   # j3 – shoulder
+  - 0.50   # j1 – base rotation
+  - 0.50   # j2 – shoulder
+  - 0.50   # j3 – shoulder
   - 0.50   # j4 – elbow
-  - 0.60   # j5 – wrist
-  - 0.60   # j6 – wrist
-  - 0.60   # j7 – wrist
+  - 0.50   # j5 – wrist
+  - 0.50   # j6 – wrist
+  - 0.50   # j7 – wrist
