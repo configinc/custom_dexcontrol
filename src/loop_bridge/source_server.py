@@ -40,6 +40,16 @@ from loop_sdk import (
 
 # Importing the upstream module runs its sys.path setup and binds the proto stubs.
 from dexcontrol.core.robotenv_vega import server as _vega_server
+from dexcontrol.core.vega.robot import SUPPORTED_ACTION_SPACES as _VEGA_SUPPORTED_ACTION_SPACES
+
+# Baked-in option menus the recorder shows on robot-step's config picker. Vega
+# knows its supported types; a customer that ships a different robot (e.g. a
+# franka) can override any of these via the corresponding *_options kwarg on
+# serve_with_loop / serve_dual_arm. Empty tuple = no menu for that axis.
+_VEGA_DEFAULT_GRIPPER_TYPE_OPTIONS: tuple[str, ...] = ("default", "robotiq", "sr_gripper")
+_VEGA_DEFAULT_ROBOT_TYPE_OPTIONS: tuple[str, ...] = ("vega_1",)
+_VEGA_DEFAULT_FINGER_TYPE_OPTIONS: tuple[str, ...] = ()
+_VEGA_DEFAULT_ROBOT_FIRMWARE_VERSION_OPTIONS: tuple[str, ...] = ()
 from loop_bridge.obs_publisher import merge_observations
 from loop_bridge.robot_action import (
     HOME,
@@ -190,17 +200,20 @@ class LoopRobotEnv:
         self._lane_stop = threading.Event()
 
         # Advertise the axes this robot owns as pickable menus the recorder shows on
-        # robot-step. Empty axis = no menu (recorder skips the picker). The control
-        # clock is NOT a per-source axis anymore — the RCI engine owns it via the
-        # cell-config's RobotConfig.control_hz, picked in the cell-config editor.
-        # robot_server_version is filled from the installed package version so the
-        # recording can pin the dexcontrol build it was captured with.
+        # robot-step. Non-empty caller-provided list wins; otherwise fall back to
+        # the Vega-baked defaults so the operator doesn't need to pass a flag for
+        # every axis just to get the standard menu. Empty defaults (finger_type,
+        # firmware) still hide the picker. The control clock is NOT a per-source
+        # axis anymore — the RCI engine owns it via the cell-config's
+        # RobotConfig.control_hz, picked in the cell-config editor. robot_server_version
+        # is filled from the installed package version so the recording can pin the
+        # dexcontrol build it was captured with.
         options = RobotConfigOptions(
-            action_space=tuple(action_space_options) or (action_space,),
-            gripper_type=tuple(gripper_type_options),
-            finger_type=tuple(finger_type_options),
-            robot_type=tuple(robot_type_options),
-            robot_firmware_version=tuple(robot_firmware_version_options),
+            action_space=tuple(action_space_options) or _VEGA_SUPPORTED_ACTION_SPACES,
+            gripper_type=tuple(gripper_type_options) or _VEGA_DEFAULT_GRIPPER_TYPE_OPTIONS,
+            finger_type=tuple(finger_type_options) or _VEGA_DEFAULT_FINGER_TYPE_OPTIONS,
+            robot_type=tuple(robot_type_options) or _VEGA_DEFAULT_ROBOT_TYPE_OPTIONS,
+            robot_firmware_version=tuple(robot_firmware_version_options) or _VEGA_DEFAULT_ROBOT_FIRMWARE_VERSION_OPTIONS,
             robot_server_version=(_ROBOT_SERVER_VERSION,),
         )
 
