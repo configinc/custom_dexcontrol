@@ -137,8 +137,31 @@ def main() -> None:
         default="",
         help="Comma-separated action spaces the source advertises (default: --action-space)",
     )
+    parser.add_argument(
+        "--gripper-type-options",
+        default="",
+        help="Comma-separated gripper types the source advertises (empty = no menu)",
+    )
+    parser.add_argument(
+        "--finger-type-options",
+        default="",
+        help="Comma-separated finger types the source advertises (empty = no menu)",
+    )
+    parser.add_argument(
+        "--robot-type-options",
+        default="",
+        help="Comma-separated robot types the source advertises (empty = no menu)",
+    )
+    parser.add_argument(
+        "--robot-firmware-version-options",
+        default="",
+        help="Comma-separated robot firmware versions the source advertises (empty = no menu)",
+    )
 
     args = parser.parse_args()
+
+    def _csv(value: str) -> tuple[str, ...]:
+        return tuple(v.strip() for v in value.split(",") if v.strip())
 
     loop_kwargs = dict(
         loop_addr=args.loop_addr,
@@ -146,9 +169,11 @@ def main() -> None:
         gripper_action_space=args.gripper_action_space,
         heartbeat_hz=args.heartbeat_hz,
         enable_action=not args.no_action,
-        action_space_options=tuple(
-            v.strip() for v in args.action_space_options.split(",") if v.strip()
-        ),
+        action_space_options=_csv(args.action_space_options),
+        gripper_type_options=_csv(args.gripper_type_options),
+        finger_type_options=_csv(args.finger_type_options),
+        robot_type_options=_csv(args.robot_type_options),
+        robot_firmware_version_options=_csv(args.robot_firmware_version_options),
     )
     # --gripper-iface (SR EtherCAT) takes precedence over --robotiq-comport, both
     # feed the one "where is the gripper" slot (mirrors server.py).

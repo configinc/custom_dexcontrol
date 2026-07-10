@@ -170,6 +170,10 @@ class LoopRobotEnv:
         heartbeat_hz: float = DEFAULT_HEARTBEAT_HZ,
         enable_action: bool = True,
         action_space_options: Sequence[str] = (),
+        gripper_type_options: Sequence[str] = (),
+        finger_type_options: Sequence[str] = (),
+        robot_type_options: Sequence[str] = (),
+        robot_firmware_version_options: Sequence[str] = (),
     ) -> None:
         if heartbeat_hz <= 0:
             raise ValueError(f"heartbeat_hz must be > 0, got {heartbeat_hz}")
@@ -185,13 +189,18 @@ class LoopRobotEnv:
         self._heartbeat_hz = heartbeat_hz  # fallback obs rate when the action lane is idle
         self._lane_stop = threading.Event()
 
-        # Advertise the axes this robot owns: action_space + robot_server_version. The
-        # control clock is NOT the robot's axis anymore — the RCI engine owns it via its
-        # own GUI-side selector. robot_server_version reports the dexcontrol build the
-        # bus link is running against, so a recording can pin the version it was
-        # captured with (mirrors robot_firmware_version reporting for HW).
+        # Advertise the axes this robot owns as pickable menus the recorder shows on
+        # robot-step. Empty axis = no menu (recorder skips the picker). The control
+        # clock is NOT a per-source axis anymore — the RCI engine owns it via the
+        # cell-config's RobotConfig.control_hz, picked in the cell-config editor.
+        # robot_server_version is filled from the installed package version so the
+        # recording can pin the dexcontrol build it was captured with.
         options = RobotConfigOptions(
             action_space=tuple(action_space_options) or (action_space,),
+            gripper_type=tuple(gripper_type_options),
+            finger_type=tuple(finger_type_options),
+            robot_type=tuple(robot_type_options),
+            robot_firmware_version=tuple(robot_firmware_version_options),
             robot_server_version=(_ROBOT_SERVER_VERSION,),
         )
 
@@ -409,6 +418,10 @@ def serve_with_loop(
     heartbeat_hz: float = DEFAULT_HEARTBEAT_HZ,
     enable_action: bool = True,
     action_space_options: Sequence[str] = (),
+    gripper_type_options: Sequence[str] = (),
+    finger_type_options: Sequence[str] = (),
+    robot_type_options: Sequence[str] = (),
+    robot_firmware_version_options: Sequence[str] = (),
     **service_kwargs: Any,
 ) -> None:
     """Single-arm: a RobotEnv gRPC server that also bridges one robot-obs/robot-action."""
@@ -425,6 +438,10 @@ def serve_with_loop(
         heartbeat_hz=heartbeat_hz,
         enable_action=enable_action,
         action_space_options=action_space_options,
+        gripper_type_options=gripper_type_options,
+        finger_type_options=finger_type_options,
+        robot_type_options=robot_type_options,
+        robot_firmware_version_options=robot_firmware_version_options,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -487,6 +504,10 @@ def serve_dual_arm(
     heartbeat_hz: float = DEFAULT_HEARTBEAT_HZ,
     enable_action: bool = True,
     action_space_options: Sequence[str] = (),
+    gripper_type_options: Sequence[str] = (),
+    finger_type_options: Sequence[str] = (),
+    robot_type_options: Sequence[str] = (),
+    robot_firmware_version_options: Sequence[str] = (),
     left_robotiq_comport: str | None = None,
     right_robotiq_comport: str | None = None,
     **service_kwargs: Any,
@@ -525,6 +546,10 @@ def serve_dual_arm(
         heartbeat_hz=heartbeat_hz,
         enable_action=enable_action,
         action_space_options=action_space_options,
+        gripper_type_options=gripper_type_options,
+        finger_type_options=finger_type_options,
+        robot_type_options=robot_type_options,
+        robot_firmware_version_options=robot_firmware_version_options,
     )
     LOGGER.info(
         "Vega dual-arm robot env running: arms=%s robot-obs=%r",
