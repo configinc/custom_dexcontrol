@@ -137,7 +137,7 @@
             --vel-smoothing-alpha 1.0 \
             --hw-correction-alpha 0.5 \
             --max-delta-scale 3.0 \
-            --max-jerk 0 \
+            --max-accel-delta 0 \
             --rot-sensitivity 2.0 \
             --vel-ratio 1.0" C-m
         sleep 0.5
@@ -155,7 +155,7 @@
             --vel-smoothing-alpha 1.0 \
             --hw-correction-alpha 0.5 \
             --max-delta-scale 3.0 \
-            --max-jerk 0 \
+            --max-accel-delta 0 \
             --rot-sensitivity 2.0 \
             --vel-ratio 1.0" C-m
         ENDSSH

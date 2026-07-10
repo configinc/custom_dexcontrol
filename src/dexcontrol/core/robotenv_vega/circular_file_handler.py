@@ -7,8 +7,8 @@ import os
 import struct
 import threading
 
-SOFT_LIMIT = 500 * 1024 * 1024  # 500MB — wrap 기준
-MAX_BYTES = 505 * 1024 * 1024   # 505MB — 실제 파일 크기 (레코드 잘림 방지 여유)
+SOFT_LIMIT = 500 * 1024 * 1024  # 500MB — threshold for wrapping
+MAX_BYTES = 505 * 1024 * 1024   # 505MB — actual file size (margin to prevent record truncation)
 
 
 class CircularFileHandler(logging.Handler):

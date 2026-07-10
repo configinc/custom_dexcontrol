@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import json
 import os
 import sys
 import threading
@@ -100,8 +99,23 @@ SUPPORTED_ACTION_SPACES = (
 
 # Gains applied by Oculus controller to raw deltas before emitting
 # cartesian_velocity.  Used to recover the original (gain-free) delta.
+# Kept as module-level constants for backward compatibility; VegaRobot
+# uses instance variables (_teleop_pos_gain / _teleop_rot_gain) so these
+# values can be overridden via yaml without changing call sites.
 _TELEOP_POS_ACTION_GAIN = 5.0
 _TELEOP_ROT_ACTION_GAIN = 2.0
+
+# Fallback IK damping override dict used when no yaml config is provided.
+_DEFAULT_IK_OVERRIDE: dict[str, float] = {
+    "torso_j1": 30000.0, "torso_j2": 30000.0, "torso_j3": 30000.0,
+    "R_arm_j1": 50.0,    "L_arm_j1": 50.0,
+    "R_arm_j2": 75.0,    "L_arm_j2": 75.0,
+    "R_arm_j3": 50.0,    "L_arm_j3": 50.0,
+    "R_arm_j4": 50.0,    "L_arm_j4": 50.0,
+    "R_arm_j5": 120.0,   "L_arm_j5": 120.0,
+    "R_arm_j6": 120.0,   "L_arm_j6": 120.0,
+    "R_arm_j7": 120.0,   "L_arm_j7": 120.0,
+}
 
 
 class JointLimitExceededError(RuntimeError):
@@ -138,10 +152,15 @@ class VegaRobot:
         vel_smoothing_alpha: float = 0.3,
         hw_correction_alpha: float = 0.7,
         max_delta_scale: float = 1.0,
-        max_jerk: float = 0.25,
+        max_accel_delta: float = 0.25,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
         head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
+        teleop_pos_gain: float = 5.0,
+        teleop_rot_gain: float = 2.0,
+        motor_max_delta_rad: list[float] | None = None,
+        ik_damping_default: float = 1e-3,
+        ik_damping_override: dict[str, float] | None = None,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -152,6 +171,17 @@ class VegaRobot:
             gripper_type = hand_type
         self._robotiq_comport = robotiq_comport
         self._ik_solver_type = ik_solver_type
+        self._teleop_pos_gain = float(teleop_pos_gain)
+        self._teleop_rot_gain = float(teleop_rot_gain)
+        self._ik_damping_default = float(ik_damping_default)
+        self._ik_damping_override = ik_damping_override if ik_damping_override is not None else _DEFAULT_IK_OVERRIDE
+        if motor_max_delta_rad is not None:
+            arr = np.array(motor_max_delta_rad, dtype=np.float64)
+            if arr.shape != (7,):
+                raise ValueError(
+                    f"motor_max_delta_rad must have exactly 7 values, got {arr.shape[0]}"
+                )
+            self._MOTOR_MAX_DELTA_RAD_BASE = arr
 
         if arm_side not in ("left", "right"):
             raise ValueError(f"arm_side must be 'left' or 'right', got: {arm_side}")
@@ -216,11 +246,12 @@ class VegaRobot:
         self._prev_joint_vel: np.ndarray | None = None
         self._vel_smoothing_alpha = float(np.clip(vel_smoothing_alpha, 0.0, 1.0))
         self._last_cmd_joint_pos: np.ndarray | None = None  # Track last sent command for delta clipping
-        self._prev_cmd_delta: np.ndarray | None = None  # Previous step delta for jerk limiting
+        self._prev_cmd_delta: np.ndarray | None = None  # Previous step delta for accel limiting
+        self._last_ik_joint_pos: np.ndarray | None = None  # IK result cache — reused by create_action_dict
         self._HW_CORRECTION_ALPHA = float(np.clip(hw_correction_alpha, 0.0, 1.0))
         self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
         self._max_delta_scale = float(max(0.1, max_delta_scale))
-        self._MOTOR_MAX_JERK_RAD = float(max(0.0, max_jerk))
+        self._MOTOR_MAX_ACCEL_DELTA_RAD = float(max(0.0, max_accel_delta))
         self._vel_ratio = float(max(0.0, vel_ratio))
         self._vel_damp_thresh = float(max(0.001, vel_damp_thresh))
 
@@ -290,45 +321,6 @@ class VegaRobot:
             self._refresh_gripper_state()
             self._start_gripper_worker()
 
-        # #region agent log
-        self._agent_debug_log(
-            run_id=f"joint-diagnostics-{self.arm_side}",
-            hypothesis_id="H10",
-            location="dexcontrol/core/vega/robot.py:__init__",
-            message="agent_debug_probe",
-            data={
-                "pid": int(os.getpid()),
-                "module_file": str(Path(__file__).resolve()),
-                "log_path": self._AGENT_DEBUG_LOG_PATH,
-                "arm_side": self.arm_side,
-                "control_hz": self.control_hz,
-                "ik_solver_type": self._ik_solver_type,
-            },
-        )
-        # #endregion
-
-    _AGENT_DEBUG_LOG_PATH = "/home/dexmate/.cursor/debug-daf7f0.log"
-    _AGENT_DEBUG_SESSION_ID = "daf7f0"
-
-    def _agent_debug_log(self, run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
-        payload = {
-            "sessionId": self._AGENT_DEBUG_SESSION_ID,
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(_time.time() * 1000),
-        }
-        try:
-            with open(self._AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=True, default=float) + "\n")
-        except Exception as exc:
-            _logger.error(
-                "[AgentDebugLogError] run_id=%s message=%s path=%s err=%s",
-                run_id, message, self._AGENT_DEBUG_LOG_PATH, exc,
-            )
-
     def _build_ik_config(self):
         """Build an optimized IK config for real-time control."""
         if self._ik_solver_type != "pink":
@@ -345,26 +337,8 @@ class VegaRobot:
                 qp_solver="proxqp",
                 safety_buffer=0.2,
                 damping_weights=IKDampingWeightsConfig(
-                    default=1e-3,
-                    override={
-                        "torso_j1": 30000.0,
-                        "torso_j2": 30000.0,
-                        "torso_j3": 30000.0,
-                        "R_arm_j1": 50,
-                        "L_arm_j1": 50,
-                        "R_arm_j2": 75,
-                        "L_arm_j2": 75,
-                        "R_arm_j3": 50.0,
-                        "L_arm_j3": 50.0,
-                        "R_arm_j4": 50.0,
-                        "L_arm_j4": 50.0,
-                        "R_arm_j5": 120.0,
-                        "L_arm_j5": 120.0,
-                        "R_arm_j6": 120.0,
-                        "L_arm_j6": 120.0,
-                        "R_arm_j7": 120.0,
-                        "L_arm_j7": 120.0,
-                    },
+                    default=self._ik_damping_default,
+                    override=self._ik_damping_override,
                 ),
             )
         except Exception:
@@ -380,6 +354,7 @@ class VegaRobot:
         self._filter_vel = None
         self._last_cmd_joint_pos = None
         self._prev_cmd_delta = None
+        self._last_ik_joint_pos = None
         if self._interpolator is not None:
             self._interpolator.clear()
         if self._output_filter is not None:
@@ -529,6 +504,7 @@ class VegaRobot:
         action_space: str,
         gripper_action_space: str = "position",
         blocking: bool = False,
+        hw_state: dict | None = None,
     ) -> None:
         if action_space not in SUPPORTED_ACTION_SPACES:
             raise ValueError(f"Unsupported action_space '{action_space}'")
@@ -537,7 +513,10 @@ class VegaRobot:
 
         action = np.asarray(command, dtype=np.float64).reshape(-1)
         dt = 1.0 / max(1, self.control_hz)
-        state_dict, _ = self.get_robot_state()
+        if hw_state is not None:
+            state_dict = hw_state
+        else:
+            state_dict, _ = self.get_robot_state()
         current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
 
         if action_space.startswith("joint"):
@@ -558,9 +537,13 @@ class VegaRobot:
         elif action_space == "joint_delta":
             target_joint_pos = current_joint_pos + arm_action
         elif action_space == "cartesian_velocity":
-            target_joint_pos = self._solve_cartesian_delta(arm_action[:3] * dt, arm_action[3:6] * dt)
+            target_joint_pos = self._solve_cartesian_delta(
+                arm_action[:3] * dt, arm_action[3:6] * dt, hw_pos=current_joint_pos)
+            self._last_ik_joint_pos = target_joint_pos.copy()
         else:  # cartesian_delta
-            target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
+            target_joint_pos = self._solve_cartesian_delta(
+                arm_action[:3], arm_action[3:6], hw_pos=current_joint_pos)
+            self._last_ik_joint_pos = target_joint_pos.copy()
 
         # Log per-joint delta from IK (before smoothing/clipping)
         ik_delta = target_joint_pos - current_joint_pos
@@ -594,7 +577,8 @@ class VegaRobot:
                 target_joint_pos = self._filter_pos.copy()
 
         try:
-            self.update_joints(target_joint_pos, velocity=False, blocking=blocking)
+            self.update_joints(target_joint_pos, velocity=False, blocking=blocking,
+                               hw_pos=current_joint_pos)
             self.update_gripper(
                 gripper_action,
                 velocity=(gripper_action_space == "velocity"),
@@ -617,6 +601,7 @@ class VegaRobot:
         command: np.ndarray,
         action_space: str,
         gripper_action_space: str = "position",
+        hw_state: dict | None = None,
     ) -> None:
         """Buffer a command at input rate for later interpolation.
 
@@ -629,13 +614,17 @@ class VegaRobot:
         """
         if self._interpolator is None:
             # No interpolation — direct execution (legacy path).
-            self.update_command(command, action_space, gripper_action_space, blocking=False)
+            self.update_command(command, action_space, gripper_action_space, blocking=False,
+                                hw_state=hw_state)
             return
 
         # Resolve action → joint-space target (same logic as update_command).
         action = np.asarray(command, dtype=np.float64).reshape(-1)
         dt = 1.0 / max(1, self.control_hz)
-        state_dict, _ = self.get_robot_state()
+        if hw_state is not None:
+            state_dict = hw_state
+        else:
+            state_dict, _ = self.get_robot_state()
         current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
 
         if action_space.startswith("joint"):
@@ -656,9 +645,13 @@ class VegaRobot:
         elif action_space == "joint_delta":
             target_joint_pos = current_joint_pos + arm_action
         elif action_space == "cartesian_velocity":
-            target_joint_pos = self._solve_cartesian_delta(arm_action[:3] * dt, arm_action[3:6] * dt)
+            target_joint_pos = self._solve_cartesian_delta(
+                arm_action[:3] * dt, arm_action[3:6] * dt, hw_pos=current_joint_pos)
+            self._last_ik_joint_pos = target_joint_pos.copy()
         else:  # cartesian_delta
-            target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
+            target_joint_pos = self._solve_cartesian_delta(
+                arm_action[:3], arm_action[3:6], hw_pos=current_joint_pos)
+            self._last_ik_joint_pos = target_joint_pos.copy()
 
         timestamp = _time.perf_counter()
         with self._interp_lock:
@@ -753,13 +746,21 @@ class VegaRobot:
         joint_pos_command: np.ndarray,
         velocity: bool = False,
         blocking: bool = False,
+        hw_pos: np.ndarray | None = None,
     ) -> None:
-        run_id = f"joint-diagnostics-{self.arm_side}"
         target_joint_pos = np.asarray(joint_pos_command, dtype=np.float64)
+
+        # Read hw position once; reused for velocity→position conversion and
+        # HW correction below. Callers may pass a cached value to avoid a
+        # redundant hardware read within the same Step.
+        if hw_pos is None:
+            hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        else:
+            hw_pos = np.asarray(hw_pos, dtype=np.float64)
+
         if velocity:
             dt = 1.0 / max(1, self.control_hz)
-            current_joint_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
-            target_joint_pos = current_joint_pos + target_joint_pos * dt
+            target_joint_pos = hw_pos + target_joint_pos * dt
 
         # Clip small IK numerical errors within tolerance before hard validation
         limits = self.arm.joint_pos_limit
@@ -777,33 +778,10 @@ class VegaRobot:
             )
 
         self.validate_joint_limits(target_joint_pos)
-        if limits is not None:
-            low = limits[:, 0].astype(np.float64)
-            high = limits[:, 1].astype(np.float64)
-            margin_low = target_joint_pos - low
-            margin_high = high - target_joint_pos
-            min_margin = float(np.minimum(margin_low, margin_high).min())
-            if min_margin < 0.08:
-                # #region agent log
-                self._agent_debug_log(
-                    run_id=run_id,
-                    hypothesis_id="H8",
-                    location="dexcontrol/core/vega/robot.py:update_joints",
-                    message="near_joint_limit",
-                    data={
-                        "arm_side": self.arm_side,
-                        "min_margin_rad": min_margin,
-                        "margin_low_min_rad": float(margin_low.min()),
-                        "margin_high_min_rad": float(margin_high.min()),
-                        "target_joint_pos": np.round(target_joint_pos, 6).tolist(),
-                    },
-                )
-                # #endregion
 
         # Gradual correction: use _last_cmd_joint_pos as the base for delta
         # clipping, blending a fraction of hw feedback error each step to
         # prevent drift without causing discontinuous jumps.
-        hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
         if self._last_cmd_joint_pos is not None:
             raw_error = hw_pos - self._last_cmd_joint_pos
             # Per-joint outlier rejection: skip correction for joints where
@@ -814,26 +792,10 @@ class VegaRobot:
         else:
             current = hw_pos
         diff = target_joint_pos - current
-        raw_diff = diff.copy()
         clipped_mask = np.abs(diff) > self._MOTOR_MAX_DELTA_RAD
-        clipped_count = int(np.count_nonzero(clipped_mask))
         if np.any(clipped_mask):
             clipped = np.clip(diff, -self._MOTOR_MAX_DELTA_RAD, self._MOTOR_MAX_DELTA_RAD)
             clipped_indices = np.where(clipped_mask)[0]
-            # #region agent log
-            self._agent_debug_log(
-                run_id=run_id,
-                hypothesis_id="H6",
-                location="dexcontrol/core/vega/robot.py:update_joints",
-                message="delta_clip_applied",
-                data={
-                    "arm_side": self.arm_side,
-                    "indices": clipped_indices.tolist(),
-                    "raw_delta": np.round(diff[clipped_mask], 6).tolist(),
-                    "clip_limit": self._MOTOR_MAX_DELTA_RAD[clipped_mask].tolist(),
-                },
-            )
-            # #endregion
             _logger.info(
                 "[DeltaClip] joints=%s raw=%s limit=%s",
                 clipped_indices.tolist(),
@@ -843,43 +805,25 @@ class VegaRobot:
             target_joint_pos = current + clipped
             diff = clipped
 
-        # Jerk limit: restrict how fast the per-step delta can change between
+        # Accel limit: restrict how fast the per-step delta can change between
         # consecutive steps.  Smooths acceleration/deceleration to prevent
         # the abrupt velocity changes that cause oscillation on stop.
-        jerk_count = 0
-        if self._prev_cmd_delta is not None and self._MOTOR_MAX_JERK_RAD > 0:
+        if self._prev_cmd_delta is not None and self._MOTOR_MAX_ACCEL_DELTA_RAD > 0:
             accel = diff - self._prev_cmd_delta
-            jerk_limit = self._MOTOR_MAX_JERK_RAD
-            jerk_mask = np.abs(accel) > jerk_limit
-            jerk_count = int(np.count_nonzero(jerk_mask))
-            if np.any(jerk_mask):
+            accel_limit = self._MOTOR_MAX_ACCEL_DELTA_RAD
+            accel_mask = np.abs(accel) > accel_limit
+            jerk_count = int(np.count_nonzero(accel_mask))
+            if np.any(accel_mask):
                 _logger.debug(
-                    "[JerkLimit] joints=%s raw_accel=%s limit=%.6f",
-                    np.where(jerk_mask)[0].tolist(),
-                    np.round(accel[jerk_mask], 6).tolist(),
-                    float(jerk_limit),
+                    "[AccelLimit] joints=%s raw_accel=%s limit=%.6f",
+                    np.where(accel_mask)[0].tolist(),
+                    np.round(accel[accel_mask], 6).tolist(),
+                    float(accel_limit),
                 )
-                accel = np.clip(accel, -jerk_limit, jerk_limit)
+                accel = np.clip(accel, -accel_limit, accel_limit)
                 diff = self._prev_cmd_delta + accel
                 target_joint_pos = current + diff
         self._prev_cmd_delta = diff.copy()
-
-        # #region agent log
-        self._agent_debug_log(
-            run_id=run_id,
-            hypothesis_id="H9",
-            location="dexcontrol/core/vega/robot.py:update_joints",
-            message="joint_update_metrics",
-            data={
-                "arm_side": self.arm_side,
-                "raw_diff_l2": float(np.linalg.norm(raw_diff)),
-                "final_diff_l2": float(np.linalg.norm(diff)),
-                "clipped_count": clipped_count,
-                "jerk_count": jerk_count,
-                "min_joint_margin_rad": min_margin if limits is not None else None,
-            },
-        )
-        # #endregion
 
         if self.use_velocity_feedforward and not blocking:
             dt = 1.0 / max(1, self.control_hz)
@@ -1046,9 +990,17 @@ class VegaRobot:
         except Exception:
             pass
 
-    def _solve_cartesian_delta(self, delta_xyz: np.ndarray, delta_rpy: np.ndarray) -> np.ndarray:
+    def _solve_cartesian_delta(
+        self,
+        delta_xyz: np.ndarray,
+        delta_rpy: np.ndarray,
+        hw_pos: np.ndarray | None = None,
+    ) -> np.ndarray:
         # Gradual correction: use last command + outlier-rejected hw correction as IK start
-        hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        if hw_pos is None:
+            hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        else:
+            hw_pos = np.asarray(hw_pos, dtype=np.float64)
         if self._last_cmd_joint_pos is not None:
             raw_error = hw_pos - self._last_cmd_joint_pos
             outlier_mask = np.abs(raw_error) > self._HW_CORRECTION_OUTLIER_THRESH
@@ -1220,8 +1172,8 @@ class VegaRobot:
             if action_space == "target_cartesian_delta":
                 # target_cartesian_delta → recover velocity by multiplying gains
                 cart_velocity = np.empty(6, dtype=np.float64)
-                cart_velocity[:3] = cart_action[:3] * _TELEOP_POS_ACTION_GAIN
-                cart_velocity[3:6] = cart_action[3:6] * _TELEOP_ROT_ACTION_GAIN
+                cart_velocity[:3] = cart_action[:3] * self._teleop_pos_gain
+                cart_velocity[3:6] = cart_action[3:6] * self._teleop_rot_gain
                 action_dict["cartesian_velocity"] = cart_velocity.tolist()
                 action_dict["target_cartesian_delta"] = np.concatenate(
                     [cart_action, [gripper_position]]
@@ -1261,8 +1213,8 @@ class VegaRobot:
                     else action_dict["cartesian_velocity"]
                 )
                 tcd = np.empty(7, dtype=np.float64)
-                tcd[:3] = np.asarray(vel_for_tcd[:3]) / _TELEOP_POS_ACTION_GAIN
-                tcd[3:6] = np.asarray(vel_for_tcd[3:6]) / _TELEOP_ROT_ACTION_GAIN
+                tcd[:3] = np.asarray(vel_for_tcd[:3]) / self._teleop_pos_gain
+                tcd[3:6] = np.asarray(vel_for_tcd[3:6]) / self._teleop_rot_gain
                 tcd[6] = gripper_position
                 action_dict["target_cartesian_delta"] = tcd.tolist()
 
@@ -1272,9 +1224,15 @@ class VegaRobot:
             target_cart[3:6] += cartesian_delta[3:6]  # rpy
             action_dict["cartesian_position"] = target_cart.tolist()
 
-            # Use IK to get joint positions
+            # Use IK to get joint positions — reuse the cached result from the
+            # update_command() / add_command_point() call that preceded this in
+            # the same Step to avoid a duplicate IK solve.
             try:
-                target_joints = self._solve_cartesian_delta(cartesian_delta[:3], cartesian_delta[3:6])
+                if self._last_ik_joint_pos is not None:
+                    target_joints = self._last_ik_joint_pos
+                else:
+                    target_joints = self._solve_cartesian_delta(
+                        cartesian_delta[:3], cartesian_delta[3:6], hw_pos=current_joint_pos)
                 action_dict["joint_position"] = target_joints.tolist()
                 joint_delta = target_joints - current_joint_pos
                 action_dict["joint_velocity"] = (joint_delta / dt).tolist()
