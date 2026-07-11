@@ -71,11 +71,12 @@ serial gripper can't be shared across both arms).
 Channels follow the RCI convention (named, namespaced by arm prefix, default
 `robot0`):
 
-- **obs** `robot-obs` — `<arm>.observation.state.<field>[i]`:
-  - **CORE** `joint_positions[0..6]` (rad), `gripper_position` (normalized 0–1),
-    `cartesian_position[0..5]` (xyz m, rpy rad)
-  - **AUX** `joint_velocities[0..6]` (rad/s), `joint_torques_computed[0..6]` (N·m),
-    `wrench_state[0..5]` (force N, torque N·m)
+- **obs** `robot-obs` — `<arm>.observation.state.<field>` — array fields carry a
+  single `list[float]` value; scalar fields carry a bare `float`:
+  - **CORE** `joint_positions` (list, 7 rad), `gripper_position` (scalar, 0–1),
+    `cartesian_position` (list, 6 — xyz m + rpy rad)
+  - **AUX** `joint_velocities` (list, 7 rad/s), `joint_torques_computed` (list, 7 N·m),
+    `wrench_state` (list, 6 — force N + torque N·m)
 - **action** `robot-action` — `<arm>.action.<space>[i]`, e.g.
   `target_cartesian_delta` (6 cartesian terms + 1 gripper).
 

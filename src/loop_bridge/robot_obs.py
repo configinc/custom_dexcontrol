@@ -2,16 +2,17 @@
 
 ``observation_to_step()`` projects one RobotEnv observation onto the ``robot-obs``
 step dict the bridge hands to ``RobotStepSender.send`` — ``{<arm>.observation.
-state.<field>[i]: reading}``. That's it: the SDK declares the layout from the first
-frame's keys and the recorder takes its columns from the streamed keys, so there
-is no ``ChannelSpec`` layout to build/declare here.
+state.<field>: reading}`` with the reading kept as a ``list[float]`` for array
+fields (joint_positions, cartesian_position, ...) and a bare ``float`` for scalar
+fields (gripper_position). That matches the wire contract customers naturally
+produce: ``dict[str, list | float]``. Downstream (recorder, teleop, inference,
+policy training) reassembles from these named list values.
 
-Channel keys follow the RCI wire convention ``<arm>.observation.state.<field>[i]``
-(a sibling of the ``<arm>.action.<space>[i]`` keys), arm-prefixed so observation
-and action keys never collide when the loop pairs them into a robot-step. The
-values are the SAME numbers ``VegaRobotEnvService._create_observation`` returns;
-only the shape changes (named ``Value`` map -> named-channel dict). Pure and
-testable: no robot, no Source Bus.
+Channel keys follow ``<arm>.observation.state.<field>`` — arm-prefixed so
+observation and action keys never collide when the loop pairs them into a
+robot-step. The values are the SAME numbers ``VegaRobotEnvService._create_
+observation`` returns; only the shape changes (named ``Value`` map → named list
+dict). Pure and testable: no robot, no Source Bus.
 """
 
 from __future__ import annotations
@@ -41,34 +42,38 @@ _OBS_FIELDS: tuple[tuple[str, int, bool], ...] = (
 )
 
 
-def _channel_key(arm_prefix: str, field: str, index: Optional[int]) -> str:
-    """One namespaced channel key. Scalar fields omit the ``[i]`` suffix."""
-    base = f"{arm_prefix}.{_OBS_NAMESPACE}.{field}"
-    return base if index is None else f"{base}[{index}]"
+def _channel_key(arm_prefix: str, field: str) -> str:
+    """One namespaced channel key: ``<arm_prefix>.observation.state.<field>``."""
+    return f"{arm_prefix}.{_OBS_NAMESPACE}.{field}"
 
 
 def observation_to_step(
     observation: Mapping[str, Any], arm_prefix: str = DEFAULT_ARM_PREFIX
-) -> dict[str, float]:
+) -> dict[str, Optional[Any]]:
     """Project one RobotEnv observation map onto the robot-obs step dict.
 
     ``observation`` is the ``dict[str, robotenv_pb2.Value]`` produced by
-    ``VegaRobotEnvService._create_observation``. Returns ``{channel_key: reading}``
-    ready for ``RobotStepSender.send``. Raises ``KeyError`` if a projected field is
-    absent and ``ValueError`` if an array field's length disagrees with its declared
-    count — both are contract violations to fix, not silently paper over.
+    ``VegaRobotEnvService._create_observation``. Array fields become a single
+    ``list[float]`` value under one namespaced key (``<arm>.observation.state.
+    <field>``); scalar fields become a bare ``float`` under the same shape. That
+    matches the customer-natural ``dict[str, list | scalar]`` wire contract —
+    downstream picks up the field with one key rather than reassembling ``[i]``
+    scalars.
+
+    Raises ``KeyError`` if a projected field is absent and ``ValueError`` if an
+    array field's length disagrees with its declared count — both are contract
+    violations to fix, not silently paper over.
     """
-    step: dict[str, float] = {}
+    step: dict[str, Optional[Any]] = {}
     for field, count, scalar in _OBS_FIELDS:
         value = observation[field]
         if scalar:
-            step[_channel_key(arm_prefix, field, None)] = float(value.float_value)
+            step[_channel_key(arm_prefix, field)] = float(value.float_value)
             continue
-        array = list(value.float_array.values)
+        array = [float(item) for item in value.float_array.values]
         if len(array) != count:
             raise ValueError(
                 f"robot-obs field {field!r} carries {len(array)} values, expected {count}"
             )
-        for i, item in enumerate(array):
-            step[_channel_key(arm_prefix, field, i)] = float(item)
+        step[_channel_key(arm_prefix, field)] = array
     return step
