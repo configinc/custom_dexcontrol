@@ -27,6 +27,7 @@ import signal
 import sys
 import threading
 from concurrent import futures
+from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Sequence
 
@@ -100,6 +101,65 @@ class _BusStepContext:
         raise RuntimeError(f"Step aborted: {code} {details}")
 
 
+# Wire-key infix loop-sdk publishes obs under (mirror of loop_bridge.robot_obs). We
+# keep the string literal instead of importing to avoid a circular import through
+# ``__init__.py`` — this is a single fixed contract.
+_OBS_NAMESPACE = "observation.state"
+
+
+def _slice_obs_for_arm(
+    merged: Mapping[str, Any], arm_prefix: str
+) -> dict[str, Any]:
+    """Extract ONE arm's un-prefixed state dict out of the merged robot-obs payload.
+
+    Loop-sdk hands us the merged obs (keys like ``robot0.observation.state.<field>``
+    across all arms). Each arm's ``Step`` RPC wants the RobotEnv-shape dict
+    (``{joint_positions, cartesian_position, gripper_position, …}``), so pull just
+    this arm's keys and strip the ``<arm_prefix>.observation.state.`` prefix. Empty
+    dict if the merged payload has nothing for this arm (skips the pre-apply
+    override so the server falls back to its internal state read).
+    """
+    prefix = f"{arm_prefix}.{_OBS_NAMESPACE}."
+    return {
+        key[len(prefix):]: value
+        for key, value in merged.items()
+        if key.startswith(prefix)
+    }
+
+
+def _encode_pre_action_state(
+    state: Mapping[str, Any],
+) -> dict[str, "_vega_server.robotenv_pb2.Value"]:
+    """Wrap a plain robot-state dict as ``StepRequest.pre_action_state`` proto values.
+
+    Mirrors ``VegaRobotEnvService._to_proto_value`` at the bridge boundary — list /
+    ndarray → ``FloatArray``; int / bool → ``float_value``; float → ``float_value``;
+    otherwise stringify. Skips keys whose value is ``None`` so an absent reading
+    doesn't spill onto the wire as a zero.
+    """
+    pb2 = _vega_server.robotenv_pb2
+    encoded: dict[str, pb2.Value] = {}
+    for key, value in state.items():
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            encoded[key] = pb2.Value(float_array=pb2.FloatArray(values=[float(v) for v in value]))
+            continue
+        if isinstance(value, bool):
+            # bool is int in Python — must precede the int branch to encode correctly.
+            encoded[key] = pb2.Value(float_value=float(value))
+            continue
+        if isinstance(value, (int, float)):
+            encoded[key] = pb2.Value(float_value=float(value))
+            continue
+        # ndarray path — mirror the Vega server's fallback shape.
+        try:
+            encoded[key] = pb2.Value(float_array=pb2.FloatArray(values=[float(v) for v in value]))
+        except TypeError:
+            encoded[key] = pb2.Value(string_value=str(value))
+    return encoded
+
+
 class _StepApplier:
     """Adapts one arm service's ``Step`` to the action consumer's ``step(...)`` seam."""
 
@@ -107,13 +167,25 @@ class _StepApplier:
         self._service = service
 
     def step(
-        self, action: list[float], action_space: str, gripper_action_space: str
+        self,
+        action: list[float],
+        action_space: str,
+        gripper_action_space: str,
+        *,
+        pre_apply_obs: Mapping[str, Any] | None = None,
     ) -> None:
         request = _vega_server.robotenv_pb2.StepRequest(
             action=list(action),
             action_space=action_space,
             gripper_action_space=gripper_action_space,
         )
+        # Forward the loop-sdk-captured pre-apply obs into the Step RPC so the
+        # server dispatches against the same snapshot the recorder will publish
+        # for this action. Skipped when the caller didn't pre-read (server falls
+        # back to its own state read).
+        if pre_apply_obs is not None:
+            for key, value in _encode_pre_action_state(pre_apply_obs).items():
+                request.pre_action_state[key].CopyFrom(value)
         response = self._service.Step(request, _BusStepContext())
         # Step swallows hardware faults into a non-SUCCESS StepResponse.status rather
         # than raising, so the action lane would otherwise treat a stalled command
@@ -365,10 +437,19 @@ class LoopRobotEnv:
             except Exception as exc:
                 LOGGER.warning("home failed for %s; skipping: %s", arm_prefix, exc)
 
-    def _apply_action_frame(self, frame: RobotActionFrame) -> None:
+    def _apply_action_frame(
+        self, frame: RobotActionFrame, pre_apply_obs: Mapping[str, Any]
+    ) -> None:
         """``apply_action_callback``: split the vector across arms via declared
         action_channels and Step each arm. ``frame.values`` is aligned to the
         ``action_channels`` this server declared on connect.
+
+        ``pre_apply_obs`` is the exact snapshot loop-sdk just captured for the
+        paired robot-obs publish — we forward it into each arm's ``Step`` so the
+        upstream RobotEnv service dispatches against the same state loop will
+        record, instead of re-reading state a moment later. That collapses the
+        two-reads race in the SDK-plus-server pipeline and gives a true single-
+        source (state, action) pair.
 
         A per-arm wiring bug (non-contiguous action indices → decode raises
         ValueError) must NOT collapse the other arms' steps or the obs-driven
@@ -389,8 +470,18 @@ class LoopRobotEnv:
                 continue
             if action is None:
                 continue
+            # Slice the merged pre-apply obs down to just THIS arm's state fields
+            # (un-prefixed) — the Vega server's Step / update_command expects the
+            # RobotEnv-style dict {joint_positions, cartesian_position, ...}, not
+            # the loop-sdk wire keys (``<arm>.observation.state.<field>``).
+            arm_pre_apply_state = _slice_obs_for_arm(pre_apply_obs, arm_prefix)
             try:
-                applier.step(action, self._action_space, self._gripper_action_space)
+                applier.step(
+                    action,
+                    self._action_space,
+                    self._gripper_action_space,
+                    pre_apply_obs=arm_pre_apply_state,
+                )
             except Exception as exc:  # _StepApplier raises on non-SUCCESS Step; skip
                 LOGGER.warning(
                     "robot-action Step failed for %s; skipping: %s", arm_prefix, exc
