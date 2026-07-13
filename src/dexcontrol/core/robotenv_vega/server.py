@@ -50,6 +50,43 @@ def _to_proto_value(val: Any) -> robotenv_pb2.Value:
     return robotenv_pb2.Value(string_value=str(val))
 
 
+def _from_proto_value(val: robotenv_pb2.Value) -> Any:
+    """Inverse of ``_to_proto_value``: unwrap a proto Value to a Python scalar / list.
+
+    Returns ``None`` for the special zero-Value that grpc gives you when the field
+    was never set — a caller building the map by only writing the keys it has is
+    common, so an unset entry decodes to ``None`` rather than a spurious zero.
+    """
+    kind = val.WhichOneof("kind")
+    if kind is None:
+        return None
+    if kind == "float_value":
+        return val.float_value
+    if kind == "float_array":
+        return list(val.float_array.values)
+    if kind == "int_value":
+        return val.int_value
+    if kind == "string_value":
+        return val.string_value
+    if kind == "bytes_value":
+        return val.bytes_value
+    return None
+
+
+def _decode_pre_action_state(
+    request: robotenv_pb2.StepRequest,
+) -> Optional[dict[str, Any]]:
+    """Decode ``StepRequest.pre_action_state`` into a plain robot-state dict.
+
+    Returns ``None`` when the caller didn't populate the field (legacy clients or
+    a direct RPC that hasn't been updated) — the ``Step`` handler then falls back
+    to reading state internally, so this is a strictly additive protocol change.
+    """
+    if not request.pre_action_state:
+        return None
+    return {key: _from_proto_value(val) for key, val in request.pre_action_state.items()}
+
+
 # Per-arm init (home) and reset middle waypoints.
 # Left→Right mirroring: [-v0, -v1, -v2, v3, -v4, -v5, -v6]
 _INIT_JOINTS = {
@@ -531,8 +568,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 action_space_for_robot = "cartesian_delta"
             t_after_xform = time.time()
 
-            # Get robot_state BEFORE executing action (needed for create_action_dict)
-            pre_action_state, _ = self._robot.get_robot_state()
+            # Get robot_state BEFORE executing action (needed for create_action_dict).
+            # If the caller supplied a pre-apply snapshot (StepRequest.pre_action_state),
+            # use it verbatim so the (state, action) pair the caller is about to record
+            # is the same one we dispatch against — single source of truth. Legacy
+            # callers that don't populate the field fall back to reading state here.
+            caller_state = _decode_pre_action_state(request)
+            if caller_state is not None:
+                pre_action_state = caller_state
+            else:
+                pre_action_state, _ = self._robot.get_robot_state()
             LOGGER.debug(
                 "[CartesianPos] %s",
                 np.round(np.asarray(pre_action_state["cartesian_position"], dtype=np.float64), 4).tolist(),
@@ -544,6 +589,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     action,
                     action_space=action_space_for_robot,
                     gripper_action_space=gripper_action_space,
+                    pre_action_state=pre_action_state,
                 )
             else:
                 # Legacy synchronous path.
@@ -552,6 +598,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     action_space=action_space_for_robot,
                     gripper_action_space=gripper_action_space,
                     blocking=False,
+                    pre_action_state=pre_action_state,
                 )
             t_after_cmd = time.time()
 

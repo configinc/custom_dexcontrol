@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import time as _time
+from collections.abc import Mapping
 from queue import Empty, Full, Queue
 from pathlib import Path
 from typing import Any, Optional
@@ -529,6 +530,7 @@ class VegaRobot:
         action_space: str,
         gripper_action_space: str = "position",
         blocking: bool = False,
+        pre_action_state: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if action_space not in SUPPORTED_ACTION_SPACES:
             raise ValueError(f"Unsupported action_space '{action_space}'")
@@ -537,7 +539,14 @@ class VegaRobot:
 
         action = np.asarray(command, dtype=np.float64).reshape(-1)
         dt = 1.0 / max(1, self.control_hz)
-        state_dict, _ = self.get_robot_state()
+        # If the caller pre-read state (e.g. the loop-sdk-driven Step path that
+        # captures the paired robot-obs snapshot before dispatch), reuse that
+        # snapshot so IK / delta math dispatches against the same state the
+        # caller will record. Otherwise fall back to a fresh internal read.
+        if pre_action_state is not None:
+            state_dict = pre_action_state
+        else:
+            state_dict, _ = self.get_robot_state()
         current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
 
         if action_space.startswith("joint"):
@@ -617,6 +626,7 @@ class VegaRobot:
         command: np.ndarray,
         action_space: str,
         gripper_action_space: str = "position",
+        pre_action_state: Optional[Mapping[str, Any]] = None,
     ) -> None:
         """Buffer a command at input rate for later interpolation.
 
@@ -626,16 +636,30 @@ class VegaRobot:
 
         When interpolation is disabled this falls back to the
         synchronous ``update_command()`` path.
+
+        ``pre_action_state`` mirrors :meth:`update_command`'s knob: when the
+        caller pre-read state we reuse that snapshot for IK / delta math so the
+        dispatch matches the caller's paired obs record. Empty ⇒ read state
+        internally as before.
         """
         if self._interpolator is None:
             # No interpolation — direct execution (legacy path).
-            self.update_command(command, action_space, gripper_action_space, blocking=False)
+            self.update_command(
+                command,
+                action_space,
+                gripper_action_space,
+                blocking=False,
+                pre_action_state=pre_action_state,
+            )
             return
 
         # Resolve action → joint-space target (same logic as update_command).
         action = np.asarray(command, dtype=np.float64).reshape(-1)
         dt = 1.0 / max(1, self.control_hz)
-        state_dict, _ = self.get_robot_state()
+        if pre_action_state is not None:
+            state_dict = pre_action_state
+        else:
+            state_dict, _ = self.get_robot_state()
         current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
 
         if action_space.startswith("joint"):
