@@ -119,6 +119,17 @@ class CommunicationFailedError(RuntimeError):
 class VegaRobot:
     """Thin wrapper around dexcontrol Robot for single-arm control."""
 
+    @classmethod
+    def build(cls, robot_model: str = "vega_1", arm_side: str = "left", **kwargs) -> "VegaRobot":
+        """Construct the hardware unit and a single-arm controller over it.
+
+        The convenience path for single-arm use. A bimanual caller instead builds
+        ONE ``Robot`` and passes it to two ``VegaRobot`` instances (one per arm), so
+        both arms share a single hardware connection.
+        """
+        robot = Robot(configs=get_robot_config(robot_model))
+        return cls(robot_model=robot_model, arm_side=arm_side, robot=robot, **kwargs)
+
     def __init__(
         self,
         robot_model: str = "vega_1",
@@ -141,6 +152,7 @@ class VegaRobot:
         max_jerk: float = 0.25,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
+        robot: Robot | None = None,
         head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
         **kwargs,
     ):
@@ -170,11 +182,17 @@ class VegaRobot:
         self.gripper_type = gripper_type
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
 
-        configs = get_robot_config(robot_model)
-        self.robot = _RobotWithCustomHeadPose(
-            configs=configs,
-            head_init_pos=np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None,
-        )
+        # This controls ONE arm. A bimanual caller injects one shared Robot via the
+        # keyword-only ``robot`` argument; direct/single-arm callers construct a fresh
+        # Robot with the custom head pose (upstream default).
+        if robot is not None:
+            self.robot = robot
+        else:
+            configs = get_robot_config(robot_model)
+            self.robot = _RobotWithCustomHeadPose(
+                configs=configs,
+                head_init_pos=np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None,
+            )
         self.arm = getattr(self.robot, f"{arm_side}_arm")
         hand_component = f"{arm_side}_hand"
 

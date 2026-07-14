@@ -60,6 +60,10 @@ example = [
     "matplotlib>=3.8.0",
     "tyro",
 ]
+loop = [
+    # Loop Source Bus client SDK (publishes robot-obs). Internal repo, not on PyPI.
+    "loop-sdk @ git+https://github.com/configinc/loop-sdk.git@main",
+]
 
 [project.urls]
 Repository = "https://github.com/dexmate-ai/dexcontrol"
@@ -85,6 +89,13 @@ ignore = ["F722", "E501"]
 [tool.ruff.lint.per-file-ignores]
 "**/__init__.py" = ["F401"]
 
+[tool.hatch.metadata]
+# Required for the loop-sdk git direct reference in the `loop` extra.
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dexcontrol", "src/loop_bridge"]
+
 [tool.pyright]
-include = ["src/dexcontrol/core/", "src/dexcontrol/config/", "examples/"]
+include = ["src/dexcontrol/core/", "src/dexcontrol/config/", "src/loop_bridge/", "examples/"]
 typeCheckingMode = "standard"

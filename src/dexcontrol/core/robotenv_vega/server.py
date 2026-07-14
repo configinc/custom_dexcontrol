@@ -95,6 +95,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         rot_sensitivity: float = 1.0,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
+        robot=None,
         head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),  # head_j1 limit: ±1.483 rad
         **kwargs,
     ):
@@ -116,9 +117,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self.control_hz, rot_sensitivity=rot_sensitivity,
         )
 
-        self._robot = VegaRobot(
-            robot_model=robot_model,
+        vega_kwargs = dict(
             arm_side=arm_side,
+            robot_model=robot_model,
             control_hz=control_hz,
             use_velocity_feedforward=use_velocity_feedforward,
             gripper_type=gripper_type,
@@ -139,6 +140,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             vel_damp_thresh=vel_damp_thresh,
             head_init_pos=head_init_pos,
         )
+        # A bimanual caller passes a shared ``robot`` so both arms' services drive one
+        # hardware unit; single-arm callers omit it and the service builds its own.
+        self._robot = VegaRobot(robot=robot, **vega_kwargs) if robot is not None else VegaRobot.build(**vega_kwargs)
         self._robot.launch_robot()
 
         # --- Background control loop for interpolation-based upsampling ---
