@@ -49,8 +49,12 @@ from dexcontrol.core.vega.robot import SUPPORTED_ACTION_SPACES as _VEGA_SUPPORTE
 # serve_with_loop / serve_dual_arm. Empty tuple = no menu for that axis.
 _VEGA_DEFAULT_GRIPPER_TYPE_OPTIONS: tuple[str, ...] = ("default", "robotiq", "sr_gripper")
 _VEGA_DEFAULT_ROBOT_TYPE_OPTIONS: tuple[str, ...] = ("vega_1",)
-_VEGA_DEFAULT_FINGER_TYPE_OPTIONS: tuple[str, ...] = ()
-_VEGA_DEFAULT_ROBOT_FIRMWARE_VERSION_OPTIONS: tuple[str, ...] = ()
+# Every axis advertises at least one default so config negotiation is testable
+# end-to-end (an empty axis is skipped by the picker). ``finger_type`` has no
+# hardware source yet, so a placeholder default; firmware version defaults to a
+# ``v0.0.0`` placeholder until the real value is read off the robot.
+_VEGA_DEFAULT_FINGER_TYPE_OPTIONS: tuple[str, ...] = ("default",)
+_VEGA_DEFAULT_ROBOT_FIRMWARE_VERSION_OPTIONS: tuple[str, ...] = ("v0.0.0",)
 from loop_bridge.obs_publisher import merge_observations
 from loop_bridge.robot_action import (
     HOME,
