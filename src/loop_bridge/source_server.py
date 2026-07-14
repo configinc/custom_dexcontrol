@@ -131,18 +131,19 @@ def _slice_obs_for_arm(
 
 
 def _encode_pre_action_state(
-    state: Mapping[str, Any],
+    obs: Mapping[str, Any],
 ) -> dict[str, "_vega_server.robotenv_pb2.Value"]:
-    """Wrap a plain robot-state dict as ``StepRequest.pre_action_state`` proto values.
+    """Encode a loop-side obs dict into ``StepRequest.pre_action_state`` proto values.
 
-    Mirrors ``VegaRobotEnvService._to_proto_value`` at the bridge boundary — list /
-    ndarray → ``FloatArray``; int / bool → ``float_value``; float → ``float_value``;
-    otherwise stringify. Skips keys whose value is ``None`` so an absent reading
-    doesn't spill onto the wire as a zero.
+    This is the bridge boundary where loop's ``obs`` becomes the Vega server's
+    ``pre_action_state``. Mirrors ``VegaRobotEnvService._to_proto_value`` — list /
+    ndarray → ``FloatArray``; int / bool / float → ``float_value``; otherwise
+    stringify. Skips keys whose value is ``None`` so an absent reading doesn't
+    spill onto the wire as a zero.
     """
     pb2 = _vega_server.robotenv_pb2
     encoded: dict[str, pb2.Value] = {}
-    for key, value in state.items():
+    for key, value in obs.items():
         if value is None:
             continue
         if isinstance(value, (list, tuple)):
@@ -463,13 +464,13 @@ class LoopRobotEnv:
             # (un-prefixed) — the Vega server's Step / update_command expects the
             # RobotEnv-style dict {joint_positions, cartesian_position, ...}, not
             # the loop-sdk wire keys (``<arm>.observation.state.<field>``).
-            arm_pre_apply_state = _slice_obs_for_arm(pre_apply_obs, arm_prefix)
+            arm_pre_apply_obs = _slice_obs_for_arm(pre_apply_obs, arm_prefix)
             try:
                 applier.step(
                     action,
                     self._action_space,
                     self._gripper_action_space,
-                    pre_apply_obs=arm_pre_apply_state,
+                    pre_apply_obs=arm_pre_apply_obs,
                 )
             except Exception as exc:  # _StepApplier raises on non-SUCCESS Step; skip
                 LOGGER.warning(
