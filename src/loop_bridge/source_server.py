@@ -55,7 +55,6 @@ from loop_bridge.obs_publisher import merge_observations
 from loop_bridge.robot_action import (
     HOME,
     arm_dim_for_action_space,
-    build_action_channels,
     decode_action,
 )
 from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
@@ -289,27 +288,23 @@ class LoopRobotEnv:
             robot_server_version=(_ROBOT_SERVER_VERSION,),
         )
 
-        # Vector-symmetric layout: the robot server is authoritative for the ordered
-        # channel keys used across robot-action / teleop-action / policy-action lanes.
-        # Teleop and policy scan robot-obs's SourceInfo.action_channels to build a
-        # vector matching THIS layout — that's how the wire stays consistent even when
-        # the robot geometry / action_space is device-specific.
-        self._action_channels = build_action_channels(
-            arm_prefixes, action_space, arm_dim_for_action_space(action_space)
-        )
+        # The opaque robot-action / teleop-action / policy-action vector is a plain
+        # concatenation of per-arm blocks (arm order, ``arm_dim`` each) — no channel
+        # layout is advertised; producers and this server agree on it out-of-band via
+        # ``action_space``. Validate the space up front so an unknown one fails here.
+        arm_dim_for_action_space(action_space)
 
         def apply_config(config: RobotConfig) -> RobotConfig:
             self.reconfigure(action_space=config.action_space)
             return config
 
-        # One bus object owns the whole link: publish robot-obs (declaring the vector
-        # action_channels) + (when enabled) consume robot-action + robot-command. Source
-        # ids are pinned by the SDK facade (our lane convention); LoopRobotEnv owns the
-        # per-arm action decode. Obs-only (enable_action=False) wires neither input lane.
+        # One bus object owns the whole link: publish robot-obs + (when enabled)
+        # consume robot-action + robot-command. Source ids are pinned by the SDK facade
+        # (our lane convention); LoopRobotEnv owns the per-arm action decode. Obs-only
+        # (enable_action=False) wires neither input lane.
         self._loop_robot_client = LoopRobotClient(
             loop_addr,
             options=options,
-            action_channels=self._action_channels,
             apply_config_callback=apply_config,
             enable_action=enable_action,
         )
@@ -349,17 +344,16 @@ class LoopRobotEnv:
         )
 
     def reconfigure(self, action_space: str = "") -> None:
-        """Apply a Source-Bus-selected config: re-target Step's action space AND
-        the vector-schema (``action_channels``) that decoders slice against.
+        """Apply a Source-Bus-selected config: re-target Step's action space.
 
         Called from the obs sender's ``apply_config`` when the recorder picks a config.
         The RCI engine's control clock is no longer part of this negotiation. If the
-        new ``action_space`` matches the current one, this is a no-op. If it has
-        DIFFERENT ``arm_dim`` than the initial space, the wire-side declared
-        ``action_channels`` (pinned at connect) becomes stale — we refuse the change
-        loudly rather than silently cross-wire (older ``target_cartesian_delta``
-        vectors would decode against fresh joint-space channels and step wrong
-        slices). Reconnect the robot server to pick up the new layout in that case.
+        new ``action_space`` matches the current one, this is a no-op. If it has a
+        DIFFERENT ``arm_dim`` than the initial space, the per-arm block size the
+        decoder slices the opaque action vector against would change mid-session — we
+        refuse loudly rather than silently step wrong slices (older
+        ``target_cartesian_delta`` vectors would slice against a fresh joint-space
+        block size). Reconnect the robot server to pick up the new space in that case.
         """
         if not action_space or action_space == self._action_space:
             return
@@ -375,14 +369,12 @@ class LoopRobotEnv:
         if new_dim != old_dim:
             LOGGER.warning(
                 "reconfigure: action_space %r has arm_dim=%d, initial %r had %d; "
-                "the wire-side action_channels layout was pinned at connect and "
-                "cannot be resized live — REJECTING the change. Reconnect the robot "
-                "server if the recorder needs the new space.",
+                "the per-arm block size the decoder slices against was fixed at "
+                "connect and cannot be resized live — REJECTING the change. Reconnect "
+                "the robot server if the recorder needs the new space.",
                 action_space, new_dim, self._action_space, old_dim,
             )
             return
-        arm_prefixes = tuple(arm_prefix for arm_prefix, _ in self._arm_services)
-        self._action_channels = build_action_channels(arm_prefixes, action_space, new_dim)
         self._action_space = action_space
 
     def _run_loop_client(self, *, enable_action: bool) -> None:
@@ -440,9 +432,10 @@ class LoopRobotEnv:
     def _apply_action_frame(
         self, frame: RobotActionFrame, pre_apply_obs: Mapping[str, Any]
     ) -> None:
-        """``apply_action_callback``: split the vector across arms via declared
-        action_channels and Step each arm. ``frame.values`` is aligned to the
-        ``action_channels`` this server declared on connect.
+        """``apply_action_callback``: slice the opaque vector into per-arm blocks
+        and Step each arm. ``frame.values`` is a plain concatenation of per-arm
+        blocks in arm order, each ``arm_dim`` long (agreed out-of-band via
+        ``action_space``); arm ``i`` owns block ``i``.
 
         ``pre_apply_obs`` is the exact snapshot loop-sdk just captured for the
         paired robot-obs publish — we forward it into each arm's ``Step`` so the
@@ -451,23 +444,15 @@ class LoopRobotEnv:
         two-reads race in the SDK-plus-server pipeline and gives a true single-
         source (state, action) pair.
 
-        A per-arm wiring bug (non-contiguous action indices → decode raises
-        ValueError) must NOT collapse the other arms' steps or the obs-driven
-        cadence — catch inside the loop and skip only that arm this tick.
+        A short frame that doesn't cover an arm's block (decode returns None) must
+        NOT collapse the other arms' steps or the obs-driven cadence — skip only
+        that arm this tick.
         """
         if not self._appliers:
             return
-        for arm_prefix, applier in self._appliers.items():
-            try:
-                action = decode_action(
-                    frame.values, self._action_channels, arm_prefix, self._action_space
-                )
-            except ValueError as exc:
-                LOGGER.warning(
-                    "robot-action decode failed for %s; skipping this arm this tick: %s",
-                    arm_prefix, exc,
-                )
-                continue
+        arm_dim = arm_dim_for_action_space(self._action_space)
+        for arm_index, (arm_prefix, applier) in enumerate(self._appliers.items()):
+            action = decode_action(frame.values, arm_index, arm_dim)
             if action is None:
                 continue
             # Slice the merged pre-apply obs down to just THIS arm's state fields
