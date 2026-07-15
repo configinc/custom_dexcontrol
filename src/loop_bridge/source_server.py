@@ -57,7 +57,6 @@ _VEGA_DEFAULT_FINGER_TYPE_OPTIONS: tuple[str, ...] = ("default",)
 _VEGA_DEFAULT_ROBOT_FIRMWARE_VERSION_OPTIONS: tuple[str, ...] = ("v0.0.0",)
 from loop_bridge.obs_publisher import merge_observations
 from loop_bridge.robot_action import (
-    HOME,
     arm_dim_for_action_space,
     decode_action,
 )
@@ -433,7 +432,7 @@ class LoopRobotEnv:
                 self._loop_robot_client.run(
                     publish_obs_callback=self._read_obs,
                     apply_action_callback=self._apply_action_frame,
-                    handle_command_callback=self._apply_command,
+                    home_callback=self._home_all_arms,
                     heartbeat_hz=self._heartbeat_hz,
                     stop=self._lane_stop,
                 )
@@ -458,13 +457,11 @@ class LoopRobotEnv:
             observations[arm_prefix] = observation
         return merge_observations(observations)
 
-    def _apply_command(self, command: dict[str, Any]) -> None:
-        """``handle_command_callback``: home each arm on a HOME command (unknown/failed logged + skipped)."""
-        if not self._appliers:
-            return
-        if command.get("command") != HOME:
-            LOGGER.warning("ignoring unknown robot-command %r", command)
-            return
+    def _home_all_arms(self) -> None:
+        """``home_callback``: home every arm (per-arm failure logged + skipped).
+
+        The SDK matches the ``home`` command for us, so this just runs the action.
+        """
         for arm_prefix, applier in self._appliers.items():
             try:
                 applier.home()
