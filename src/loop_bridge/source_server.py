@@ -164,6 +164,35 @@ def _encode_pre_action_state(
     return encoded
 
 
+def _decode_action_info(
+    action_info: "Mapping[str, _vega_server.robotenv_pb2.Value]",
+) -> dict[str, Any]:
+    """Decode ``StepResponse.action_info`` proto values into a plain dict.
+
+    The server computes these (desired_velocity, delta_action, resolved cartesian,
+    ...) from the action against the pre-apply state and returns them per Step; the
+    reverse of ``_encode_pre_action_state``. Drops the ``state.*`` entries the server
+    flattens in — they duplicate the obs snapshot loop already publishes for this tick.
+    """
+    decoded: dict[str, Any] = {}
+    for key, value in action_info.items():
+        if key.startswith("state."):
+            continue
+        kind = value.WhichOneof("kind")
+        if kind == "float_array":
+            decoded[key] = [float(v) for v in value.float_array.values]
+            continue
+        if kind == "float_value":
+            decoded[key] = float(value.float_value)
+            continue
+        if kind == "int_value":
+            decoded[key] = int(value.int_value)
+            continue
+        if kind == "string_value":
+            decoded[key] = value.string_value
+    return decoded
+
+
 class _StepApplier:
     """Adapts one arm service's ``Step`` to the action consumer's ``step(...)`` seam."""
 
@@ -177,7 +206,14 @@ class _StepApplier:
         gripper_action_space: str,
         *,
         pre_apply_obs: Mapping[str, Any] | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
+        """Step one arm and return the server-computed action info for this tick.
+
+        The returned dict holds the auxiliary values the server derived while
+        applying the action (desired_velocity, delta_action, resolved cartesian, ...),
+        keyed by their bare names; the caller namespaces them per arm before merging
+        onto the published robot-obs. Empty if the server sent no action info.
+        """
         request = _vega_server.robotenv_pb2.StepRequest(
             action=list(action),
             action_space=action_space,
@@ -204,6 +240,7 @@ class _StepApplier:
             raise RuntimeError(
                 f"robot-action Step returned {status}: {getattr(response, 'message', '')}"
             )
+        return _decode_action_info(response.action_info)
 
     def home(self) -> None:
         """Home this arm: ``Reset(mode="home")`` — moves it to its home pose.
@@ -436,7 +473,7 @@ class LoopRobotEnv:
 
     def _apply_action_frame(
         self, frame: RobotActionFrame, pre_apply_obs: Mapping[str, Any]
-    ) -> None:
+    ) -> dict[str, Any]:
         """``apply_action_callback``: slice the opaque vector into per-arm blocks
         and Step each arm. ``frame.values`` is a plain concatenation of per-arm
         blocks in arm order, each ``arm_dim`` long (agreed out-of-band via
@@ -449,13 +486,20 @@ class LoopRobotEnv:
         two-reads race in the SDK-plus-server pipeline and gives a true single-
         source (state, action) pair.
 
+        Returns per-arm action channels to merge onto that same robot-obs sample:
+        ``<arm>.received_action`` (the raw vector this arm was handed — a sanity
+        check against what the RCI commanded) and ``<arm>.action.<field>`` (the
+        auxiliary values the server derived while applying it — desired_velocity,
+        delta_action, resolved cartesian, ...). Empty dict when nothing stepped.
+
         A short frame that doesn't cover an arm's block (decode returns None) must
         NOT collapse the other arms' steps or the obs-driven cadence — skip only
         that arm this tick.
         """
         if not self._appliers:
-            return
+            return {}
         arm_dim = arm_dim_for_action_space(self._action_space)
+        action_channels: dict[str, Any] = {}
         for arm_index, (arm_prefix, applier) in enumerate(self._appliers.items()):
             action = decode_action(frame.values, arm_index, arm_dim)
             if action is None:
@@ -466,7 +510,7 @@ class LoopRobotEnv:
             # the loop-sdk wire keys (``<arm>.observation.state.<field>``).
             arm_pre_apply_obs = _slice_obs_for_arm(pre_apply_obs, arm_prefix)
             try:
-                applier.step(
+                arm_action_info = applier.step(
                     action,
                     self._action_space,
                     self._gripper_action_space,
@@ -476,6 +520,11 @@ class LoopRobotEnv:
                 LOGGER.warning(
                     "robot-action Step failed for %s; skipping: %s", arm_prefix, exc
                 )
+                continue
+            action_channels[f"{arm_prefix}.received_action"] = action
+            for field, value in arm_action_info.items():
+                action_channels[f"{arm_prefix}.action.{field}"] = value
+        return action_channels
 
     def close(self) -> None:
         """Stop the lane and close the bus link (BEFORE closing the robot)."""
