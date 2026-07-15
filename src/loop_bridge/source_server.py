@@ -483,11 +483,11 @@ class LoopRobotEnv:
         two-reads race in the SDK-plus-server pipeline and gives a true single-
         source (state, action) pair.
 
-        Returns per-arm action channels to merge onto that same robot-obs sample:
-        ``<arm>.received_action`` (the raw vector this arm was handed — a sanity
-        check against what the RCI commanded) and ``<arm>.action.<field>`` (the
-        auxiliary values the server derived while applying it — desired_velocity,
-        delta_action, resolved cartesian, ...). Empty dict when nothing stepped.
+        Returns the per-arm ``<arm>.action.<field>`` channels the server derived while
+        applying the action (desired_velocity, delta_action, resolved cartesian, ...) to
+        merge onto that same robot-obs sample; empty dict when nothing stepped. The raw
+        received action is added by loop-sdk itself (flat ``received_action``), so we do
+        not repeat it per arm here.
 
         A short frame that doesn't cover an arm's block (decode returns None) must
         NOT collapse the other arms' steps or the obs-driven cadence — skip only
@@ -518,7 +518,6 @@ class LoopRobotEnv:
                     "robot-action Step failed for %s; skipping: %s", arm_prefix, exc
                 )
                 continue
-            action_channels[f"{arm_prefix}.received_action"] = action
             for field, value in arm_action_info.items():
                 action_channels[f"{arm_prefix}.action.{field}"] = value
         return action_channels
