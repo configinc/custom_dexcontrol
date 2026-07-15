@@ -431,7 +431,7 @@ class LoopRobotEnv:
             if enable_action:
                 self._loop_robot_client.run(
                     publish_obs_callback=self._read_obs,
-                    apply_action_callback=self._apply_action_frame,
+                    apply_action_callback=self._apply_action,
                     home_callback=self._home_all_arms,
                     heartbeat_hz=self._heartbeat_hz,
                     stop=self._lane_stop,
@@ -468,11 +468,11 @@ class LoopRobotEnv:
             except Exception as exc:
                 LOGGER.warning("home failed for %s; skipping: %s", arm_prefix, exc)
 
-    def _apply_action_frame(
-        self, frame: RobotActionFrame, pre_apply_obs: Mapping[str, Any]
+    def _apply_action(
+        self, action: RobotActionFrame, pre_apply_obs: Mapping[str, Any]
     ) -> dict[str, Any]:
         """``apply_action_callback``: slice the opaque vector into per-arm blocks
-        and Step each arm. ``frame.values`` is a plain concatenation of per-arm
+        and Step each arm. ``action.values`` is a plain concatenation of per-arm
         blocks in arm order, each ``arm_dim`` long (agreed out-of-band via
         ``action_space``); arm ``i`` owns block ``i``.
 
@@ -489,8 +489,8 @@ class LoopRobotEnv:
         received action is added by loop-sdk itself (flat ``received_action``), so we do
         not repeat it per arm here.
 
-        A short frame that doesn't cover an arm's block (decode returns None) must
-        NOT collapse the other arms' steps or the obs-driven cadence — skip only
+        A short action vector that doesn't cover an arm's block (decode returns None)
+        must NOT collapse the other arms' steps or the obs-driven cadence — skip only
         that arm this tick.
         """
         if not self._appliers:
@@ -498,8 +498,8 @@ class LoopRobotEnv:
         arm_dim = arm_dim_for_action_space(self._action_space)
         action_channels: dict[str, Any] = {}
         for arm_index, (arm_prefix, applier) in enumerate(self._appliers.items()):
-            action = decode_action(frame.values, arm_index, arm_dim)
-            if action is None:
+            arm_action = decode_action(action.values, arm_index, arm_dim)
+            if arm_action is None:
                 continue
             # Slice the merged pre-apply obs down to just THIS arm's state fields
             # (un-prefixed) — the Vega server's Step / update_command expects the
@@ -508,7 +508,7 @@ class LoopRobotEnv:
             arm_pre_apply_obs = _slice_obs_for_arm(pre_apply_obs, arm_prefix)
             try:
                 arm_action_info = applier.step(
-                    action,
+                    arm_action,
                     self._action_space,
                     self._gripper_action_space,
                     pre_apply_obs=arm_pre_apply_obs,
