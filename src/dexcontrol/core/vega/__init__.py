@@ -1,6 +1,6 @@
 """Vega robot interfaces."""
 
-from core.vega.robot import (
+from .robot import (
     CommunicationFailedError,
     IKFailedError,
     JointLimitExceededError,

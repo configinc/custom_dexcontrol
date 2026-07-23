@@ -17,7 +17,7 @@ _logger = logging.getLogger("robotenv_vega")
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from dexcontrol.core.vega.cartesian_commands import (
+from .cartesian_commands import (
     clip_physical_cartesian_delta,
     normalized_cartesian_velocity_to_delta,
 )
