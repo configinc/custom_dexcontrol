@@ -1,5 +1,14 @@
 # Migration: Recompute `cartesian_delta` for legacy Vega trajectories
 
+> [!IMPORTANT]
+> This document describes the legacy normalized-command behavior used by old
+> trajectories. In the current controller, `target_cartesian_delta` is a
+> physical pose error (`xyz` in metres, `rpy` in radians): values below the
+> configured limits pass through unchanged, and only values above the limits
+> are norm-clipped. Do not apply the legacy `×5` / `×2` conversion to newly
+> recorded `target_cartesian_delta` data. The `cartesian_velocity` action space
+> retains the legacy normalized conversion for compatibility.
+
 ## Background
 
 `VegaRobot.create_action_dict` (in `src/dexcontrol/core/vega/robot.py`) used to

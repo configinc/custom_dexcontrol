@@ -24,6 +24,10 @@ _this = Path(__file__).resolve()
 sys.path.insert(0, str(_this.parents[2]))  # src/dexcontrol/ -> "from core.vega..."
 sys.path.insert(0, str(_this.parents[4]))  # <repo>/          -> "from proto..."
 
+from core.vega.cartesian_commands import (  # noqa: E402
+    clip_physical_cartesian_delta,
+    normalized_cartesian_velocity_to_delta,
+)
 from core.vega.robot import (  # noqa: E402
     CommunicationFailedError,
     IKFailedError,
@@ -197,7 +201,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             ik_damping_arm_j3,
         )
         LOGGER.info(
-            "Cartesian velocity normalization enabled: max_lin_delta=%.6f max_rot_delta=%.6f",
+            "Cartesian limits: target_cartesian_delta=physical norm clip, "
+            "cartesian_velocity=legacy normalized scaling "
+            "(max_lin_delta=%.6f m, max_rot_delta=%.6f rad)",
             self._max_lin_delta,
             self._max_rot_delta,
         )
@@ -269,23 +275,19 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
     def _cartesian_velocity_to_delta(self, action: np.ndarray) -> np.ndarray:
         """Convert normalized 6D Cartesian velocity command to per-step delta."""
-        converted = np.asarray(action, dtype=np.float64).copy()
-        if converted.shape[0] < 6:
-            return converted
+        return normalized_cartesian_velocity_to_delta(
+            action,
+            max_linear_delta=self._max_lin_delta,
+            max_rotation_delta=self._max_rot_delta,
+        )
 
-        lin_vel = converted[:3]
-        rot_vel = converted[3:6]
-
-        lin_norm = float(np.linalg.norm(lin_vel))
-        rot_norm = float(np.linalg.norm(rot_vel))
-        if lin_norm > 1.0:
-            lin_vel = lin_vel / lin_norm
-        if rot_norm > 1.0:
-            rot_vel = rot_vel / rot_norm
-
-        converted[:3] = lin_vel * self._max_lin_delta
-        converted[3:6] = rot_vel * self._max_rot_delta
-        return converted
+    def _clip_target_cartesian_delta(self, action: np.ndarray) -> np.ndarray:
+        """Safety-clip a physical pose error without scaling small commands."""
+        return clip_physical_cartesian_delta(
+            action,
+            max_linear_delta=self._max_lin_delta,
+            max_rotation_delta=self._max_rot_delta,
+        )
 
     def GetObservationSpec(self, request, context):
         del request, context
@@ -425,6 +427,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "robot_model": self.robot_model,
                 "control_hz": str(self.control_hz),
                 "arm_side": self.arm_side,
+                "target_cartesian_delta_units": "xyz=m,rpy=rad",
+                "max_linear_delta_m": str(self._max_lin_delta),
+                "max_rotation_delta_rad": str(self._max_rot_delta),
             },
         )
 
@@ -519,16 +524,21 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     raw_lin_norm, raw_rot_norm, self._max_lin_delta, self._max_rot_delta,
                 )
             elif action_space == "target_cartesian_delta":
-                # Recover cartesian_velocity by re-applying teleop gains,
-                # then convert to motor delta via the standard path.
-                from dexcontrol.core.vega.robot import (
-                    _TELEOP_POS_ACTION_GAIN,
-                    _TELEOP_ROT_ACTION_GAIN,
-                )
-                action[:3] *= _TELEOP_POS_ACTION_GAIN
-                action[3:6] *= _TELEOP_ROT_ACTION_GAIN
-                action = self._cartesian_velocity_to_delta(action)
+                # The Oculus controller emits a physical TCP/wrist pose error:
+                # metres for xyz and radians for RPY. Preserve small errors and
+                # only norm-clip commands that exceed the per-step safety caps.
+                raw_action = action.copy()
+                action = self._clip_target_cartesian_delta(action)
                 action_space_for_robot = "cartesian_delta"
+                if not np.allclose(raw_action[:6], action[:6]):
+                    LOGGER.debug(
+                        "Clipped target_cartesian_delta: linear %.6f->%.6f m, "
+                        "rotation %.6f->%.6f rad",
+                        float(np.linalg.norm(raw_action[:3])),
+                        float(np.linalg.norm(action[:3])),
+                        float(np.linalg.norm(raw_action[3:6])),
+                        float(np.linalg.norm(action[3:6])),
+                    )
             t_after_xform = time.time()
 
             # Get robot_state BEFORE executing action (needed for create_action_dict)

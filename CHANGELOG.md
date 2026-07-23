@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Vega `target_cartesian_delta` commands now use physical pose-error units
+  (`xyz` in metres, `rpy` in radians). The server no longer applies the
+  teleoperation `×5` linear / `×2` rotational gains or scales every command by
+  `max_*_delta`; it only norm-clips commands that exceed the configured
+  physical per-step limits. Legacy `cartesian_velocity` semantics are
+  unchanged.
+
 ## [0.5.0] - 2026-06-03
 
 ### Added
