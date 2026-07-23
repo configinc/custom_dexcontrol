@@ -21,6 +21,7 @@ from .cartesian_commands import (
     clip_physical_cartesian_delta,
     normalized_cartesian_velocity_to_delta,
 )
+from .velocity_feedforward import TargetVelocityFeedforward
 from dexcontrol.utils.filters import MultiChannelFilter
 from dexcontrol.utils.trajectory_interpolator import TrajectoryInterpolator
 
@@ -211,7 +212,6 @@ class VegaRobot:
         self._prev_command_successful = True
         self._prev_gripper_command_successful = True
         self._prev_controller_latency_ms = 0.0
-        self._prev_joint_vel: np.ndarray | None = None
         self._vel_smoothing_alpha = float(np.clip(vel_smoothing_alpha, 0.0, 1.0))
         self._last_cmd_joint_pos: np.ndarray | None = None  # Track last sent command for delta clipping
         self._prev_cmd_delta: np.ndarray | None = None  # Previous step delta for jerk limiting
@@ -219,8 +219,17 @@ class VegaRobot:
         self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
         self._max_delta_scale = float(max(0.1, max_delta_scale))
         self._MOTOR_MAX_JERK_RAD = float(max(0.0, max_jerk))
-        self._vel_ratio = float(max(0.0, vel_ratio))
-        self._vel_damp_thresh = float(max(0.001, vel_damp_thresh))
+        self._velocity_feedforward = TargetVelocityFeedforward(
+            nominal_dt_s=1.0 / max(1, self.control_hz),
+            velocity_ratio=vel_ratio,
+            smoothing_alpha=self._vel_smoothing_alpha,
+            stale_timeout_s=2.0 / max(1, self.control_hz),
+        )
+        if vel_damp_thresh != 0.05:
+            _logger.warning(
+                "vel_damp_thresh is deprecated and ignored: velocity feedforward "
+                "is now derived only from consecutive joint targets"
+            )
 
         # Velocity logging for diagnostics.
         vel_log_path = os.environ.get("VEL_LOG_PATH")
@@ -378,6 +387,7 @@ class VegaRobot:
         self._filter_vel = None
         self._last_cmd_joint_pos = None
         self._prev_cmd_delta = None
+        self._velocity_feedforward.reset()
         if self._interpolator is not None:
             self._interpolator.clear()
         if self._output_filter is not None:
@@ -591,8 +601,20 @@ class VegaRobot:
 
                 target_joint_pos = self._filter_pos.copy()
 
+        target_joint_vel = None
+        if self.use_velocity_feedforward and not blocking:
+            target_joint_vel = self._velocity_feedforward.update(
+                target_joint_pos,
+                _time.perf_counter(),
+            )
+
         try:
-            self.update_joints(target_joint_pos, velocity=False, blocking=blocking)
+            self.update_joints(
+                target_joint_pos,
+                velocity=False,
+                blocking=blocking,
+                joint_vel_command=target_joint_vel,
+            )
             self.update_gripper(
                 gripper_action,
                 velocity=(gripper_action_space == "velocity"),
@@ -661,6 +683,8 @@ class VegaRobot:
         timestamp = _time.perf_counter()
         with self._interp_lock:
             self._interpolator.add_point(timestamp, target_joint_pos)
+            if self.use_velocity_feedforward:
+                self._velocity_feedforward.update(target_joint_pos, timestamp)
             self._latest_target_joint_pos = target_joint_pos.copy()
             self._latest_gripper_action = gripper_action
             self._latest_gripper_action_space = gripper_action_space
@@ -677,12 +701,20 @@ class VegaRobot:
                 return False
 
             now = _time.perf_counter()
-            pos, vel = self._interpolator.interpolate(now, compute_velocity=self.use_velocity_feedforward)
+            pos, _ = self._interpolator.interpolate(
+                now,
+                compute_velocity=False,
+            )
 
             if pos is None:
                 # Not enough data for interpolation — use latest raw target.
                 pos = self._latest_target_joint_pos.copy()
-                vel = None
+
+            target_joint_vel = (
+                self._velocity_feedforward.sample(now)
+                if self.use_velocity_feedforward
+                else None
+            )
 
             gripper_action = self._latest_gripper_action
             gripper_vel = self._latest_gripper_action_space == "velocity"
@@ -708,7 +740,12 @@ class VegaRobot:
                 pos = self._filter_pos.copy()
 
         try:
-            self.update_joints(pos, velocity=False, blocking=False)
+            self.update_joints(
+                pos,
+                velocity=False,
+                blocking=False,
+                joint_vel_command=target_joint_vel,
+            )
             self.update_gripper(gripper_action, velocity=gripper_vel, blocking=False)
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
@@ -751,6 +788,7 @@ class VegaRobot:
         joint_pos_command: np.ndarray,
         velocity: bool = False,
         blocking: bool = False,
+        joint_vel_command: np.ndarray | None = None,
     ) -> None:
         run_id = f"joint-diagnostics-{self.arm_side}"
         target_joint_pos = np.asarray(joint_pos_command, dtype=np.float64)
@@ -880,20 +918,15 @@ class VegaRobot:
         # #endregion
 
         if self.use_velocity_feedforward and not blocking:
-            dt = 1.0 / max(1, self.control_hz)
-            raw_vel = (target_joint_pos - current) / dt
-            if self._prev_joint_vel is not None:
-                a = self._vel_smoothing_alpha
-                target_joint_vel = a * raw_vel + (1.0 - a) * self._prev_joint_vel
-            else:
-                target_joint_vel = raw_vel
-            # Per-joint velocity damping: scale down velocity when delta is small
-            # to help joints settle near target without overshoot.
-            pos_err = np.abs(target_joint_pos - current)
-            damp_thresh = self._vel_damp_thresh
-            damp_scale = np.clip(pos_err / damp_thresh, 0.0, 1.0)
-            target_joint_vel = target_joint_vel * damp_scale * self._vel_ratio
-            self._prev_joint_vel = target_joint_vel.copy()
+            target_joint_vel = (
+                np.zeros_like(target_joint_pos)
+                if joint_vel_command is None
+                else np.asarray(joint_vel_command, dtype=np.float64)
+            )
+            if target_joint_vel.shape != target_joint_pos.shape:
+                raise ValueError(
+                    "joint_vel_command and joint_pos_command must have the same shape"
+                )
             if self._vel_log_file is not None:
                 self._vel_log_file.write(
                     f"{_time.time()},{','.join(f'{v:.6f}' for v in target_joint_vel)}\n"

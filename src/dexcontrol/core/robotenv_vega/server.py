@@ -190,7 +190,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         )
         LOGGER.info(
             "Joint command mode: %s",
-            "position+velocity feedforward" if self.use_velocity_feedforward else "position-only",
+            (
+                "position+target-derivative velocity feedforward"
+                if self.use_velocity_feedforward
+                else "position-only"
+            ),
         )
         LOGGER.info(
             "IK config: solver=%s damping(default=%.6f torso=%.1f arm_j2=%.1f arm_j3=%.1f)",
@@ -1251,7 +1255,7 @@ def main() -> None:
         "--vel-damp-thresh",
         type=float,
         default=0.05,
-        help="Velocity damping threshold in rad. Velocity tapers linearly from 0→100%% over this distance to target (default: 0.05). Smaller=less damping, larger=more damping.",
+        help="Deprecated compatibility option; ignored by target-derivative velocity feedforward.",
     )
     parser.add_argument(
         "--head-init-pos",
