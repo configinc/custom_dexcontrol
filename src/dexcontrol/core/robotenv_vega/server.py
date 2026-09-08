@@ -373,6 +373,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description="Wrench state [fx, fy, fz, tx, ty, tz]",
             )
         )
+        spec.fields["joint_currents"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64",
+                shape=[7],
+                required=False,
+                description="Joint motor currents (A)",
+            )
+        )
         spec.fields["prev_controller_latency_ms"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="float64",
@@ -729,6 +737,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             ),
             "wrench_state": robotenv_pb2.Value(
                 float_array=robotenv_pb2.FloatArray(values=np.asarray(state_dict["wrench_state"]).tolist())
+            ),
+            "joint_currents": robotenv_pb2.Value(
+                float_array=robotenv_pb2.FloatArray(values=np.asarray(state_dict["joint_currents"]).tolist())
             ),
             "prev_controller_latency_ms": robotenv_pb2.Value(
                 float_value=float(state_dict.get("prev_controller_latency_ms", 0.0))

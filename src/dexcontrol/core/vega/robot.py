@@ -938,6 +938,10 @@ class VegaRobot:
             joint_torques = np.asarray(self.arm.get_joint_torque(), dtype=np.float64)
         except ValueError:
             joint_torques = np.zeros(7, dtype=np.float64)
+        try:
+            joint_currents = np.asarray(self.arm.get_joint_current(), dtype=np.float64)
+        except ValueError:
+            joint_currents = np.zeros(7, dtype=np.float64)
         gripper_position = self.get_cached_gripper_position() if self.hand is not None else 0.0
 
         wrench_state = np.zeros(6, dtype=np.float64)
@@ -963,6 +967,7 @@ class VegaRobot:
             "gripper_position": gripper_position,
             "cartesian_position": cartesian_position,
             "wrench_state": wrench_state,
+            "joint_currents": joint_currents,
             "prev_controller_latency_ms": float(self._prev_controller_latency_ms),
             "prev_command_successful": bool(self._prev_command_successful),
             "prev_gripper_command_successful": bool(self._prev_gripper_command_successful),
