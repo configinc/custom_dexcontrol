@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+from contextlib import contextmanager
 
 import pytest
 from conftest import make_observation
@@ -105,6 +106,21 @@ class _FakeService:
         self.action_info = action_info or {}
         self.requests: list[_StepRequest] = []
         self.resets: list[_ResetRequest] = []
+        self.paused = True
+        self.closed = False
+        self.control_error = None
+        self.queued_commands = []
+
+    def resume(self):
+        self.paused = False
+
+    def pause(self):
+        self.paused = True
+        self.queued_commands.clear()
+
+    def close(self):
+        self.pause()
+        self.closed = True
 
     def _create_observation(self) -> tuple[dict[str, object], int]:
         return make_observation(), 123
@@ -117,7 +133,8 @@ class _FakeService:
         )
 
     def Reset(self, request: _ResetRequest, context: object) -> object:
-        del context
+        if not self.status:
+            context.set_details(self.message)
         self.resets.append(request)
         return types.SimpleNamespace(status=self.status, message=self.message)
 
@@ -367,3 +384,236 @@ def test_dual_arm_comports_non_serial_gripper_unrestricted(
     # Built-in (non-serial) grippers share no port → same/empty comport is fine.
     kwargs = {"gripper_type": "default"}
     assert source_server._dual_arm_comports(kwargs, None, None) == (None, None)
+
+
+class _InputBinding:
+    dropped_count = 0
+
+    def start(self, receiver, policy):
+        self.receiver = receiver
+
+    def close(self):
+        pass
+
+
+def test_lifecycle_opens_on_start_pauses_and_reuses_then_closes(monkeypatch):
+    from loop_node.runtime import NodeRuntime
+
+    module = _import_source_server(monkeypatch)
+    left, right = _FakeService(), _FakeService()
+    opened = []
+
+    @contextmanager
+    def factory():
+        opened.append(True)
+        try:
+            yield [("left", left), ("right", right)]
+        finally:
+            right.close()
+            left.close()
+
+    node = module.VegaRobotNode(service_factory=factory)
+    runtime = NodeRuntime(node)
+    assert not opened
+    try:
+        runtime.start({}, {"action_command": _InputBinding()})
+        assert opened == [True]
+        assert not left.paused and not right.paused
+        left.queued_commands.append("old target")
+        runtime.stop()
+        assert left.paused and right.paused
+        assert not left.queued_commands
+        assert not left.closed and not right.closed
+        runtime.start({}, {"action_command": _InputBinding()})
+        assert opened == [True]
+        assert not left.queued_commands
+    finally:
+        runtime.shutdown()
+    assert left.closed and right.closed
+
+
+@pytest.mark.parametrize("status", ["HOME_FAILED", ""])
+def test_home_failure_reaches_caller_and_faults_both_arms(monkeypatch, status):
+    from loop_node.runtime import NodeRuntime
+    from loop_sdk import LifecycleState
+
+    module = _import_source_server(monkeypatch)
+    left = _FakeService(status=status, message="estopped")
+    right = _FakeService()
+    node = module.VegaRobotNode([("left", left), ("right", right)])
+    runtime = NodeRuntime(node)
+    try:
+        runtime.start({}, {"action_command": _InputBinding()})
+        with pytest.raises(RuntimeError, match="estopped"):
+            node._handle_command(module.RobotCommand.HOME)
+        assert runtime.status.lifecycle is LifecycleState.FAULT
+        assert left.paused and right.paused
+        assert not right.resets
+        runtime.reset_fault()
+        runtime.start({}, {"action_command": _InputBinding()})
+        assert runtime.status.lifecycle is LifecycleState.ACTIVE
+    finally:
+        runtime.shutdown()
+
+
+def test_failed_start_releases_opened_hardware(monkeypatch):
+    from loop_node.lifecycle import NodeOperationError
+    from loop_node.runtime import NodeRuntime
+
+    module = _import_source_server(monkeypatch)
+    left, right = _FakeService(), _FakeService()
+    right.resume = lambda: (_ for _ in ()).throw(RuntimeError("right unavailable"))
+    node = module.VegaRobotNode([("left", left), ("right", right)])
+    runtime = NodeRuntime(node)
+    with pytest.raises(NodeOperationError, match="right unavailable"):
+        runtime.start({}, {"action_command": _InputBinding()})
+    assert left.closed and right.closed
+    runtime.shutdown()
+
+
+def test_right_initialization_failure_closes_left(monkeypatch):
+    module = _import_source_server(monkeypatch)
+    left = _FakeService()
+    left._robot = types.SimpleNamespace(robot=object())
+
+    def make_service(**kwargs):
+        if kwargs["arm_side"] == "right":
+            raise RuntimeError("right initialization failed")
+        return left
+
+    monkeypatch.setattr(module, "_LockedStepService", make_service)
+    with pytest.raises(RuntimeError, match="right initialization failed"):
+        with module._open_arm_services():
+            pytest.fail("Initialization should fail before yielding services")
+    assert left.closed
+
+
+def test_failed_registration_never_opens_hardware_and_closes_node(monkeypatch):
+    module = _import_source_server(monkeypatch)
+    events = []
+
+    class Host:
+        is_running = False
+
+        def __init__(self, **kwargs):
+            events.append("created")
+
+        def start(self, **kwargs):
+            raise RuntimeError("session failed")
+
+        def _on_shutdown(self):
+            events.append("cleanup")
+
+        def close(self):
+            events.append("closed")
+
+    monkeypatch.setattr(module, "VegaRobotNode", Host)
+    monkeypatch.setattr(
+        module,
+        "_open_arm_services",
+        lambda **kwargs: pytest.fail("Hardware opened before Start"),
+    )
+    with pytest.raises(RuntimeError, match="session failed"):
+        module.serve_dual_arm(
+            node_id="robot",
+            connection=module.NodeConnectionConfig(loop_endpoint="tcp/127.0.0.1:7448"),
+        )
+    assert events == ["created", "cleanup", "closed"]
+
+
+def test_action_failure_pauses_both_arms_without_dispatching_the_other(monkeypatch):
+    from loop_node.runtime import NodeRuntime
+    from loop_sdk import LifecycleState
+
+    module = _import_source_server(monkeypatch)
+    left = _FakeService(status="IK_FAILED", message="unreachable")
+    right = _FakeService()
+    node = module.VegaRobotNode([("left", left), ("right", right)])
+    runtime = NodeRuntime(node)
+    try:
+        runtime.start({}, {"action_command": _InputBinding()})
+        message = ReceivedMessage(
+            timestamp_ns=1,
+            sequence=1,
+            received_at_ns=2,
+            payload={
+                f"{arm}.{field}": value
+                for arm in ["left", "right"]
+                for field, value in [
+                    ("target_cartesian_delta", float64_tensor([0.0] * 6, shape=(6,))),
+                    ("gripper_position", 0.5),
+                ]
+            },
+        )
+        with pytest.raises(RuntimeError, match="IK_FAILED"):
+            node._apply_action(message)
+        assert runtime.status.lifecycle is LifecycleState.FAULT
+        assert not right.requests
+        assert left.paused and right.paused
+    finally:
+        runtime.shutdown()
+
+
+def test_heartbeat_failure_can_pause_its_own_worker(monkeypatch):
+    import threading
+
+    from loop_node.runtime import NodeRuntime
+    from loop_sdk import LifecycleState
+
+    module = _import_source_server(monkeypatch)
+    left, right = _FakeService(), _FakeService()
+    node = module.VegaRobotNode([("left", left), ("right", right)])
+    runtime = NodeRuntime(node)
+    paused = threading.Event()
+    original_pause = right.pause
+
+    def pause():
+        original_pause()
+        paused.set()
+
+    right.pause = pause
+    try:
+        runtime.start(
+            {"heartbeat_frequency_hz": 100}, {"action_command": _InputBinding()}
+        )
+        left._create_observation = lambda: (_ for _ in ()).throw(
+            RuntimeError("disconnected")
+        )
+        assert paused.wait(2), (
+            "Observation worker could not finish its own fault cleanup"
+        )
+        assert runtime.status.lifecycle is LifecycleState.FAULT
+        assert left.paused and right.paused
+    finally:
+        runtime.shutdown()
+
+
+def test_interpolation_failure_reaches_node_and_pauses_both_arms(monkeypatch):
+    import threading
+
+    from loop_node.runtime import NodeRuntime
+    from loop_sdk import LifecycleState
+
+    module = _import_source_server(monkeypatch)
+    service = module._LockedStepService.__new__(module._LockedStepService)
+    service.arm_side = "left"
+    service._control_loop_hz = 200
+    service._control_loop_stop = threading.Event()
+    service._robot = types.SimpleNamespace(
+        execute_interpolated_tick=lambda: True,
+        _prev_command_successful=False,
+    )
+    service._control_loop_run()
+
+    left, right = _FakeService(), _FakeService()
+    node = module.VegaRobotNode([("left", left), ("right", right)])
+    runtime = NodeRuntime(node)
+    try:
+        runtime.start({}, {"action_command": _InputBinding()})
+        left.control_error = service.control_error
+        node.check_health()
+        assert runtime.status.lifecycle is LifecycleState.FAULT
+        assert left.paused and right.paused
+        assert service._control_loop_stop.is_set()
+    finally:
+        runtime.shutdown()

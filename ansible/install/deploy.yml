@@ -1,4 +1,82 @@
 ---
-- import_playbook: sync_project.yml
-- import_playbook: host_setup.yml
-- import_playbook: restart.yml
+- name: Prepare Vega deployment hosts
+  ansible.builtin.import_playbook: host_setup.yml
+- name: Synchronize Vega sources
+  ansible.builtin.import_playbook: sync_project.yml
+- name: Install and configure the Vega Robot Node
+  hosts: all
+  become: false
+  vars_files:
+    - defaults.yml
+  tasks:
+    - name: Install the Loop runtime on Vega
+      ansible.builtin.command:
+        argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
+        stdin: |
+          set -euo pipefail
+          export PATH={{ (dexcontrol_tools_dir ~ '/bin') | quote }}:"$PATH"
+          export GIT_TERMINAL_PROMPT=0
+          export GIT_SSH_COMMAND='ssh -o BatchMode=yes'
+          {% if lookup('ansible.builtin.env', 'DOCKER_GITHUB_PAT') %}
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0={{ ('url.https://' ~ lookup('ansible.builtin.env', 'DOCKER_GITHUB_PAT') ~ '@github.com/.insteadOf') | quote }}
+          export GIT_CONFIG_VALUE_0='git@github.com:'
+          export GIT_CONFIG_KEY_1="$GIT_CONFIG_KEY_0"
+          export GIT_CONFIG_VALUE_1='https://github.com/'
+          {% endif %}
+          {% if lookup('ansible.builtin.env', 'UV_DEFAULT_INDEX') %}
+          export UV_DEFAULT_INDEX={{ lookup('ansible.builtin.env', 'UV_DEFAULT_INDEX') | quote }}
+          {% endif %}
+          python_request={{ dexcontrol_python | quote }}
+          {% if gripper_type == 'sr_gripper' %}
+          export UV_PYTHON_INSTALL_DIR={{ (dexcontrol_project_dir ~ '/.python') | quote }}
+          uv python install --no-bin "$python_request"
+          python_request=$(uv python find --managed-python --system --no-project "$python_request")
+          {% endif %}
+          args=(--python "$python_request")
+          {% if gripper_type != 'default' %}
+          args+=(--extra {{ ('sr-gripper' if gripper_type == 'sr_gripper' else 'robotiq') | quote }})
+          {% endif %}
+          {{ (dexcontrol_project_dir ~ '/install.sh') | quote }} "${args[@]}"
+          {{ (dexcontrol_project_dir ~ '/run.sh') | quote }} --help >/dev/null
+      environment:
+        SSHPASS: "{{ dexmate_pass }}"
+      no_log: true
+      changed_when: true
+      tags: runtime
+
+    - name: Grant EtherCAT access to this project's interpreter
+      ansible.builtin.command:
+        argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
+        stdin: |
+          set -euo pipefail
+          python_path=$(readlink -f {{ (dexcontrol_project_dir ~ '/.venv/bin/python') | quote }})
+          case "$python_path" in
+            {{ (dexcontrol_project_dir ~ '/.python/') | quote }}*) ;;
+            *) echo 'EtherCAT requires the dedicated project Python.' >&2; exit 1 ;;
+          esac
+          sudo -n setcap cap_net_raw,cap_net_admin=eip "$python_path"
+      environment:
+        SSHPASS: "{{ dexmate_pass }}"
+      no_log: true
+      changed_when: true
+      when: gripper_type == 'sr_gripper'
+      tags: runtime
+
+    - name: Configure the Vega startup script
+      ansible.builtin.command:
+        argv: >-
+          {{ dexmate_ssh_argv + ['bash', '-c',
+             ('umask 022; cat > ' ~ (dexcontrol_start_script | quote) ~
+              '; chmod 755 ' ~ (dexcontrol_start_script | quote)) | quote] }}
+        stdin: "{{ lookup('ansible.builtin.template', 'templates/start_vega_robot_node.sh.j2') }}"
+      environment:
+        SSHPASS: "{{ dexmate_pass }}"
+      no_log: true
+      changed_when: true
+      tags: start
+
+    - name: Start the deployed Vega Robot Node
+      ansible.builtin.import_tasks: start.yml
+      when: dexcontrol_start | bool
+      tags: start

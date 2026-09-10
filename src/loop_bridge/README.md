@@ -1,70 +1,70 @@
-# Dual-arm Vega Robot Node
+# Vega Robot Node
 
-This package migrates the former Loop Source Bus bridge on
-`origin/feat/loop-source-robot-obs` to the Node Graph SDK. It presents one physical
-Vega with two arms as one external `loop.robot@1` Node.
+One external `loop.robot@1` Node controls both arms of a Vega through the existing
+DexControl IK, interpolation, filtering, and gripper implementation.
 
-## Run
+## Install and run
+
+From the repository root, with Git, uv, a C++ compiler, CMake, and GitHub access:
 
 ```bash
-uv sync --extra loop --extra dev
-
-uv run dexcontrol-loop-robot-node \
-  --node-id robot \
-  --loop-endpoint tcp/127.0.0.1:7448 \
-  --gripper-type robotiq \
+./install.sh --extra robotiq
+export LOOP_NODE_GRAPH_NODE_ENDPOINT=tcp/loop-host:7448
+./run.sh --node-id robot --gripper-type robotiq \
   --robotiq-comport-left /dev/ttyUSB0 \
   --robotiq-comport-right /dev/ttyUSB1
 ```
 
-The process can start before Loop. Registration keeps retrying until the Loop
-Orchestrator appears. The `--node-id` must match the external Robot Node ID in the
-Cell Config.
+The installer creates a Python 3.12 `.venv`, downloads pinned SDK/Node sources to
+`third_party`, and installs the selected gripper. Use `--extra sr-gripper` for SR
+EtherCAT grippers, or omit the gripper extra for built-in hands. With SR, the
+per-arm port arguments are network interface names. Ansible configures the
+required EtherCAT permissions.
 
-Hardware, IK, interpolation, filtering, gains, and gripper settings remain CLI
-arguments owned by this robot process. Run `uv run dexcontrol-loop-robot-node
---help` for the complete set.
+`--loop-endpoint` overrides `LOOP_NODE_GRAPH_NODE_ENDPOINT`; the fallback is
+`tcp/127.0.0.1:7448`. This is the Loop connection. DexComm's `ROBOT_NAME` and
+`ZENOH_CONFIG` still configure communication with the physical Vega.
 
-## Ports
+`./run.sh --help` lists the hardware and controller options. Match `--node-id` to
+the Robot Node ID in the Loop Cell Config. Both Robotiq and SR require distinct
+ports for the left and right grippers.
 
-- `robot_observation` output: both arms' Cartesian pose, gripper position, joint
-  position/velocity/torque, and wrench.
-- `action_command` input: `left/right.target_cartesian_delta[6]` plus absolute
-  `left/right.gripper_position`.
-- `robot_command` request server: `home` homes both arms through the existing
-  RobotEnv `Reset(mode="home")` paths.
+## Lifecycle
 
-## Preserved behavior
+| Event | Behavior |
+| --- | --- |
+| Process start | Register with Loop in IDLE; no arm service is opened yet. |
+| Start | Open hardware on the first Start, resume control, and publish an initial observation. |
+| Stop | Stop observation/control workers, discard pending arm/gripper commands, and hold the current arm position. Keep the hardware connection. |
+| Fault | Pause both arms and report the failure to Loop. Reset Fault returns to IDLE; Start resumes operation. |
+| Shutdown / process exit | Stop workers and close grippers and the shared Vega connection. |
 
-For every action, the Node:
+The existing hardware initialization, including control-mode/head initialization,
+happens on the first Start. Later Starts reuse the connection.
 
-1. reads both arm observations once;
-2. passes each arm's exact pre-action state to its existing RobotEnv `Step`;
-3. applies the left and right 7-value action blocks through the unchanged services;
-4. publishes that paired pre-action observation after dispatch, including the
-   received 14-value action and the fixed action-info fields returned by `Step`.
+## Data and commands
 
-Before the first action it publishes one bootstrap observation. While actions are
-flowing, their paired observations determine cadence. After two quiet heartbeat
-periods it resumes state-only observations at `heartbeat_frequency_hz` (20 Hz by
-default), matching the former `LoopRobotClient.run()` behavior.
+| Port | Data |
+| --- | --- |
+| `robot_observation` output | `left/right.cartesian_position`, gripper position, joints, velocities, torques, and wrench |
+| `action_command` input | `left/right.target_cartesian_delta`: float64 `[6]`; `left/right.gripper_position`: scalar |
+| `robot_command` request/reply | Home both arms through the existing reset paths; return failure if either arm fails. |
 
-The physical Vega and its per-arm services stay open while this external process is
-alive. A Graph Stop only stops Node data activity; a later Graph Start reuses the
-same hardware process. Process shutdown closes both per-arm control loops and both
-gripper/robot wrappers.
+For an action, the Node reads both arm observations once and passes those same
+pre-action states to each arm's Step. After dispatch it publishes that observation
+with the received action and per-arm action details. A failed Step faults the Node.
+Loop's Main Controller builds the final ControlStep for recording.
 
-## Intentional wire changes
+When actions are idle, state-only observations resume after two heartbeat periods
+(default heartbeat: 20 Hz). The input keeps the latest pending action rather than
+a backlog of old targets.
 
-The old Source Bus carried an opaque 14-value action and fields such as
-`robot0.observation.state.cartesian_position`. Node Graph contracts make these
-explicit:
+## Development
 
-- `robot0` maps to `left`, `robot1` maps to `right`;
-- the action is four named fields rather than an out-of-band vector layout;
-- tensor dtype and shape are advertised by `Describe` and validated before a Graph
-  starts;
-- the Graph's Main Node builds and records the final ControlStep.
+```bash
+./install.sh --extra robotiq --extra dev
+.venv/bin/python -m pytest -q tests/loop_bridge
+```
 
-These are transport/data-contract changes. They do not alter the values passed into
-Vega `Step`, its pre-action state, or the low-level control path.
+See [deployment](../../ansible/README.md). Legacy per-arm gRPC entrypoints remain
+available for existing clients; the Loop deployment runs the single Robot Node.

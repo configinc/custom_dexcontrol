@@ -16,12 +16,11 @@ To run the examples in this repo, you can try:
 pip install dexcontrol[example]
 ```
 
-### Loop Node Graph
+### Loop Robot Node
 
-The external dual-arm Vega Robot Node is documented in
-[`src/loop_bridge/README.md`](src/loop_bridge/README.md). It uses the `loop` extra
-and preserves the existing RobotEnv action/observation path while replacing the
-legacy Source Bus integration.
+Use the [Vega Robot Node](src/loop_bridge/README.md) for Loop integration.
+It controls both arms in one process, with uv installation and pinned SDK/Node
+sources. See [Ansible deployment](ansible/README.md) for the Teleop-to-Vega setup.
 
 ### Robotiq 2F-85 Gripper (optional)
 

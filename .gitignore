@@ -28,3 +28,5 @@ env/
 .coverage
 htmlcov/
 .ruff_cache/
+/third_party/
+/.python/

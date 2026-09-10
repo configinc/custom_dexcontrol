@@ -2,37 +2,28 @@
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import os
-import sys
 import threading
 import time as _time
 from collections.abc import Mapping
-from queue import Empty, Full, Queue
+from contextlib import ExitStack
 from pathlib import Path
+from queue import Empty, Full, Queue
 from typing import Any, Optional
 
-_logger = logging.getLogger("robotenv_vega")
-
 import numpy as np
+from dexbot_utils.configs import get_robot_config
+from dexmotion.utils import robot_utils
 from scipy.spatial.transform import Rotation as R
 
-from dexcontrol.utils.trajectory_interpolator import TrajectoryInterpolator
-from dexcontrol.utils.filters import MultiChannelFilter
-
-# Ensure local sibling repositories are importable in workspace deployments.
-# robot.py lives at: <repo>/src/dexcontrol/core/vega/robot.py
-#   parents: [0]=vega, [1]=core, [2]=dexcontrol, [3]=src, [4]=<repo>
-_REPO_ROOT = Path(__file__).resolve().parents[4]
-_DEXCONTROL_SRC = _REPO_ROOT / "src"
-_DEXCONTROL_TELEOP = _REPO_ROOT / "examples" / "teleop"
-for _path in (_DEXCONTROL_SRC, _DEXCONTROL_TELEOP):
-    if _path.exists() and str(_path) not in sys.path:
-        sys.path.insert(0, str(_path))
-
 from dexcontrol import Robot
-from dexbot_utils.configs import get_robot_config
+from dexcontrol.core.vega.ik_controller import BaseIKController
+from dexcontrol.utils.filters import MultiChannelFilter
+from dexcontrol.utils.trajectory_interpolator import TrajectoryInterpolator
+
+_logger = logging.getLogger("robotenv_vega")
 
 
 class _RobotWithCustomHeadPose(Robot):
@@ -81,19 +72,6 @@ class _RobotWithCustomHeadPose(Robot):
                 )
             head.set_joint_pos(init_pos)
 
-_base_arm_teleop_error = None
-try:
-    from base_arm_teleop import BaseIKController
-except ImportError as e:
-    BaseIKController = None
-    _base_arm_teleop_error = e
-
-try:
-    from dexmotion.utils import robot_utils
-except ImportError:
-    robot_utils = None
-
-
 SUPPORTED_ACTION_SPACES = (
     "joint_position",
     "joint_velocity",
@@ -133,7 +111,13 @@ class VegaRobot:
         both arms share a single hardware connection.
         """
         robot = Robot(configs=get_robot_config(robot_model))
-        return cls(robot_model=robot_model, arm_side=arm_side, robot=robot, **kwargs)
+        try:
+            wrapper = cls(robot_model=robot_model, arm_side=arm_side, robot=robot, **kwargs)
+        except BaseException:
+            robot.shutdown()
+            raise
+        wrapper._owns_robot = True
+        return wrapper
 
     def __init__(
         self,
@@ -172,163 +156,166 @@ class VegaRobot:
 
         if arm_side not in ("left", "right"):
             raise ValueError(f"arm_side must be 'left' or 'right', got: {arm_side}")
-        if BaseIKController is None:
-            msg = (
-                "BaseIKController not found. Ensure custom_dexcontrol/examples/teleop is available "
-                "and dependencies are installed (e.g. pip install pytransform3d dexmotion dualsense_controller)."
-            )
-            if _base_arm_teleop_error is not None:
-                msg += f" Original error: {_base_arm_teleop_error}"
-            raise ImportError(msg) from _base_arm_teleop_error
-
         self.robot_model = robot_model
         self.arm_side = arm_side
         self.control_hz = int(control_hz)
         self.gripper_type = gripper_type
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
 
-        # This controls ONE arm. A bimanual caller injects one shared Robot via the
-        # keyword-only ``robot`` argument; direct/single-arm callers construct a fresh
-        # Robot with the custom head pose (upstream default).
-        if robot is not None:
-            self.robot = robot
-        else:
-            configs = get_robot_config(robot_model)
-            self.robot = _RobotWithCustomHeadPose(
-                configs=configs,
-                head_init_pos=np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None,
+        with ExitStack() as startup:
+            # This controls ONE arm. A bimanual caller injects one shared Robot via the
+            # keyword-only ``robot`` argument; direct/single-arm callers construct a fresh
+            # Robot with the custom head pose (upstream default).
+            self._owns_robot = robot is None
+            self._closed = False
+            if robot is not None:
+                self.robot = robot
+            else:
+                configs = get_robot_config(robot_model)
+                self.robot = _RobotWithCustomHeadPose(
+                    configs=configs,
+                    head_init_pos=np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None,
+                )
+            if self._owns_robot:
+                startup.callback(self.robot.shutdown)
+            self.arm = getattr(self.robot, f"{arm_side}_arm")
+            hand_component = f"{arm_side}_hand"
+
+            if gripper_type == "robotiq":
+                from dexcontrol.core.robotiq_gripper import (
+                    RobotiqGripper,  # lazy import
+                )
+                self.hand = RobotiqGripper(comport=self._robotiq_comport)
+            elif gripper_type == "sr_gripper":
+                from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
+                self.hand = SrGripperAdapter(comport=self._robotiq_comport)
+            else:
+                self.hand = getattr(self.robot, hand_component) if self.robot.has_component(hand_component) else None
+
+            if gripper_type in ("robotiq", "sr_gripper") and self.hand is not None:
+                startup.callback(self.hand.shutdown)
+            custom_ik_cfg = self._build_ik_config()
+            self.ik_controller = BaseIKController(
+                bot=self.robot, visualize=False,
+                ik_solver_type=self._ik_solver_type,
+                custom_local_ik_config=custom_ik_cfg,
             )
-        self.arm = getattr(self.robot, f"{arm_side}_arm")
-        hand_component = f"{arm_side}_hand"
+            self._arm_joint_names = [f"{arm_side[0].upper()}_arm_j{i + 1}" for i in range(7)]
 
-        if gripper_type == "robotiq":
-            from dexcontrol.core.robotiq_gripper import RobotiqGripper  # lazy import
-            self.hand = RobotiqGripper(comport=self._robotiq_comport)
-        elif gripper_type == "sr_gripper":
-            from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
-            self.hand = SrGripperAdapter(comport=self._robotiq_comport)
-        else:
-            self.hand = getattr(self.robot, hand_component) if self.robot.has_component(hand_component) else None
-
-        custom_ik_cfg = self._build_ik_config()
-        self.ik_controller = BaseIKController(
-            bot=self.robot, visualize=False,
-            ik_solver_type=self._ik_solver_type,
-            custom_local_ik_config=custom_ik_cfg,
-        )
-        self._arm_joint_names = [f"{arm_side[0].upper()}_arm_j{i + 1}" for i in range(7)]
-
-        # Use Vega unfold pose (L_shape) as default reset, same as fold_robot.py unfold.
-        self.reset_joints = np.asarray(
-            self.arm.get_predefined_pose("L_shape"), dtype=np.float64
-        )
-        self.safe_transit_pose = self.reset_joints.copy()
-
-        self._gripper_open_pos, self._gripper_close_pos = self._init_gripper_reference()
-        self._gripper_state_lock = threading.Lock()
-        self._gripper_io_lock = threading.Lock()
-        self._gripper_poll_interval_s = 1.0 / max(1, self.control_hz)
-        self._gripper_position = 0.0
-        self._gripper_joint_pos = np.asarray(self._gripper_open_pos, dtype=np.float64).copy()
-        self._gripper_command_queue: Queue[float] | None = None
-        self._gripper_stop_event = threading.Event()
-        self._gripper_worker: threading.Thread | None = None
-        self._prev_command_successful = True
-        self._prev_gripper_command_successful = True
-        self._prev_controller_latency_ms = 0.0
-        self._prev_joint_vel: np.ndarray | None = None
-        self._vel_smoothing_alpha = float(np.clip(vel_smoothing_alpha, 0.0, 1.0))
-        self._last_cmd_joint_pos: np.ndarray | None = None  # Track last sent command for delta clipping
-        self._prev_cmd_delta: np.ndarray | None = None  # Previous step delta for jerk limiting
-        self._HW_CORRECTION_ALPHA = float(np.clip(hw_correction_alpha, 0.0, 1.0))
-        self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
-        self._max_delta_scale = float(max(0.1, max_delta_scale))
-        self._MOTOR_MAX_JERK_RAD = float(max(0.0, max_jerk))
-        self._vel_ratio = float(max(0.0, vel_ratio))
-        self._vel_damp_thresh = float(max(0.001, vel_damp_thresh))
-
-        # Velocity logging for diagnostics.
-        vel_log_path = os.environ.get("VEL_LOG_PATH")
-        if vel_log_path:
-            self._vel_log_file = open(vel_log_path, "a")
-            header = f"timestamp,{','.join(f'j{i+1}_vel' for i in range(7))}\n"
-            self._vel_log_file.write(header)
-            _logger.info("Velocity logging enabled: %s", vel_log_path)
-        else:
-            self._vel_log_file = None
-
-        # Critically damped 2nd-order smoothing filter for joint commands.
-        # alpha controls responsiveness (0.0 = disabled, 0.3~0.8 = typical).
-        self._ema_alpha = float(np.clip(ema_alpha, 0.0, 0.99))
-        self._filter_pos: np.ndarray | None = None
-        self._filter_vel: np.ndarray | None = None
-
-        # --- Trajectory interpolation (input-rate → control-rate upsampling) ---
-        # When interpolation_method != "none", incoming commands are buffered
-        # via add_command_point() and the control loop calls
-        # get_interpolated_command() at a higher rate for smooth output.
-        self._interpolation_method = interpolation_method
-        if interpolation_method != "none":
-            self._interpolator = TrajectoryInterpolator(
-                method=interpolation_method,
-                history_size=interpolation_history,
+            # Use Vega unfold pose (L_shape) as default reset, same as fold_robot.py unfold.
+            self.reset_joints = np.asarray(
+                self.arm.get_predefined_pose("L_shape"), dtype=np.float64
             )
-            _logger.info(
-                "Trajectory interpolation enabled: method=%s history=%d",
-                interpolation_method,
-                interpolation_history,
+            self.safe_transit_pose = self.reset_joints.copy()
+
+            self._gripper_open_pos, self._gripper_close_pos = self._init_gripper_reference()
+            self._gripper_state_lock = threading.Lock()
+            self._gripper_io_lock = threading.Lock()
+            self._gripper_poll_interval_s = 1.0 / max(1, self.control_hz)
+            self._gripper_position = 0.0
+            self._gripper_joint_pos = np.asarray(self._gripper_open_pos, dtype=np.float64).copy()
+            self._gripper_command_queue: Queue[float] | None = None
+            self._gripper_stop_event = threading.Event()
+            self._gripper_worker: threading.Thread | None = None
+            self._prev_command_successful = True
+            self._prev_gripper_command_successful = True
+            self._prev_controller_latency_ms = 0.0
+            self._prev_joint_vel: np.ndarray | None = None
+            self._vel_smoothing_alpha = float(np.clip(vel_smoothing_alpha, 0.0, 1.0))
+            self._last_cmd_joint_pos: np.ndarray | None = None  # Track last sent command for delta clipping
+            self._prev_cmd_delta: np.ndarray | None = None  # Previous step delta for jerk limiting
+            self._HW_CORRECTION_ALPHA = float(np.clip(hw_correction_alpha, 0.0, 1.0))
+            self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
+            self._max_delta_scale = float(max(0.1, max_delta_scale))
+            self._MOTOR_MAX_JERK_RAD = float(max(0.0, max_jerk))
+            self._vel_ratio = float(max(0.0, vel_ratio))
+            self._vel_damp_thresh = float(max(0.001, vel_damp_thresh))
+
+            # Velocity logging for diagnostics.
+            vel_log_path = os.environ.get("VEL_LOG_PATH")
+            if vel_log_path:
+                self._vel_log_file = open(vel_log_path, "a")
+                startup.callback(self._vel_log_file.close)
+                header = f"timestamp,{','.join(f'j{i+1}_vel' for i in range(7))}\n"
+                self._vel_log_file.write(header)
+                _logger.info("Velocity logging enabled: %s", vel_log_path)
+            else:
+                self._vel_log_file = None
+
+            # Critically damped 2nd-order smoothing filter for joint commands.
+            # alpha controls responsiveness (0.0 = disabled, 0.3~0.8 = typical).
+            self._ema_alpha = float(np.clip(ema_alpha, 0.0, 0.99))
+            self._filter_pos: np.ndarray | None = None
+            self._filter_vel: np.ndarray | None = None
+
+            # --- Trajectory interpolation (input-rate → control-rate upsampling) ---
+            # When interpolation_method != "none", incoming commands are buffered
+            # via add_command_point() and the control loop calls
+            # get_interpolated_command() at a higher rate for smooth output.
+            self._interpolation_method = interpolation_method
+            if interpolation_method != "none":
+                self._interpolator = TrajectoryInterpolator(
+                    method=interpolation_method,
+                    history_size=interpolation_history,
+                )
+                _logger.info(
+                    "Trajectory interpolation enabled: method=%s history=%d",
+                    interpolation_method,
+                    interpolation_history,
+                )
+            else:
+                self._interpolator = None
+
+            # --- Output filter (applied after interpolation / EMA) ---
+            if filter_type != "none":
+                filter_cfg = {"default": {"type": filter_type}}
+                if filter_type == "butterworth":
+                    filter_cfg["default"]["cutoff_freq"] = filter_cutoff_freq
+                    filter_cfg["default"]["order"] = filter_order
+                elif filter_type == "ema":
+                    filter_cfg["default"]["alpha"] = filter_ema_alpha
+                self._output_filter = MultiChannelFilter(
+                    filter_config=filter_cfg,
+                    control_rate=float(control_hz),
+                )
+                _logger.info(
+                    "Output filter enabled: type=%s (cutoff=%.1f order=%d ema_alpha=%.2f)",
+                    filter_type,
+                    filter_cutoff_freq,
+                    filter_order,
+                    filter_ema_alpha,
+                )
+            else:
+                self._output_filter = None
+
+            # Latest raw command stored by add_command_point for the control loop
+            self._latest_target_joint_pos: np.ndarray | None = None
+            self._latest_gripper_action: float = 0.0
+            self._latest_gripper_action_space: str = "position"
+            self._interp_lock = threading.Lock()
+
+            if self.hand is not None:
+                self._refresh_gripper_state()
+                startup.callback(self._stop_gripper_worker)
+                self._start_gripper_worker()
+
+            # #region agent log
+            self._agent_debug_log(
+                run_id=f"joint-diagnostics-{self.arm_side}",
+                hypothesis_id="H10",
+                location="dexcontrol/core/vega/robot.py:__init__",
+                message="agent_debug_probe",
+                data={
+                    "pid": int(os.getpid()),
+                    "module_file": str(Path(__file__).resolve()),
+                    "log_path": self._AGENT_DEBUG_LOG_PATH,
+                    "arm_side": self.arm_side,
+                    "control_hz": self.control_hz,
+                    "ik_solver_type": self._ik_solver_type,
+                },
             )
-        else:
-            self._interpolator = None
-
-        # --- Output filter (applied after interpolation / EMA) ---
-        if filter_type != "none":
-            filter_cfg = {"default": {"type": filter_type}}
-            if filter_type == "butterworth":
-                filter_cfg["default"]["cutoff_freq"] = filter_cutoff_freq
-                filter_cfg["default"]["order"] = filter_order
-            elif filter_type == "ema":
-                filter_cfg["default"]["alpha"] = filter_ema_alpha
-            self._output_filter = MultiChannelFilter(
-                filter_config=filter_cfg,
-                control_rate=float(control_hz),
-            )
-            _logger.info(
-                "Output filter enabled: type=%s (cutoff=%.1f order=%d ema_alpha=%.2f)",
-                filter_type,
-                filter_cutoff_freq,
-                filter_order,
-                filter_ema_alpha,
-            )
-        else:
-            self._output_filter = None
-
-        # Latest raw command stored by add_command_point for the control loop
-        self._latest_target_joint_pos: np.ndarray | None = None
-        self._latest_gripper_action: float = 0.0
-        self._latest_gripper_action_space: str = "position"
-        self._interp_lock = threading.Lock()
-
-        if self.hand is not None:
-            self._refresh_gripper_state()
-            self._start_gripper_worker()
-
-        # #region agent log
-        self._agent_debug_log(
-            run_id=f"joint-diagnostics-{self.arm_side}",
-            hypothesis_id="H10",
-            location="dexcontrol/core/vega/robot.py:__init__",
-            message="agent_debug_probe",
-            data={
-                "pid": int(os.getpid()),
-                "module_file": str(Path(__file__).resolve()),
-                "log_path": self._AGENT_DEBUG_LOG_PATH,
-                "arm_side": self.arm_side,
-                "control_hz": self.control_hz,
-                "ik_solver_type": self._ik_solver_type,
-            },
-        )
-        # #endregion
+            # #endregion
+            startup.pop_all()
 
     _AGENT_DEBUG_LOG_PATH = "/home/dexmate/.cursor/debug-daf7f0.log"
     _AGENT_DEBUG_SESSION_ID = "daf7f0"
@@ -357,7 +344,10 @@ class VegaRobot:
         if self._ik_solver_type != "pink":
             return None
         try:
-            from dexmotion.configs.ik.ik_config import LocalPinkIKConfig, IKDampingWeightsConfig
+            from dexmotion.configs.ik.ik_config import (
+                IKDampingWeightsConfig,
+                LocalPinkIKConfig,
+            )
             return LocalPinkIKConfig(
                 solver_name="local_pink",
                 target_frames=["L_ee", "R_ee"],
@@ -409,6 +399,17 @@ class VegaRobot:
             self._output_filter.reset()
         self._latest_target_joint_pos = None
 
+    def pause_commands(self) -> None:
+        """Quiesce queued commands and hold the current arm position."""
+        self._clear_gripper_command_queue()
+        try:
+            self._stop_gripper_worker()
+        finally:
+            self.reset_filter_state()
+            self._prev_joint_vel = None
+            current_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+            self.arm.set_joint_pos(current_pos, wait_time=0.0)
+
     def launch_robot(self) -> None:
         """Validate robot readiness and default control mode."""
         self.arm.set_modes(["position"] * 7)
@@ -435,6 +436,8 @@ class VegaRobot:
         self._gripper_stop_event.set()
         if self._gripper_worker is not None and self._gripper_worker.is_alive():
             self._gripper_worker.join(timeout=1.0)
+            if self._gripper_worker.is_alive():
+                raise RuntimeError("Gripper worker did not stop")
         self._gripper_worker = None
         self._gripper_command_queue = None
 
@@ -451,6 +454,8 @@ class VegaRobot:
                 except Empty:
                     pass
 
+            if self._gripper_stop_event.is_set():
+                return
             if latest_target is not None:
                 self._execute_gripper_command(
                     latest_target, wait_time=0.0, raise_on_error=False
@@ -1381,16 +1386,16 @@ class VegaRobot:
             pass
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._stop_gripper_worker()
         if self._vel_log_file is not None:
             self._vel_log_file.close()
             self._vel_log_file = None
-        self._stop_gripper_worker()
-        if self.gripper_type in ("robotiq", "sr_gripper") and self.hand is not None:
-            try:
-                self.hand.shutdown()
-            except Exception:
-                pass
         try:
-            self.robot.shutdown()
-        except Exception:
-            pass
+            if self.gripper_type in ("robotiq", "sr_gripper") and self.hand is not None:
+                self.hand.shutdown()
+        finally:
+            if self._owns_robot:
+                self.robot.shutdown()
+            self._closed = True

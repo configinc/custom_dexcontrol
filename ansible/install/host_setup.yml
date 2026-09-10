@@ -1,115 +1,48 @@
 ---
-- name: Setup host environment for Vega robot control
+- name: Prepare the Teleop gateway and Vega host
   hosts: all
-  become: yes
-  vars:
-    dexmate_ip: "192.168.5.20"
-    dexmate_user: "dexmate"
-    dexmate_pass: "hello-dex"
-    # Activate conda on dexmate before any pip/python call. The interactive
-    # shell auto-activates (base), but ansible's non-interactive heredoc shell
-    # does not source ~/.bashrc, so we activate explicitly.
-    conda_activate: |
-      if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-        source "$HOME/miniconda3/etc/profile.d/conda.sh"
-      elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-        source "$HOME/anaconda3/etc/profile.d/conda.sh"
-      else
-        echo "ERROR: conda.sh not found in ~/miniconda3 or ~/anaconda3" >&2
-        exit 1
-      fi
-      conda env list | grep -q '^robot ' || conda create -n robot python=3.13.11 -y
-      conda activate robot
-
+  become: false
+  vars_files:
+    - defaults.yml
   tasks:
-    # ── Teleop host setup (ds-teleop-0004-XX) ────────────────────────────────
-    - name: Install essential packages on teleop host
-      apt:
-        name:
-          - tmux
-          - vim
-          - sshpass
-          - netcat-openbsd
+    - name: Validate deployment configuration
+      ansible.builtin.assert:
+        that:
+          - dexcontrol_project_dir.startswith('/') and dexcontrol_project_dir != '/'
+          - dexcontrol_staging_dir.startswith('/') and dexcontrol_staging_dir != '/'
+          - gripper_type in ['default', 'robotiq', 'sr_gripper']
+      tags: always
+
+    - name: Install gateway transfer tools
+      become: true
+      ansible.builtin.apt:
+        name: [sshpass, rsync]
         state: present
-        update_cache: yes
+        update_cache: true
+        cache_valid_time: 3600
+      tags: host
 
-    # ── Dexmate machine setup (192.168.5.20) ─────────────────────────────────
-    - name: Install Python dependencies on dexmate
-      shell: |
-        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
-        {{ conda_activate }}
-        cd ~/custom_dexcontrol
-        pip install -e . 2>&1 | tail -5
-        ENDSSH
-      args:
-        executable: /bin/bash
-      become: false
-
-    - name: Install Robotiq gripper dependencies on dexmate
-      shell: |
-        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
-        {{ conda_activate }}
-        pip install pymodbus pyserial
-        cd ~/custom_dexcontrol
-        pip install -e robotiq_2f_85_controller/ 2>&1 | tail -5
-        ENDSSH
-      args:
-        executable: /bin/bash
-      become: false
-
-    - name: Install SR gripper dependencies on dexmate
-      shell: |
-        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
-        {{ conda_activate }}
-        pip install pysoem
-        cd ~/custom_dexcontrol
-        pip install -e sr_gripper_controller/ 2>&1 | tail -5
-        ENDSSH
-      args:
-        executable: /bin/bash
-      become: false
-
-    - name: Grant raw-socket capability to dexmate Python (EtherCAT)
-      # Lets the SR gripper open raw EtherCAT sockets without sudo at run
-      # time. The capability is bound to the python binary, so re-run this
-      # whenever the env's python is recreated. Resolves the symlink so
-      # setcap targets the real ELF binary.
-      shell: |
-        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
-        {{ conda_activate }}
-        PYBIN=$(python -c 'import os, sys; print(os.path.realpath(sys.executable))')
-        echo "$PYBIN"
-        sudo setcap cap_net_raw,cap_net_admin=eip "$PYBIN"
-        getcap "$PYBIN"
-        ENDSSH
-      args:
-        executable: /bin/bash
-      become: false
-      ignore_errors: true
-
-    - name: Ensure dexmate user is in dialout group (serial port access)
-      shell: |
-        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
-          'sudo usermod -aG dialout {{ dexmate_user }}'
-      args:
-        executable: /bin/bash
-      become: false
-      ignore_errors: true
-
-    - name: Set permissions on Robotiq USB serial ports on dexmate
-      shell: |
-        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
-        for dev in /dev/ttyUSB0 /dev/ttyUSB1; do
-          if [ -e "$dev" ]; then
-            sudo chmod 666 "$dev"
+    - name: Install Vega host tools and pinned uv
+      ansible.builtin.command:
+        argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
+        stdin: |
+          set -euo pipefail
+          sudo -n apt-get update
+          sudo -n apt-get install -y ca-certificates git rsync tmux python3-venv build-essential cmake ninja-build libgl1 libegl1 libcap2-bin
+          tools_dir={{ dexcontrol_tools_dir | quote }}
+          if [ ! -x "$tools_dir/bin/python" ]; then
+            python3 -m venv "$tools_dir"
           fi
-        done
-        ENDSSH
-      args:
-        executable: /bin/bash
-      become: false
-      ignore_errors: true
-
-    - name: Display setup completion message
-      debug:
-        msg: "Host setup completed for teleop host and dexmate ({{ dexmate_ip }})"
+          "$tools_dir/bin/python" -m pip install {{ ('uv==' ~ dexcontrol_uv_version) | quote }}
+          {% if gripper_type == 'robotiq' %}
+          sudo -n usermod -aG dialout {{ dexmate_user | quote }}
+          printf '%s\n' 'SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", MODE="0660", GROUP="dialout"' | \
+            sudo -n tee /etc/udev/rules.d/99-dexcontrol-gripper.rules >/dev/null
+          sudo -n udevadm control --reload-rules
+          sudo -n udevadm trigger --subsystem-match=tty
+          {% endif %}
+      environment:
+        SSHPASS: "{{ dexmate_pass }}"
+      no_log: true
+      changed_when: true
+      tags: host

@@ -10,28 +10,19 @@ import sys
 import threading
 import time
 from concurrent import futures
-from pathlib import Path
 from typing import Any, Optional
 
 import grpc
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-# Add package root for local imports.
-# server.py lives at: <repo>/src/dexcontrol/core/robotenv_vega/server.py
-#   parents: [0]=robotenv_vega, [1]=core, [2]=dexcontrol, [3]=src, [4]=<repo>
-_this = Path(__file__).resolve()
-sys.path.insert(0, str(_this.parents[2]))  # src/dexcontrol/ -> "from core.vega..."
-sys.path.insert(0, str(_this.parents[4]))  # <repo>/          -> "from proto..."
-
-from core.vega.robot import (  # noqa: E402
+from dexcontrol.core.robotenv_vega.proto import robotenv_pb2, robotenv_pb2_grpc
+from dexcontrol.core.vega.robot import (
     CommunicationFailedError,
     IKFailedError,
     JointLimitExceededError,
     VegaRobot,
 )
-from proto import robotenv_pb2, robotenv_pb2_grpc  # noqa: E402
-
 
 LOGGER = logging.getLogger("robotenv_vega")
 
@@ -133,6 +124,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
         robot=None,
+        auto_start_control_loop: bool = True,
         head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),  # head_j1 limit: ±1.483 rad
         **kwargs,
     ):
@@ -189,7 +181,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._control_loop_hz = control_loop_hz if control_loop_hz > 0 else 0
         self._control_loop_thread: Optional[threading.Thread] = None
         self._control_loop_stop = threading.Event()
-        if self._robot.interpolation_enabled and self._control_loop_hz > 0:
+        if auto_start_control_loop and self._robot.interpolation_enabled and self._control_loop_hz > 0:
             self._start_control_loop()
             LOGGER.info(
                 "Control loop thread started: %d Hz (input≈%d Hz → control=%d Hz)",
@@ -279,6 +271,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._control_loop_stop.set()
         if self._control_loop_thread is not None and self._control_loop_thread.is_alive():
             self._control_loop_thread.join(timeout=2.0)
+            if self._control_loop_thread.is_alive():
+                raise RuntimeError("Vega control loop did not stop")
         self._control_loop_thread = None
 
     def _control_loop_run(self) -> None:

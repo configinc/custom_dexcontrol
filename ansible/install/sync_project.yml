@@ -1,112 +1,100 @@
 ---
-- name: Sync custom_dexcontrol project
+- name: Synchronize custom_dexcontrol through the Teleop gateway
   hosts: all
-  become: yes
-  vars:
-    dexmate_ip: "192.168.5.20"
-    dexmate_user: "dexmate"
-    dexmate_pass: "hello-dex"
-
+  become: false
+  vars_files:
+    - defaults.yml
   tasks:
-    - name: Save current git branch and tag to version_info.txt
-      shell: |
-        echo "branch: $(git rev-parse --abbrev-ref HEAD)" >| version_info.txt
-        echo "commit: $(git rev-parse HEAD)" >> version_info.txt
-        echo "tag: $(git describe --tags --exact-match 2>/dev/null || echo 'no tag')" >> version_info.txt
-      args:
-        chdir: "{{ ((playbook_dir + '/../..') | realpath) }}"
-      delegate_to: localhost
-      become: false
+    - name: Stop existing Vega processes before replacing source
+      ansible.builtin.import_tasks: stop.yml
 
-    # ── Sync to teleop host (ds-teleop-0004-XX) ──────────────────────────────
-    - name: Ensure local project directory exists on teleop host
-      file:
-        path: "/home/ubuntu/custom_dexcontrol"
+    - name: Ensure the gateway staging directory exists
+      ansible.builtin.file:
+        path: "{{ dexcontrol_staging_dir }}"
         state: directory
         mode: "0755"
-        owner: ubuntu
-        group: ubuntu
 
-    - name: Clean Python cache files before sync
-      shell: |
-        cd /home/ubuntu/custom_dexcontrol 2>/dev/null || true
-        find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-        find . -name "*.pyc" -exec rm -f {} + 2>/dev/null || true
-        find . -name "*.pyo" -exec rm -f {} + 2>/dev/null || true
-      become: yes
-      ignore_errors: yes
-
-    - name: Rsync custom_dexcontrol to teleop host
+    - name: Copy source to the gateway
       ansible.posix.synchronize:
-        src: "{{ ((playbook_dir + '/../..') | realpath) }}/"
-        dest: "/home/ubuntu/custom_dexcontrol/"
+        src: "{{ dexcontrol_source_dir }}/"
+        dest: "{{ dexcontrol_staging_dir }}/"
         archive: true
+        owner: false
+        group: false
         delete: true
-        compress: false
-        private_key: "{{ ansible_ssh_private_key_file }}"
-        use_ssh_args: yes
+        use_ssh_args: true
+        private_key: "{{ ansible_ssh_private_key_file | default(omit) }}"
         rsync_opts:
-          - "--exclude=.git/"
-          - "--exclude=__pycache__/"
-          - "--exclude=*.pyc"
-          - "--exclude=.vscode/"
-          - "--exclude=.DS_Store"
-          - "--exclude=**/*.mp4"
-          - "--delete-excluded"
+          - --exclude=.git
+          - --exclude=.venv/
+          - --exclude=/.python/
+          - --exclude=/third_party/
+          - --exclude=__pycache__/
+          - --exclude=*.pyc
+          - --exclude=*.egg-info/
+          - --exclude=.pytest_cache/
+          - --exclude=.ruff_cache/
+          - --exclude=build/
+          - --exclude=dist/
+          - --exclude=.env*
+          - --exclude=/unit_config.json
+          - --exclude=*.mp4
+
+    - name: Copy source from the gateway to Vega
+      ansible.builtin.command:
+        argv:
+          - rsync
+          - -az
+          - --delete
+          - --rsync-path=mkdir -p {{ dexcontrol_project_dir | quote }} && rsync
+          - --exclude=.git
+          - --exclude=.venv/
+          - --exclude=/.python/
+          - --exclude=/third_party/
+          - --exclude=__pycache__/
+          - --exclude=*.pyc
+          - --exclude=*.egg-info/
+          - --exclude=.pytest_cache/
+          - --exclude=.ruff_cache/
+          - --exclude=build/
+          - --exclude=dist/
+          - --exclude=.env*
+          - --exclude=/unit_config.json
+          - --exclude=*.mp4
+          - -e
+          - sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10
+          - "{{ dexcontrol_staging_dir }}/"
+          - "{{ dexmate_user }}@{{ dexmate_ip }}:{{ dexcontrol_project_dir }}/"
+      environment:
+        SSHPASS: "{{ dexmate_pass }}"
+      no_log: true
+      changed_when: true
+
+    - name: Read the selected source version
+      ansible.builtin.command:
+        argv: "{{ ['git', '-C', dexcontrol_source_dir] + item }}"
+      loop:
+        - [rev-parse, --abbrev-ref, HEAD]
+        - [rev-parse, HEAD]
+        - [describe, --tags, --exact-match]
       delegate_to: localhost
-      become: false
-      ignore_errors: true
+      vars:
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      register: dexcontrol_source_version
+      failed_when: dexcontrol_source_version.rc != 0 and item[0] != 'describe'
+      changed_when: false
 
-    - name: Set proper permissions for shell scripts
-      shell: |
-        find /home/ubuntu/custom_dexcontrol -name "*.sh" -exec chmod +x {} \;
-      become: false
-
-    # ── Sync to dexmate machine (192.168.5.20) ───────────────────────────────
-    - name: Install sshpass on teleop host
-      apt:
-        name: sshpass
-        state: present
-        update_cache: false
-      become: true
-
-    - name: Ping dexmate machine
-      shell: ping -c 3 -W 2 {{ dexmate_ip }}
-      args:
-        executable: /bin/bash
-      register: dexmate_ping
-      ignore_errors: true
-      become: false
-
-    - name: Fail if dexmate machine is unreachable
-      fail:
-        msg: "Cannot reach {{ dexmate_ip }} — dexmate machine is offline or not connected"
-      when: dexmate_ping.rc != 0
-
-    - name: Ensure project directory exists on dexmate
-      shell: |
-        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
-          'mkdir -p ~/custom_dexcontrol'
-      args:
-        executable: /bin/bash
-      become: false
-
-    - name: Rsync custom_dexcontrol from teleop host to dexmate
-      shell: |
-        sshpass -p '{{ dexmate_pass }}' rsync -az --delete \
-          --exclude='.git/' \
-          --exclude='__pycache__/' \
-          --exclude='*.pyc' \
-          --exclude='.vscode/' \
-          --exclude='.DS_Store' \
-          --exclude='**/*.mp4' \
-          -e "ssh -o StrictHostKeyChecking=no" \
-          /home/ubuntu/custom_dexcontrol/ \
-          {{ dexmate_user }}@{{ dexmate_ip }}:~/custom_dexcontrol/
-      args:
-        executable: /bin/bash
-      become: false
-
-    - name: Display sync completion message
-      debug:
-        msg: "Project sync completed — teleop host and dexmate ({{ dexmate_ip }}) are up to date"
+    - name: Record the installed version on Vega
+      ansible.builtin.command:
+        argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
+        stdin: |
+          set -euo pipefail
+          cat > {{ (dexcontrol_project_dir ~ '/version_info.txt') | quote }} <<'VERSION'
+          branch: {{ dexcontrol_source_version.results[0].stdout }}
+          commit: {{ dexcontrol_source_version.results[1].stdout }}
+          tag: {{ dexcontrol_source_version.results[2].stdout | default('no tag', true) }}
+          VERSION
+      environment:
+        SSHPASS: "{{ dexmate_pass }}"
+      no_log: true
+      changed_when: true
