@@ -416,7 +416,8 @@ def test_lifecycle_opens_on_start_pauses_and_reuses_then_closes(monkeypatch):
     runtime = NodeRuntime(node)
     assert not opened
     try:
-        runtime.start({}, {"action_command": _InputBinding()})
+        runtime.configure({})
+        runtime.start({"action_command": _InputBinding()})
         assert opened == [True]
         assert not left.paused and not right.paused
         left.queued_commands.append("old target")
@@ -424,7 +425,8 @@ def test_lifecycle_opens_on_start_pauses_and_reuses_then_closes(monkeypatch):
         assert left.paused and right.paused
         assert not left.queued_commands
         assert not left.closed and not right.closed
-        runtime.start({}, {"action_command": _InputBinding()})
+        runtime.configure({})
+        runtime.start({"action_command": _InputBinding()})
         assert opened == [True]
         assert not left.queued_commands
     finally:
@@ -443,14 +445,16 @@ def test_home_failure_reaches_caller_and_faults_both_arms(monkeypatch, status):
     node = module.VegaRobotNode([("left", left), ("right", right)])
     runtime = NodeRuntime(node)
     try:
-        runtime.start({}, {"action_command": _InputBinding()})
+        runtime.configure({})
+        runtime.start({"action_command": _InputBinding()})
         with pytest.raises(RuntimeError, match="estopped"):
             node._handle_command(module.RobotCommand.HOME)
         assert runtime.status.lifecycle is LifecycleState.FAULT
         assert left.paused and right.paused
         assert not right.resets
         runtime.reset_fault()
-        runtime.start({}, {"action_command": _InputBinding()})
+        runtime.configure({})
+        runtime.start({"action_command": _InputBinding()})
         assert runtime.status.lifecycle is LifecycleState.ACTIVE
     finally:
         runtime.shutdown()
@@ -466,7 +470,8 @@ def test_failed_start_releases_opened_hardware(monkeypatch):
     node = module.VegaRobotNode([("left", left), ("right", right)])
     runtime = NodeRuntime(node)
     with pytest.raises(NodeOperationError, match="right unavailable"):
-        runtime.start({}, {"action_command": _InputBinding()})
+        runtime.configure({})
+        runtime.start({"action_command": _InputBinding()})
     assert left.closed and right.closed
     runtime.shutdown()
 
@@ -531,7 +536,8 @@ def test_action_failure_pauses_both_arms_without_dispatching_the_other(monkeypat
     node = module.VegaRobotNode([("left", left), ("right", right)])
     runtime = NodeRuntime(node)
     try:
-        runtime.start({}, {"action_command": _InputBinding()})
+        runtime.configure({})
+        runtime.start({"action_command": _InputBinding()})
         message = ReceivedMessage(
             timestamp_ns=1,
             sequence=1,
@@ -573,9 +579,8 @@ def test_heartbeat_failure_can_pause_its_own_worker(monkeypatch):
 
     right.pause = pause
     try:
-        runtime.start(
-            {"heartbeat_frequency_hz": 100}, {"action_command": _InputBinding()}
-        )
+        runtime.configure({"heartbeat_frequency_hz": 100})
+        runtime.start({"action_command": _InputBinding()})
         left._create_observation = lambda: (_ for _ in ()).throw(
             RuntimeError("disconnected")
         )
@@ -609,7 +614,8 @@ def test_interpolation_failure_reaches_node_and_pauses_both_arms(monkeypatch):
     node = module.VegaRobotNode([("left", left), ("right", right)])
     runtime = NodeRuntime(node)
     try:
-        runtime.start({}, {"action_command": _InputBinding()})
+        runtime.configure({})
+        runtime.start({"action_command": _InputBinding()})
         left.control_error = service.control_error
         node.check_health()
         assert runtime.status.lifecycle is LifecycleState.FAULT

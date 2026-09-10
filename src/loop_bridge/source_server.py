@@ -332,6 +332,7 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
             action_handler=self._apply_action,
             command_handler=self._handle_command,
             input_capacity=1,
+            on_configure=self._on_configure,
             on_start=self._on_start,
             on_stop=self._on_stop,
             on_reset_fault=self._on_reset_fault,
@@ -348,7 +349,12 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
         self._arm_services = services
         self._appliers = {arm: _StepApplier(service) for arm, service in services}
 
-    def _on_start(self, config: VegaRobotNodeConfig) -> None:
+    def _on_configure(self, config: VegaRobotNodeConfig) -> None:
+        self._action_space = config.action_space
+        self._gripper_action_space = config.gripper_action_space
+        self._heartbeat_hz = config.heartbeat_frequency_hz
+
+    def _on_start(self) -> None:
         try:
             with self._device_lock:
                 if not self._arm_services:
@@ -357,9 +363,6 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
                     self._set_services(
                         self._resources.enter_context(self._service_factory())
                     )
-                self._action_space = config.action_space
-                self._gripper_action_space = config.gripper_action_space
-                self._heartbeat_hz = config.heartbeat_frequency_hz
                 for _arm, service in self._arm_services:
                     service.resume()
                 self._heartbeat_stop.clear()
