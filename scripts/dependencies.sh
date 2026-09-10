@@ -48,7 +48,7 @@ prepare_dependency() {
             ;;
         loop)
             fetch_source loop git@github.com:configinc/loop.git \
-                a55eaef4f3dce6225044f27f266e7199d71b0943 packages/loop-node
+                de497cfa25f3d029592815f7b068141c8ab80b03 packages/loop-node
             ;;
         *)
             printf 'Unknown dependency: %s\n' "$1" >&2
