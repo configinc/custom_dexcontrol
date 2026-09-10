@@ -1,5 +1,10 @@
 # Vega deployment
 
+Data Studio Layout installs Loop under `~/loop-v2/` without starting it.
+Use **Loop v2 → Restart Robot/UTI** to stop the existing Robot, Inference,
+and Recorder and start the Loop services. To return, use **Stop Robot/UTI**,
+then restart the existing services. Their source directories are kept separately.
+
 The deployment server copies this checkout through the Teleop PC to the Vega PC.
 Vega runs one dual-arm Loop Robot Node in a uv environment. UTI runs separately.
 
@@ -16,7 +21,7 @@ existing deployment. Override the Vega connection settings in inventory.
 | --- | --- |
 | `dexmate_ip`, `dexmate_user`, `dexmate_pass` | Existing Vega connection settings; traffic passes through the Teleop PC |
 | `dexcontrol_python` | `3.12`; the pinned OMPL dependency has no Python 3.13 wheel |
-| `dexcontrol_project_dir` | `/home/<dexmate_user>/custom_dexcontrol` on Vega |
+| `dexcontrol_project_dir` | `/home/<dexmate_user>/loop-v2/custom_dexcontrol` on Vega |
 | `dexcontrol_start` | `true`; set `false` to install and configure without starting |
 | `dexcontrol_node_id` | `robot` |
 | `dexcontrol_loop_endpoint` | Overrides `LOOP_NODE_GRAPH_NODE_ENDPOINT` in the launcher; empty inherits Vega's SSH environment |
@@ -38,9 +43,10 @@ SR deployment installs a dedicated Python under `.python` for EtherCAT permissio
 it does not change permissions on a shared or system interpreter.
 
 Sync preserves `.venv`, `.python`, `third_party`, environment files, and `unit_config.json`.
-It stops the managed `robot-server` tmux session before updating source. Legacy
-left/right server panes receive Ctrl+C and are removed after their processes exit.
-The new process uses the same session name.
+It stops the managed `vega-loop-robot` tmux session before updating source.
+The legacy `robot-server` session is separate. Deployment also saves the robot SSH
+connection in `~/loop-v2/vega-connection.json` on the Teleop PC (owner access only),
+so Service Controls can stop Vega without downloading a repository.
 
 Restart the installed version without reinstalling:
 
@@ -48,6 +54,6 @@ Restart the installed version without reinstalling:
 ansible-playbook -i inventory.ini ansible/install/restart.yml
 ```
 
-DS Layout's Vega Robot Restart already calls this playbook. It checks the Node
-process rather than the obsolete gRPC ports 50061/50063. A running process can wait
-for Loop to become available; registration alone does not activate robot control.
+DS Layout's combined Robot/UTI control uses the installed startup scripts.
+A running process can wait for Loop to become available; registration alone does
+not activate robot control.

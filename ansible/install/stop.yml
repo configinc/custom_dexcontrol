@@ -1,5 +1,5 @@
 ---
-- name: Stop the managed Vega tmux session, including legacy dual-arm panes
+- name: Stop the managed Loop Vega tmux session
   ansible.builtin.command:
     argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
     stdin: |

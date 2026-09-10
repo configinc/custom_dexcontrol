@@ -5,14 +5,14 @@ dexmate_user: dexmate
 dexmate_pass: "hello-dex"
 
 dexcontrol_source_dir: "{{ (playbook_dir ~ '/../..') | realpath }}"
-dexcontrol_staging_dir: "{{ ansible_facts['user_dir'] }}/custom_dexcontrol"
-dexcontrol_project_dir: "/home/{{ dexmate_user }}/custom_dexcontrol"
+dexcontrol_staging_dir: "{{ ansible_facts['user_dir'] }}/loop-v2/custom_dexcontrol"
+dexcontrol_project_dir: "/home/{{ dexmate_user }}/loop-v2/custom_dexcontrol"
 dexcontrol_tools_dir: "/home/{{ dexmate_user }}/.local/share/dexcontrol-tools"
 dexcontrol_python: "3.12"
 dexcontrol_uv_version: "0.11.28"
 dexcontrol_start: true
 dexcontrol_start_script: "/home/{{ dexmate_user }}/start_vega_robot_node.sh"
-dexcontrol_tmux_session: robot-server
+dexcontrol_tmux_session: vega-loop-robot
 dexcontrol_node_id: robot
 dexcontrol_loop_endpoint: ""
 dexcontrol_robot_name: ""

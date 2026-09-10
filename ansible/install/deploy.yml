@@ -9,6 +9,13 @@
   vars_files:
     - defaults.yml
   tasks:
+    - name: Save the robot connection for service controls on the teleop host
+      ansible.builtin.copy:
+        dest: "{{ ansible_facts['user_dir'] }}/loop-v2/vega-connection.json"
+        mode: "0600"
+        content: "{{ {'host': dexmate_ip, 'user': dexmate_user, 'password': dexmate_pass} | to_json }}"
+      no_log: true
+
     - name: Install the Loop runtime on Vega
       ansible.builtin.command:
         argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
