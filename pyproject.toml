@@ -103,6 +103,11 @@ sr-gripper-controller = { path = "sr_gripper_controller", editable = true }
 [tool.uv]
 # ruckig 0.17.3 still uses the cmake.targets setting removed in 0.10.
 build-constraint-dependencies = ["scikit-build-core==0.9.10"]
+# Match Vega's existing runtime: newer viser keeps URDF viewer dependencies optional.
+constraint-dependencies = ["viser==1.0.30"]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64' and python_version == '3.12'",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dexcontrol", "src/loop_bridge"]
