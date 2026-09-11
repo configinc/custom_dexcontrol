@@ -1,38 +1,7 @@
 ---
-- name: Stop the managed Loop Vega tmux session
+- name: Stop the deployed repository services
   ansible.builtin.command:
-    argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
-    stdin: |
-      set -euo pipefail
-      session={{ ('=' ~ dexcontrol_tmux_session) | quote }}
-      if ! command -v tmux >/dev/null || ! tmux has-session -t "$session" 2>/dev/null; then
-        exit 0
-      fi
-      while read -r pane; do
-        tmux send-keys -t "$pane" C-c 2>/dev/null || true
-      done < <(tmux list-panes -s -t "$session" -F '#{pane_id}')
-      for attempt in {1..30}; do
-        if ! tmux has-session -t "$session" 2>/dev/null; then
-          exit 0
-        fi
-        if ! commands=$(tmux list-panes -s -t "$session" -F '#{pane_current_command}' 2>/dev/null); then
-          # The last process may exit between has-session and list-panes.
-          ! tmux has-session -t "$session" 2>/dev/null
-          exit $?
-        fi
-        idle=true
-        while read -r command; do
-          case "$command" in bash|sh|zsh|fish) ;; *) idle=false ;; esac
-        done <<< "$commands"
-        if "$idle"; then
-          tmux kill-session -t "$session" 2>/dev/null || ! tmux has-session -t "$session" 2>/dev/null
-          exit 0
-        fi
-        sleep 1
-      done
-      echo 'Vega processes did not finish shutdown; source was not replaced.' >&2
-      exit 1
+    argv: ["{{ dexcontrol_staging_dir }}/loop-service.sh", stop]
   environment:
-    SSHPASS: "{{ dexmate_pass }}"
-  no_log: true
+    LOOP_NODE_GRAPH_NODE_ENDPOINT: "{{ ansible_facts['env'].get('LOOP_NODE_GRAPH_NODE_ENDPOINT', '') }}"
   changed_when: true

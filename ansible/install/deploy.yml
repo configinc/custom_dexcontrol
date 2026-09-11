@@ -16,6 +16,13 @@
         content: "{{ {'host': dexmate_ip, 'user': dexmate_user, 'password': dexmate_pass} | to_json }}"
       no_log: true
 
+    - name: Configure repository service controls on the Teleop host
+      ansible.builtin.template:
+        src: loop_service_config.sh.j2
+        dest: "{{ dexcontrol_staging_dir }}/.env.loop-service"
+        mode: "0644"
+      tags: start
+
     - name: Install the Loop runtime on Vega
       ansible.builtin.command:
         argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
@@ -63,6 +70,21 @@
       no_log: true
       changed_when: true
       tags: runtime
+
+    - name: Find the Teleop interface used to reach Vega
+      ansible.builtin.command:
+        argv: [ip, -j, -4, route, get, "{{ dexmate_ip }}"]
+      register: dexcontrol_gateway_route
+      changed_when: false
+      when: not dexcontrol_relay_bind_address
+      tags: start
+
+    - name: Resolve the Vega relay endpoint
+      ansible.builtin.set_fact:
+        dexcontrol_relay_address: >-
+          {{ dexcontrol_relay_bind_address or
+             (dexcontrol_gateway_route.stdout | from_json)[0]['prefsrc'] }}
+      tags: start
 
     - name: Configure the Vega startup script
       ansible.builtin.command:

@@ -15,7 +15,7 @@
     - name: Install gateway transfer tools
       become: true
       ansible.builtin.apt:
-        name: [sshpass, rsync]
+        name: [sshpass, rsync, tmux, socat, iproute2, python3]
         state: present
         update_cache: true
         cache_valid_time: 3600

@@ -13,7 +13,12 @@ dexcontrol_uv_version: "0.11.28"
 dexcontrol_start_script: "/home/{{ dexmate_user }}/start_vega_robot_node.sh"
 dexcontrol_tmux_session: vega-loop-robot
 dexcontrol_node_id: robot
+# GPU endpoint override for the Teleop relay; empty reads its environment.
 dexcontrol_loop_endpoint: ""
+dexcontrol_relay_tmux_session: vega-loop-relay
+dexcontrol_relay_port: 7448
+# Empty detects the Teleop address used to reach dexmate_ip.
+dexcontrol_relay_bind_address: ""
 dexcontrol_robot_name: ""
 dexcontrol_zenoh_config: ""
 dexmate_ssh_argv:

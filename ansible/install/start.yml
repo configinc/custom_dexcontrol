@@ -1,23 +1,7 @@
 ---
-- name: Launch the Vega Robot Node and verify its process
+- name: Start the deployed repository services
   ansible.builtin.command:
-    argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
-    stdin: |
-      set -euo pipefail
-      script={{ dexcontrol_start_script | quote }}
-      session={{ dexcontrol_tmux_session | quote }}
-      test -x "$script"
-      if tmux has-session -t "=$session" 2>/dev/null; then
-        echo 'Vega session already exists; stop it before starting another.' >&2
-        exit 1
-      fi
-      tmux new-session -d -s "$session" -c {{ dexcontrol_project_dir | quote }} \
-        -e "LOOP_NODE_GRAPH_NODE_ENDPOINT=${LOOP_NODE_GRAPH_NODE_ENDPOINT:-}" \
-        -e "ROBOT_NAME=${ROBOT_NAME:-}" -e "ZENOH_CONFIG=${ZENOH_CONFIG:-}" \
-        "exec $(printf '%q' "$script")"
-      sleep 2
-      tmux has-session -t "=$session"
+    argv: ["{{ dexcontrol_staging_dir }}/loop-service.sh", start]
   environment:
-    SSHPASS: "{{ dexmate_pass }}"
-  no_log: true
+    LOOP_NODE_GRAPH_NODE_ENDPOINT: "{{ ansible_facts['env'].get('LOOP_NODE_GRAPH_NODE_ENDPOINT', '') }}"
   changed_when: true

@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-{% if dexcontrol_loop_endpoint %}
-export LOOP_NODE_GRAPH_NODE_ENDPOINT={{ dexcontrol_loop_endpoint | quote }}
-{% endif %}
+export LOOP_NODE_GRAPH_NODE_ENDPOINT={{ ('tcp/' ~ dexcontrol_relay_address ~ ':' ~ dexcontrol_relay_port) | quote }}
 {% if dexcontrol_robot_name %}
 export ROBOT_NAME={{ dexcontrol_robot_name | quote }}
 {% endif %}
@@ -15,4 +13,4 @@ export ZENOH_CONFIG={{ dexcontrol_zenoh_config | quote }}
 [[ -n "${ZENOH_CONFIG:-}" ]] || unset ZENOH_CONFIG
 
 project_dir={{ dexcontrol_project_dir | quote }}
-exec "$project_dir/run.sh" --node-id {{ dexcontrol_node_id | quote }}
+exec "$project_dir/run.sh" --node-id {{ dexcontrol_node_id | quote }} "$@"
