@@ -10,28 +10,19 @@ import sys
 import threading
 import time
 from concurrent import futures
-from pathlib import Path
 from typing import Any, Optional
 
 import grpc
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-# Add package root for local imports.
-# server.py lives at: <repo>/src/dexcontrol/core/robotenv_vega/server.py
-#   parents: [0]=robotenv_vega, [1]=core, [2]=dexcontrol, [3]=src, [4]=<repo>
-_this = Path(__file__).resolve()
-sys.path.insert(0, str(_this.parents[2]))  # src/dexcontrol/ -> "from core.vega..."
-sys.path.insert(0, str(_this.parents[4]))  # <repo>/          -> "from proto..."
-
-from core.vega.robot import (  # noqa: E402
+from dexcontrol.core.robotenv_vega.proto import robotenv_pb2, robotenv_pb2_grpc
+from dexcontrol.core.vega.robot import (
     CommunicationFailedError,
     IKFailedError,
     JointLimitExceededError,
     VegaRobot,
 )
-from proto import robotenv_pb2, robotenv_pb2_grpc  # noqa: E402
-
 
 LOGGER = logging.getLogger("robotenv_vega")
 
@@ -50,11 +41,56 @@ def _to_proto_value(val: Any) -> robotenv_pb2.Value:
     return robotenv_pb2.Value(string_value=str(val))
 
 
+def _from_proto_value(val: robotenv_pb2.Value) -> Any:
+    """Inverse of ``_to_proto_value``: unwrap a proto Value to a Python scalar / list.
+
+    Returns ``None`` for the special zero-Value that grpc gives you when the field
+    was never set — a caller building the map by only writing the keys it has is
+    common, so an unset entry decodes to ``None`` rather than a spurious zero.
+    """
+    kind = val.WhichOneof("kind")
+    if kind is None:
+        return None
+    if kind == "float_value":
+        return val.float_value
+    if kind == "float_array":
+        return list(val.float_array.values)
+    if kind == "int_value":
+        return val.int_value
+    if kind == "string_value":
+        return val.string_value
+    if kind == "bytes_value":
+        return val.bytes_value
+    return None
+
+
+def _decode_pre_action_state(
+    request: robotenv_pb2.StepRequest,
+) -> Optional[dict[str, Any]]:
+    """Decode ``StepRequest.pre_action_state`` into a plain robot-state dict.
+
+    Returns ``None`` when the caller didn't populate the field (legacy clients or
+    a direct RPC that hasn't been updated) — the ``Step`` handler then falls back
+    to reading state internally, so this is a strictly additive protocol change.
+    """
+    if not request.pre_action_state:
+        return None
+    return {key: _from_proto_value(val) for key, val in request.pre_action_state.items()}
+
+
 # Per-arm init (home) and reset middle waypoints.
 # Left→Right mirroring: [-v0, -v1, -v2, v3, -v4, -v5, -v6]
 _INIT_JOINTS = {
     "left":  np.array([-1.4234,  1.3524,  2.8707, -1.981,   0.6751, -0.1662,  0.068]),
     "right": np.array([ 1.4234, -1.3524, -2.8707, -1.981,  -0.1515,  0.1662, -0.068]),
+}
+# Match robot-control-interface/config/init_setup/frame.yaml.
+_INIT_JOINTS_BY_FRAME = {
+    "vega-1-pro_torso_frame_v1": _INIT_JOINTS,
+    "vega-1-pro_torso_frame_v2": {
+        "left":  np.array([ 1.2373,  0.2848,  0.2404, -1.5499,  1.5265, -0.0526,  0.3908]),
+        "right": np.array([-1.2373, -0.2848, -0.2404, -1.5499, -1.0265,  0.0526, -0.3908]),
+    },
 }
 _RESET_MIDDLE_JOINTS = {
     "left":  np.array([-0.9548,  0.9862, -0.3738, -1.4169,  0.6624, -0.2987, -0.0650]),
@@ -95,6 +131,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         rot_sensitivity: float = 1.0,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
+        robot=None,
+        auto_start_control_loop: bool = True,
         head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),  # head_j1 limit: ±1.483 rad
         **kwargs,
     ):
@@ -116,9 +154,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self.control_hz, rot_sensitivity=rot_sensitivity,
         )
 
-        self._robot = VegaRobot(
-            robot_model=robot_model,
+        vega_kwargs = dict(
             arm_side=arm_side,
+            robot_model=robot_model,
             control_hz=control_hz,
             use_velocity_feedforward=use_velocity_feedforward,
             gripper_type=gripper_type,
@@ -139,6 +177,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             vel_damp_thresh=vel_damp_thresh,
             head_init_pos=head_init_pos,
         )
+        # A bimanual caller passes a shared ``robot`` so both arms' services drive one
+        # hardware unit; single-arm callers omit it and the service builds its own.
+        self._robot = VegaRobot(robot=robot, **vega_kwargs) if robot is not None else VegaRobot.build(**vega_kwargs)
         self._robot.launch_robot()
 
         # --- Background control loop for interpolation-based upsampling ---
@@ -148,7 +189,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._control_loop_hz = control_loop_hz if control_loop_hz > 0 else 0
         self._control_loop_thread: Optional[threading.Thread] = None
         self._control_loop_stop = threading.Event()
-        if self._robot.interpolation_enabled and self._control_loop_hz > 0:
+        if auto_start_control_loop and self._robot.interpolation_enabled and self._control_loop_hz > 0:
             self._start_control_loop()
             LOGGER.info(
                 "Control loop thread started: %d Hz (input≈%d Hz → control=%d Hz)",
@@ -157,8 +198,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 self._control_loop_hz,
             )
 
-        # Override home position with per-arm init joints.
-        self.reset_joints = _INIT_JOINTS[arm_side].copy()
+        # Select startup and Home targets before the initial reset motion.
+        init_joints = _INIT_JOINTS_BY_FRAME.get(frame_type, _INIT_JOINTS)
+        self.reset_joints = init_joints[arm_side].copy()
         self.reset_middle_joints = _RESET_MIDDLE_JOINTS[arm_side].copy()
         self.safe_transit_pose = self._robot.safe_transit_pose.copy()
 
@@ -238,6 +280,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._control_loop_stop.set()
         if self._control_loop_thread is not None and self._control_loop_thread.is_alive():
             self._control_loop_thread.join(timeout=2.0)
+            if self._control_loop_thread.is_alive():
+                raise RuntimeError("Vega control loop did not stop")
         self._control_loop_thread = None
 
     def _control_loop_run(self) -> None:
@@ -531,8 +575,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 action_space_for_robot = "cartesian_delta"
             t_after_xform = time.time()
 
-            # Get robot_state BEFORE executing action (needed for create_action_dict)
-            pre_action_state, _ = self._robot.get_robot_state()
+            # Get robot_state BEFORE executing action (needed for create_action_dict).
+            # If the caller supplied a pre-apply snapshot (StepRequest.pre_action_state),
+            # use it verbatim so the (state, action) pair the caller is about to record
+            # is the same one we dispatch against — single source of truth. Legacy
+            # callers that don't populate the field fall back to reading state here.
+            caller_state = _decode_pre_action_state(request)
+            if caller_state is not None:
+                pre_action_state = caller_state
+            else:
+                pre_action_state, _ = self._robot.get_robot_state()
             LOGGER.debug(
                 "[CartesianPos] %s",
                 np.round(np.asarray(pre_action_state["cartesian_position"], dtype=np.float64), 4).tolist(),
@@ -544,6 +596,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     action,
                     action_space=action_space_for_robot,
                     gripper_action_space=gripper_action_space,
+                    pre_action_state=pre_action_state,
                 )
             else:
                 # Legacy synchronous path.
@@ -552,6 +605,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     action_space=action_space_for_robot,
                     gripper_action_space=gripper_action_space,
                     blocking=False,
+                    pre_action_state=pre_action_state,
                 )
             t_after_cmd = time.time()
 

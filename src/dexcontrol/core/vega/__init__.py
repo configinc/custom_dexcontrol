@@ -1,6 +1,6 @@
 """Vega robot interfaces."""
 
-from core.vega.robot import (
+from dexcontrol.core.vega.robot import (
     CommunicationFailedError,
     IKFailedError,
     JointLimitExceededError,

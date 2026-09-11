@@ -16,6 +16,15 @@ To run the examples in this repo, you can try:
 pip install dexcontrol[example]
 ```
 
+### Loop Robot Node
+
+Loop sends Configure before Start. Configure applies Node Config; Start activates
+the robot. Stop and ResetFault return to IDLE, requiring Configure for the next run.
+
+Use the [Vega Robot Node](src/loop_bridge/README.md) for Loop integration.
+It controls both arms in one process, with uv installation and pinned SDK/Node
+sources. See [Ansible deployment](ansible/README.md) for the Teleop-to-Vega setup.
+
 ### Robotiq 2F-85 Gripper (optional)
 
 If you want to use a Robotiq 2F-85 gripper connected via USB-RS485, clone this

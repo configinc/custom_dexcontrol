@@ -1,0 +1,24 @@
+---
+- name: Require the Vega Loop runtime to be stopped before installation
+  ansible.builtin.command:
+    argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
+    stdin: |
+      set -euo pipefail
+      if command -v tmux >/dev/null && tmux has-session -t {{ ('=' ~ dexcontrol_tmux_session) | quote }} 2>/dev/null; then
+        echo 'Use Stop Robot/UTI before deploying.' >&2
+        exit 1
+      fi
+  environment:
+    SSHPASS: "{{ dexmate_pass }}"
+  no_log: true
+  changed_when: false
+
+- name: Require the Vega relay to be stopped before installation
+  ansible.builtin.shell: |
+    if command -v tmux >/dev/null && tmux has-session -t {{ ('=' ~ dexcontrol_relay_tmux_session) | quote }} 2>/dev/null; then
+      echo 'Use Stop Robot/UTI before deploying.' >&2
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
+  changed_when: false

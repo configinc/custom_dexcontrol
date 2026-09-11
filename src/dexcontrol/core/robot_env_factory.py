@@ -68,7 +68,7 @@ def create_robot_env(
                 'control_hz': kwargs.get('control_hz', 20),
                 'gripper_type': kwargs.get('gripper_type', 'default'),
             }
-            robot = VegaRobot(**robot_kwargs)
+            robot = VegaRobot.build(**robot_kwargs)
             robot.launch_robot()
             return robot
         except ImportError:

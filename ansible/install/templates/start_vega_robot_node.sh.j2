@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Load the robot identity normally inherited from Vega's login shell.
+if [[ -r /etc/profile.d/10-dexmate-robot.sh ]]; then
+    source /etc/profile.d/10-dexmate-robot.sh
+fi
+
+export LOOP_NODE_GRAPH_NODE_ENDPOINT={{ ('tcp/' ~ dexcontrol_relay_address ~ ':' ~ dexcontrol_relay_port) | quote }}
+{% if dexcontrol_robot_name %}
+export ROBOT_NAME={{ dexcontrol_robot_name | quote }}
+{% endif %}
+{% if dexcontrol_zenoh_config %}
+export ZENOH_CONFIG={{ dexcontrol_zenoh_config | quote }}
+{% endif %}
+# Do not pass empty SSH environment values to DexComm.
+[[ -n "${ROBOT_NAME:-}" ]] || unset ROBOT_NAME
+[[ -n "${ZENOH_CONFIG:-}" ]] || unset ZENOH_CONFIG
+
+project_dir={{ dexcontrol_project_dir | quote }}
+exec "$project_dir/run.sh" --node-id {{ dexcontrol_node_id | quote }} "$@"
