@@ -30,8 +30,9 @@ existing deployment. Override the Vega connection settings in inventory.
 
 The Loop endpoint must be reachable **from Vega**, which can have a different
 network route from the Teleop gateway. The launcher registers in IDLE; Loop Start
-opens the robot control resources. Gripper devices and control rates come from
-[Node Config](../src/loop_bridge/README.md#node-config). Unit Config is not read.
+opens the robot control resources. Arm pose presets, gripper devices, and control
+rates come from [Node Config](../src/loop_bridge/README.md#node-config).
+Unit Config is not read.
 
 `DOCKER_GITHUB_PAT` on the deployment server is passed transiently to the installer
 for private SDK/Node downloads. Without it, Vega needs GitHub SSH access. An optional

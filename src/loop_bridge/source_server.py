@@ -60,6 +60,12 @@ class VegaRobotNodeConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
+    frame_type: Literal["vega-1-pro_torso_frame_v1", "vega-1-pro_torso_frame_v2"] = (
+        Field(
+            default="vega-1-pro_torso_frame_v1",
+            description="Arm startup and Home pose preset; does not rotate the coordinate frame.",
+        )
+    )
     control_hz: int = Field(default=20, gt=0)
     observation_frequency_hz: float = Field(default=20.0, gt=0)
     gripper_type: Literal["default", "robotiq", "sr_gripper"] = "robotiq"
@@ -96,7 +102,6 @@ class VegaRobotNodeConfig(BaseModel):
 # Preserve the deployed controller tuning; only Node Config fields vary per cell.
 _SERVICE_DEFAULTS: dict[str, Any] = {
     "robot_model": "vega_1",
-    "frame_type": "vega_mobile_base",
     "ik_solver_type": "pink",
     "use_velocity_feedforward": True,
     "interpolation_method": "linear",
@@ -584,6 +589,7 @@ def _action_info_payload(arm: str, action_info: Mapping[str, Any]) -> dict[str, 
 def _open_arm_services(config: VegaRobotNodeConfig) -> Iterator[ArmServices]:
     service_kwargs = {
         **_SERVICE_DEFAULTS,
+        "frame_type": config.frame_type,
         "gripper_type": config.gripper_type,
         "control_hz": config.control_hz,
     }

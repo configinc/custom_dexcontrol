@@ -84,6 +84,14 @@ _INIT_JOINTS = {
     "left":  np.array([-1.4234,  1.3524,  2.8707, -1.981,   0.6751, -0.1662,  0.068]),
     "right": np.array([ 1.4234, -1.3524, -2.8707, -1.981,  -0.1515,  0.1662, -0.068]),
 }
+# Match robot-control-interface/config/init_setup/frame.yaml.
+_INIT_JOINTS_BY_FRAME = {
+    "vega-1-pro_torso_frame_v1": _INIT_JOINTS,
+    "vega-1-pro_torso_frame_v2": {
+        "left":  np.array([ 1.2373,  0.2848,  0.2404, -1.5499,  1.5265, -0.0526,  0.3908]),
+        "right": np.array([-1.2373, -0.2848, -0.2404, -1.5499, -1.0265,  0.0526, -0.3908]),
+    },
+}
 _RESET_MIDDLE_JOINTS = {
     "left":  np.array([-0.9548,  0.9862, -0.3738, -1.4169,  0.6624, -0.2987, -0.0650]),
     "right": np.array([ 0.9548, -0.9862,  0.3738, -1.4169, -0.6624,  0.2987,  0.0650]),
@@ -190,8 +198,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 self._control_loop_hz,
             )
 
-        # Override home position with per-arm init joints.
-        self.reset_joints = _INIT_JOINTS[arm_side].copy()
+        # Select startup and Home targets before the initial reset motion.
+        init_joints = _INIT_JOINTS_BY_FRAME.get(frame_type, _INIT_JOINTS)
+        self.reset_joints = init_joints[arm_side].copy()
         self.reset_middle_joints = _RESET_MIDDLE_JOINTS[arm_side].copy()
         self.safe_transit_pose = self._robot.safe_transit_pose.copy()
 

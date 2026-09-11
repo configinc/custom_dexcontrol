@@ -405,8 +405,21 @@ def test_lifecycle_opens_on_start_pauses_and_reuses_then_closes(monkeypatch):
     assert left.closed and right.closed
 
 
-def test_reconfigure_reopens_hardware_with_new_gripper_and_control_settings(
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"frame_type": "vega-1-pro_torso_frame_v2"},
+        {
+            "gripper_type": "sr_gripper",
+            "left_gripper_device": "enp1s0",
+            "right_gripper_device": "enp2s0",
+            "control_hz": 30,
+        },
+    ],
+)
+def test_reconfigure_reopens_hardware_with_new_settings(
     monkeypatch,
+    settings,
 ):
     from loop_node.runtime import NodeRuntime
 
@@ -427,22 +440,19 @@ def test_reconfigure_reopens_hardware_with_new_gripper_and_control_settings(
         assert created == []
         runtime.start({"action_command": _InputBinding()})
         runtime.stop()
-        runtime.configure(
-            {
-                "gripper_type": "sr_gripper",
-                "left_gripper_device": "enp1s0",
-                "right_gripper_device": "enp2s0",
-                "control_hz": 30,
-            }
-        )
+        runtime.configure(settings)
         assert len(created) == 2
         runtime.start({"action_command": _InputBinding()})
         assert all(service.closed for _, service in created[:2])
         left, right = created[2:]
-        assert left[0]["robotiq_comport"] == "enp1s0"
-        assert right[0]["robotiq_comport"] == "enp2s0"
-        assert left[0]["gripper_type"] == right[0]["gripper_type"] == "sr_gripper"
-        assert left[0]["control_hz"] == right[0]["control_hz"] == 30
+        config = module.VegaRobotNodeConfig(**settings)
+        assert left[0]["robotiq_comport"] == config.left_gripper_device
+        assert right[0]["robotiq_comport"] == config.right_gripper_device
+        assert (
+            left[0]["gripper_type"] == right[0]["gripper_type"] == config.gripper_type
+        )
+        assert left[0]["control_hz"] == right[0]["control_hz"] == config.control_hz
+        assert left[0]["frame_type"] == right[0]["frame_type"] == config.frame_type
         assert right[0]["robot"] is left[1]._robot.robot
     finally:
         runtime.shutdown()
