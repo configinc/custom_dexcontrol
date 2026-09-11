@@ -31,7 +31,11 @@ existing deployment. Override the Vega connection settings in inventory.
 | `dexcontrol_relay_port` | `7448` on the Teleop PC |
 | `dexcontrol_relay_bind_address` | Empty; detect the Teleop IPv4 address used to reach Vega |
 | `dexcontrol_relay_tmux_session` | `vega-loop-relay` |
-| `dexcontrol_robot_name`, `dexcontrol_zenoh_config` | Optional DexComm settings, separate from the Loop connection |
+| `dexcontrol_robot_name`, `dexcontrol_zenoh_config` | Optional overrides for Vega's DexComm environment, separate from the Loop connection |
+
+The Vega launcher loads `/etc/profile.d/10-dexmate-robot.sh` when present, just
+as the legacy login shell did. This reads the device's existing `ROBOT_NAME`;
+explicit deployment overrides are applied afterward.
 
 Set `LOOP_NODE_GRAPH_NODE_ENDPOINT=tcp/GPU_HOST:7448` in the **Teleop PC's**
 SSH environment. The relay accepts Vega connections on the Teleop interface
