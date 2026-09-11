@@ -35,15 +35,10 @@
           export UV_DEFAULT_INDEX={{ lookup('ansible.builtin.env', 'UV_DEFAULT_INDEX') | quote }}
           {% endif %}
           python_request={{ dexcontrol_python | quote }}
-          {% if gripper_type == 'sr_gripper' %}
           export UV_PYTHON_INSTALL_DIR={{ (dexcontrol_project_dir ~ '/.python') | quote }}
           uv python install --no-bin "$python_request"
           python_request=$(uv python find --managed-python --system --no-project "$python_request")
-          {% endif %}
-          args=(--python "$python_request")
-          {% if gripper_type != 'default' %}
-          args+=(--extra {{ ('sr-gripper' if gripper_type == 'sr_gripper' else 'robotiq') | quote }})
-          {% endif %}
+          args=(--python "$python_request" --extra robotiq --extra sr-gripper)
           {{ (dexcontrol_project_dir ~ '/install.sh') | quote }} "${args[@]}"
           {{ (dexcontrol_project_dir ~ '/run.sh') | quote }} --help >/dev/null
       environment:
@@ -67,7 +62,6 @@
         SSHPASS: "{{ dexmate_pass }}"
       no_log: true
       changed_when: true
-      when: gripper_type == 'sr_gripper'
       tags: runtime
 
     - name: Configure the Vega startup script
@@ -83,7 +77,17 @@
       changed_when: true
       tags: start
 
-    - name: Start the deployed Vega Robot Node
-      ansible.builtin.import_tasks: start.yml
-      when: dexcontrol_start | bool
-      tags: start
+    - name: Record the installed version on Vega
+      ansible.builtin.command:
+        argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
+        stdin: |
+          set -euo pipefail
+          cat > {{ (dexcontrol_project_dir ~ '/version_info.txt') | quote }} <<'VERSION'
+          branch: {{ dexcontrol_source_version.results[0].stdout }}
+          commit: {{ dexcontrol_source_version.results[1].stdout }}
+          tag: {{ dexcontrol_source_version.results[2].stdout | default('no tag', true) }}
+          VERSION
+      environment:
+        SSHPASS: "{{ dexmate_pass }}"
+      no_log: true
+      changed_when: true

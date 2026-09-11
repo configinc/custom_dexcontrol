@@ -10,39 +10,12 @@ dexcontrol_project_dir: "/home/{{ dexmate_user }}/loop-v2/custom_dexcontrol"
 dexcontrol_tools_dir: "/home/{{ dexmate_user }}/.local/share/dexcontrol-tools"
 dexcontrol_python: "3.12"
 dexcontrol_uv_version: "0.11.28"
-dexcontrol_start: true
 dexcontrol_start_script: "/home/{{ dexmate_user }}/start_vega_robot_node.sh"
 dexcontrol_tmux_session: vega-loop-robot
 dexcontrol_node_id: robot
 dexcontrol_loop_endpoint: ""
 dexcontrol_robot_name: ""
 dexcontrol_zenoh_config: ""
-gripper_type: robotiq
-dexcontrol_left_gripper_port: ""
-dexcontrol_right_gripper_port: ""
-dexcontrol_robot_args:
-  - --use-velocity-feedforward
-  - --interpolation-method
-  - linear
-  - --interpolation-history
-  - "3"
-  - --control-loop-hz
-  - "200"
-  - --filter-type
-  - none
-  - --vel-smoothing-alpha
-  - "1.0"
-  - --hw-correction-alpha
-  - "0.5"
-  - --max-delta-scale
-  - "3.0"
-  - --max-jerk
-  - "0"
-  - --rot-sensitivity
-  - "2.0"
-  - --vel-ratio
-  - "1.0"
-
 dexmate_ssh_argv:
   - sshpass
   - -e

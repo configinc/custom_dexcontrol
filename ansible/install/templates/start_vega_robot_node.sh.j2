@@ -15,26 +15,4 @@ export ZENOH_CONFIG={{ dexcontrol_zenoh_config | quote }}
 [[ -n "${ZENOH_CONFIG:-}" ]] || unset ZENOH_CONFIG
 
 project_dir={{ dexcontrol_project_dir | quote }}
-left_port={{ dexcontrol_left_gripper_port | quote }}
-right_port={{ dexcontrol_right_gripper_port | quote }}
-{% if gripper_type != 'default' %}
-if [[ -z "$left_port" || -z "$right_port" ]]; then
-    mapfile -t ports < <("$project_dir/.venv/bin/python" "$project_dir/scripts/gripper_ports.py" {{ gripper_type | quote }})
-{% raw %}
-    if [[ ${#ports[@]} -ne 2 ]]; then
-{% endraw %}
-        echo 'Set explicit left/right gripper ports when two devices cannot be identified.' >&2
-        exit 1
-    fi
-    left_port=${left_port:-${ports[0]}}
-    right_port=${right_port:-${ports[1]}}
-fi
-{% endif %}
-args=(--node-id {{ dexcontrol_node_id | quote }} --gripper-type {{ gripper_type | quote }})
-{% if gripper_type != 'default' %}
-args+=(--robotiq-comport-left "$left_port" --robotiq-comport-right "$right_port")
-{% endif %}
-{% for argument in dexcontrol_robot_args %}
-args+=({{ argument | quote }})
-{% endfor %}
-exec "$project_dir/run.sh" "${args[@]}"
+exec "$project_dir/run.sh" --node-id {{ dexcontrol_node_id | quote }}

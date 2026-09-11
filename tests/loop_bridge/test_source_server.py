@@ -268,7 +268,7 @@ def test_step_applier_home_raises_on_non_success(
         source_server._StepApplier(service).home()
 
 
-def test_dual_arm_node_preserves_legacy_action_and_observation_pairing(
+def test_action_uses_pre_action_state_and_observations_include_latest_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_server = _import_source_server(monkeypatch)
@@ -313,6 +313,8 @@ def test_dual_arm_node_preserves_legacy_action_and_observation_pairing(
         7.0,
     ]
     assert right.requests[0].pre_action_state["gripper_position"].float_value == 0.5
+    assert published == []
+    node._read_and_publish()
     assert len(published) == 1
     assert published[0]["left.gripper_position"] == 0.5
     assert published[0]["right.gripper_position"] == 0.5
@@ -355,37 +357,6 @@ def test_dual_arm_node_home_uses_both_existing_reset_paths(
     assert [reset.mode for reset in right.resets] == ["home"]
 
 
-# --- dual-arm per-arm gripper comports -------------------------------------
-
-
-def test_dual_arm_comports_distinct_robotiq_ok(monkeypatch: pytest.MonkeyPatch) -> None:
-    source_server = _import_source_server(monkeypatch)
-    kwargs = {"gripper_type": "robotiq", "robotiq_comport": "/dev/ttyUSB0"}
-    left, right = source_server._dual_arm_comports(
-        kwargs, "/dev/ttyUSB1", "/dev/ttyUSB0"
-    )
-    assert (left, right) == ("/dev/ttyUSB1", "/dev/ttyUSB0")
-
-
-def test_dual_arm_comports_same_serial_port_rejected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source_server = _import_source_server(monkeypatch)
-    kwargs = {"gripper_type": "robotiq", "robotiq_comport": "/dev/ttyUSB0"}
-    # Both arms falling back to the same shared port is the footgun → reject.
-    with pytest.raises(ValueError, match="DISTINCT comport"):
-        source_server._dual_arm_comports(kwargs, None, None)
-
-
-def test_dual_arm_comports_non_serial_gripper_unrestricted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source_server = _import_source_server(monkeypatch)
-    # Built-in (non-serial) grippers share no port → same/empty comport is fine.
-    kwargs = {"gripper_type": "default"}
-    assert source_server._dual_arm_comports(kwargs, None, None) == (None, None)
-
-
 class _InputBinding:
     dropped_count = 0
 
@@ -404,8 +375,8 @@ def test_lifecycle_opens_on_start_pauses_and_reuses_then_closes(monkeypatch):
     opened = []
 
     @contextmanager
-    def factory():
-        opened.append(True)
+    def factory(config):
+        opened.append(config)
         try:
             yield [("left", left), ("right", right)]
         finally:
@@ -418,7 +389,7 @@ def test_lifecycle_opens_on_start_pauses_and_reuses_then_closes(monkeypatch):
     try:
         runtime.configure({})
         runtime.start({"action_command": _InputBinding()})
-        assert opened == [True]
+        assert len(opened) == 1
         assert not left.paused and not right.paused
         left.queued_commands.append("old target")
         runtime.stop()
@@ -427,11 +398,55 @@ def test_lifecycle_opens_on_start_pauses_and_reuses_then_closes(monkeypatch):
         assert not left.closed and not right.closed
         runtime.configure({})
         runtime.start({"action_command": _InputBinding()})
-        assert opened == [True]
+        assert len(opened) == 1
         assert not left.queued_commands
     finally:
         runtime.shutdown()
     assert left.closed and right.closed
+
+
+def test_reconfigure_reopens_hardware_with_new_gripper_and_control_settings(
+    monkeypatch,
+):
+    from loop_node.runtime import NodeRuntime
+
+    module = _import_source_server(monkeypatch)
+    created = []
+
+    def make_service(**kwargs):
+        service = _FakeService()
+        service._robot = types.SimpleNamespace(robot=object())
+        created.append((kwargs, service))
+        return service
+
+    monkeypatch.setattr(module, "_LockedStepService", make_service)
+    node = module.VegaRobotNode(service_factory=module._open_arm_services)
+    runtime = NodeRuntime(node)
+    try:
+        runtime.configure({})
+        assert created == []
+        runtime.start({"action_command": _InputBinding()})
+        runtime.stop()
+        runtime.configure(
+            {
+                "gripper_type": "sr_gripper",
+                "left_gripper_device": "enp1s0",
+                "right_gripper_device": "enp2s0",
+                "control_hz": 30,
+            }
+        )
+        assert len(created) == 2
+        runtime.start({"action_command": _InputBinding()})
+        assert all(service.closed for _, service in created[:2])
+        left, right = created[2:]
+        assert left[0]["robotiq_comport"] == "enp1s0"
+        assert right[0]["robotiq_comport"] == "enp2s0"
+        assert left[0]["gripper_type"] == right[0]["gripper_type"] == "sr_gripper"
+        assert left[0]["control_hz"] == right[0]["control_hz"] == 30
+        assert right[0]["robot"] is left[1]._robot.robot
+    finally:
+        runtime.shutdown()
+    assert all(service.closed for _, service in created)
 
 
 @pytest.mark.parametrize("status", ["HOME_FAILED", ""])
@@ -488,7 +503,7 @@ def test_right_initialization_failure_closes_left(monkeypatch):
 
     monkeypatch.setattr(module, "_LockedStepService", make_service)
     with pytest.raises(RuntimeError, match="right initialization failed"):
-        with module._open_arm_services():
+        with module._open_arm_services(module.VegaRobotNodeConfig()):
             pytest.fail("Initialization should fail before yielding services")
     assert left.closed
 
@@ -560,7 +575,7 @@ def test_action_failure_pauses_both_arms_without_dispatching_the_other(monkeypat
         runtime.shutdown()
 
 
-def test_heartbeat_failure_can_pause_its_own_worker(monkeypatch):
+def test_observation_failure_can_pause_its_own_worker(monkeypatch):
     import threading
 
     from loop_node.runtime import NodeRuntime
@@ -579,7 +594,7 @@ def test_heartbeat_failure_can_pause_its_own_worker(monkeypatch):
 
     right.pause = pause
     try:
-        runtime.configure({"heartbeat_frequency_hz": 100})
+        runtime.configure({"observation_frequency_hz": 100})
         runtime.start({"action_command": _InputBinding()})
         left._create_observation = lambda: (_ for _ in ()).throw(
             RuntimeError("disconnected")

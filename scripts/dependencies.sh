@@ -44,11 +44,11 @@ prepare_dependency() {
     case "$1" in
         loop-sdk)
             fetch_source loop-sdk git@github.com:configinc/loop-sdk.git \
-                d13afe79c99fec0f0f25b3de6a7b6f0f6ca718cb
+                cab0a54b3cb3d1b00b9676d5742eb5ca1db57ea5
             ;;
         loop)
             fetch_source loop git@github.com:configinc/loop.git \
-                de497cfa25f3d029592815f7b068141c8ab80b03 packages/loop-node
+                a3ef49573c7c58ed98c80b908995bc15a208ca27 packages/loop-node
             ;;
         *)
             printf 'Unknown dependency: %s\n' "$1" >&2

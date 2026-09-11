@@ -10,7 +10,6 @@
         that:
           - dexcontrol_project_dir.startswith('/') and dexcontrol_project_dir != '/'
           - dexcontrol_staging_dir.startswith('/') and dexcontrol_staging_dir != '/'
-          - gripper_type in ['default', 'robotiq', 'sr_gripper']
       tags: always
 
     - name: Install gateway transfer tools
@@ -34,13 +33,11 @@
             python3 -m venv "$tools_dir"
           fi
           "$tools_dir/bin/python" -m pip install {{ ('uv==' ~ dexcontrol_uv_version) | quote }}
-          {% if gripper_type == 'robotiq' %}
           sudo -n usermod -aG dialout {{ dexmate_user | quote }}
           printf '%s\n' 'SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", MODE="0660", GROUP="dialout"' | \
             sudo -n tee /etc/udev/rules.d/99-dexcontrol-gripper.rules >/dev/null
           sudo -n udevadm control --reload-rules
           sudo -n udevadm trigger --subsystem-match=tty
-          {% endif %}
       environment:
         SSHPASS: "{{ dexmate_pass }}"
       no_log: true

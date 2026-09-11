@@ -1,9 +1,11 @@
 # Vega deployment
 
-Data Studio Layout installs Loop under `~/loop-v2/` without starting it.
-Use **Loop v2 → Restart Robot/UTI** to stop the existing Robot, Inference,
-and Recorder and start the Loop services. To return, use **Stop Robot/UTI**,
-then restart the existing services. Their source directories are kept separately.
+Data Studio Layout's **Loop v2** mode installs under `~/loop-v2/`.
+Deployment never stops or starts services. Stop Loop Robot/UTI before updating an
+existing Loop installation.
+
+- To use Loop: **Deploy Loop Nodes → Stop Existing Services → Start / Restart Robot/UTI**.
+- To return: **Stop Robot/UTI**, then use the existing Robot, Inference and Recorder restart buttons.
 
 The deployment server copies this checkout through the Teleop PC to the Vega PC.
 Vega runs one dual-arm Loop Robot Node in a uv environment. UTI runs separately.
@@ -22,28 +24,26 @@ existing deployment. Override the Vega connection settings in inventory.
 | `dexmate_ip`, `dexmate_user`, `dexmate_pass` | Existing Vega connection settings; traffic passes through the Teleop PC |
 | `dexcontrol_python` | `3.12`; the pinned OMPL dependency has no Python 3.13 wheel |
 | `dexcontrol_project_dir` | `/home/<dexmate_user>/loop-v2/custom_dexcontrol` on Vega |
-| `dexcontrol_start` | `true`; set `false` to install and configure without starting |
 | `dexcontrol_node_id` | `robot` |
 | `dexcontrol_loop_endpoint` | Overrides `LOOP_NODE_GRAPH_NODE_ENDPOINT` in the launcher; empty inherits Vega's SSH environment |
 | `dexcontrol_robot_name`, `dexcontrol_zenoh_config` | Optional DexComm settings, separate from the Loop connection |
-| `gripper_type` | `robotiq`, `sr_gripper`, or `default` |
-| `dexcontrol_left_gripper_port`, `dexcontrol_right_gripper_port` | Prefer explicit serial paths or EtherCAT interfaces; otherwise the launcher discovers exactly two devices |
-| `dexcontrol_robot_args` | Existing controller tuning, including linear interpolation and the 200 Hz control loop |
 
 The Loop endpoint must be reachable **from Vega**, which can have a different
 network route from the Teleop gateway. The launcher registers in IDLE; Loop Start
-opens the robot control resources. Gripper discovery belongs to launcher setup.
+opens the robot control resources. Gripper devices and control rates come from
+[Node Config](../src/loop_bridge/README.md#node-config). Unit Config is not read.
 
 `DOCKER_GITHUB_PAT` on the deployment server is passed transiently to the installer
 for private SDK/Node downloads. Without it, Vega needs GitHub SSH access. An optional
 `UV_DEFAULT_INDEX` is also forwarded when a private Python package index is used.
 Neither is written into the startup script or Git configuration.
 
-SR deployment installs a dedicated Python under `.python` for EtherCAT permissions;
-it does not change permissions on a shared or system interpreter.
+Deployment installs both Robotiq and SR drivers, serial permissions, and a dedicated
+Python under `.python` with EtherCAT permissions. It does not change permissions
+on a shared or system interpreter. Hardware selection happens at Configure.
 
 Sync preserves `.venv`, `.python`, `third_party`, environment files, and `unit_config.json`.
-It stops the managed `vega-loop-robot` tmux session before updating source.
+A running `vega-loop-robot` session blocks deployment; stop Robot/UTI first.
 The legacy `robot-server` session is separate. Deployment also saves the robot SSH
 connection in `~/loop-v2/vega-connection.json` on the Teleop PC (owner access only),
 so Service Controls can stop Vega without downloading a repository.

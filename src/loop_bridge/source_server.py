@@ -24,7 +24,6 @@ import signal
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
-from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Literal, Sequence, cast
 
 from loop_sdk import (
@@ -35,7 +34,7 @@ from loop_sdk import (
     RobotNode,
     TensorValue,
 )
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from dexcontrol.core.robotenv_vega import server as _vega_server
 from loop_bridge.contracts import (
@@ -55,35 +54,62 @@ LOGGER = logging.getLogger("loop_bridge.vega")
 
 DEFAULT_ACTION_SPACE = "target_cartesian_delta"
 
-# The installed dexcontrol build we run against. Advertised on ``robot-obs`` so a
-# recording pins the robot-server version it was captured with (mirrors the HW
-# ``robot_firmware_version`` axis, for the software side). Resolved from the
-# installed package metadata so a release automatically flows through — no
-# separate manual bump. Falls back to a sentinel when the package is not
-# installed (e.g. running from an editable checkout without a wheel resolve).
-try:
-    _ROBOT_SERVER_VERSION = f"dexcontrol-{version('dexcontrol')}"
-except PackageNotFoundError:
-    _ROBOT_SERVER_VERSION = "dexcontrol-unknown"
-# Fallback observation rate when the action lane is idle. Action-paired samples
-# retain the legacy pre-apply snapshot semantics.
-DEFAULT_HEARTBEAT_HZ = 20.0
-
 
 class VegaRobotNodeConfig(BaseModel):
-    """Graph-stored counterpart of the legacy negotiated RobotConfig."""
+    """Hardware settings supplied by the Cell Config before Start."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
-    action_space: Literal["target_cartesian_delta"] = DEFAULT_ACTION_SPACE
-    gripper_action_space: Literal["", "position"] = ""
-    heartbeat_frequency_hz: float = Field(default=DEFAULT_HEARTBEAT_HZ, gt=0)
-    gripper_type: str = "default"
-    finger_type: str = "default"
-    robot_type: str = "vega_1"
-    robot_firmware_version: str = "v0.0.0"
-    robot_server_version: str = _ROBOT_SERVER_VERSION
-    teleop_server_version: str = ""
+    control_hz: int = Field(default=20, gt=0)
+    observation_frequency_hz: float = Field(default=20.0, gt=0)
+    gripper_type: Literal["default", "robotiq", "sr_gripper"] = "robotiq"
+    left_gripper_device: str = Field(
+        default="/dev/ttyUSB0",
+        min_length=1,
+        description="Left Robotiq serial path or SR EtherCAT interface; ignored for built-in grippers.",
+    )
+    right_gripper_device: str = Field(
+        default="/dev/ttyUSB1",
+        min_length=1,
+        description="Right Robotiq serial path or SR EtherCAT interface; ignored for built-in grippers.",
+    )
+
+    @model_validator(mode="after")
+    def _distinct_gripper_devices(self) -> VegaRobotNodeConfig:
+        if (
+            self.gripper_type != "default"
+            and self.left_gripper_device == self.right_gripper_device
+        ):
+            raise ValueError(
+                "Left and right grippers must use different devices/interfaces"
+            )
+        if self.gripper_type == "sr_gripper" and any(
+            "/" in device
+            for device in (self.left_gripper_device, self.right_gripper_device)
+        ):
+            raise ValueError(
+                "SR grippers require EtherCAT interface names, not serial device paths"
+            )
+        return self
+
+
+# Preserve the deployed controller tuning; only Node Config fields vary per cell.
+_SERVICE_DEFAULTS: dict[str, Any] = {
+    "robot_model": "vega_1",
+    "frame_type": "vega_mobile_base",
+    "ik_solver_type": "pink",
+    "use_velocity_feedforward": True,
+    "interpolation_method": "linear",
+    "interpolation_history": 3,
+    "control_loop_hz": 200,
+    "filter_type": "none",
+    "vel_smoothing_alpha": 1.0,
+    "hw_correction_alpha": 0.5,
+    "max_delta_scale": 3.0,
+    "max_jerk": 0.0,
+    "rot_sensitivity": 2.0,
+    "vel_ratio": 1.0,
+}
 
 
 class _BusStepContext:
@@ -198,10 +224,7 @@ class _StepApplier:
             action_space=action_space,
             gripper_action_space=gripper_action_space,
         )
-        # Forward the loop-sdk-captured pre-apply obs into the Step RPC so the
-        # server dispatches against the same snapshot the recorder will publish
-        # for this action. Skipped when the caller didn't pre-read (server falls
-        # back to its own state read).
+        # Both arms apply against the snapshot captured before this action.
         if pre_apply_obs is not None:
             for key, value in _encode_pre_action_state(pre_apply_obs).items():
                 request.pre_action_state[key].CopyFrom(value)
@@ -295,7 +318,9 @@ class _LockedStepService(_vega_server.VegaRobotEnvService):
 
 
 ArmServices = Sequence[tuple[str, Any]]
-ServiceFactory = Callable[[], contextlib.AbstractContextManager[ArmServices]]
+ServiceFactory = Callable[
+    [VegaRobotNodeConfig], contextlib.AbstractContextManager[ArmServices]
+]
 
 
 class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
@@ -310,6 +335,8 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
         if (arm_services is None) == (service_factory is None):
             raise ValueError("Provide arm services or a service factory")
         self._service_factory = service_factory
+        self._config: VegaRobotNodeConfig | None = None
+        self._opened_config: VegaRobotNodeConfig | None = None
         self._resources = contextlib.ExitStack()
         self._arm_services: tuple[tuple[str, Any], ...] = ()
         self._appliers: dict[str, _StepApplier] = {}
@@ -318,12 +345,12 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
             for _arm, service in arm_services:
                 self._resources.callback(service.close)
         self._device_lock = threading.RLock()
-        self._heartbeat_stop = threading.Event()
-        self._heartbeat_thread: threading.Thread | None = None
-        self._heartbeat_hz = DEFAULT_HEARTBEAT_HZ
+        self._observation_stop = threading.Event()
+        self._observation_thread: threading.Thread | None = None
+        self._observation_hz = 20.0
         self._action_space = DEFAULT_ACTION_SPACE
-        self._gripper_action_space = ""
-        self._last_publish_ns = 0
+        self._gripper_action_space = "position"
+        self._latest_action_info: dict[str, Any] = {}
         self._active = False
         super().__init__(
             config_type=VegaRobotNodeConfig,
@@ -350,30 +377,44 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
         self._appliers = {arm: _StepApplier(service) for arm, service in services}
 
     def _on_configure(self, config: VegaRobotNodeConfig) -> None:
-        self._action_space = config.action_space
-        self._gripper_action_space = config.gripper_action_space
-        self._heartbeat_hz = config.heartbeat_frequency_hz
+        self._config = config
+        self._observation_hz = config.observation_frequency_hz
 
     def _on_start(self) -> None:
+        config = self._config
+        if config is None:
+            raise RuntimeError("Configure must succeed before Start")
         try:
             with self._device_lock:
+                if (
+                    self._service_factory is not None
+                    and self._opened_config is not None
+                ):
+                    previous = self._opened_config.model_dump(
+                        exclude={"observation_frequency_hz"}
+                    )
+                    current = config.model_dump(exclude={"observation_frequency_hz"})
+                    if previous != current:
+                        self._close_services()
                 if not self._arm_services:
                     if self._service_factory is None:
                         raise RuntimeError("Arm services are closed")
                     self._set_services(
-                        self._resources.enter_context(self._service_factory())
+                        self._resources.enter_context(self._service_factory(config))
                     )
+                self._opened_config = config
+                self._latest_action_info = {}
                 for _arm, service in self._arm_services:
                     service.resume()
-                self._heartbeat_stop.clear()
+                self._observation_stop.clear()
                 self._active = True
                 self._read_and_publish()
-                self._heartbeat_thread = threading.Thread(
-                    target=self._heartbeat_loop,
-                    name="vega-robot-observation-heartbeat",
+                self._observation_thread = threading.Thread(
+                    target=self._observation_loop,
+                    name="vega-robot-observation",
                     daemon=True,
                 )
-                self._heartbeat_thread.start()
+                self._observation_thread.start()
         except BaseException:
             self._on_shutdown()
             raise
@@ -381,9 +422,9 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
     def _on_stop(self) -> None:
         with self._device_lock:
             self._active = False
-            self._heartbeat_stop.set()
-            thread = self._heartbeat_thread
-            self._heartbeat_thread = None
+            self._observation_stop.set()
+            thread = self._observation_thread
+            self._observation_thread = None
         errors: list[Exception] = []
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2.0)
@@ -401,15 +442,19 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
     def _on_reset_fault(self) -> None:
         self._on_stop()
 
+    def _close_services(self) -> None:
+        try:
+            self._resources.close()
+        finally:
+            self._arm_services = ()
+            self._appliers = {}
+            self._opened_config = None
+
     def _on_shutdown(self) -> None:
         try:
             self._on_stop()
         finally:
-            try:
-                self._resources.close()
-            finally:
-                self._arm_services = ()
-                self._appliers = {}
+            self._close_services()
 
     def _fault(self, code: str, error: Exception) -> None:
         self.report_fault(code, str(error))
@@ -436,17 +481,13 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
         elif self.status.lifecycle is LifecycleState.FAULT:
             self._on_stop()
 
-    def _heartbeat_loop(self) -> None:
-        period_s = 1.0 / self._heartbeat_hz
-        grace_ns = round(2.0 * period_s * 1_000_000_000)
-        while not self._heartbeat_stop.wait(period_s):
+    def _observation_loop(self) -> None:
+        period_s = 1.0 / self._observation_hz
+        while not self._observation_stop.wait(period_s):
             try:
                 with self._device_lock:
                     if not self._active:
                         return
-                    idle_ns = time.monotonic_ns() - self._last_publish_ns
-                    if idle_ns < grace_ns:
-                        continue
                     self._read_and_publish()
             except Exception as error:
                 self._fault("robot_observation_failed", error)
@@ -461,21 +502,21 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
 
     def _read_and_publish(self) -> None:
         _observations, payload = self._read_observations()
+        payload.update(self._latest_action_info)
         self._publish_observation(payload)
 
     def _publish_observation(self, payload: Mapping[str, Any]) -> None:
-        # Match the former LoopRobotClient stamp: wall-clock capture time on the
-        # wire, while heartbeat scheduling remains on the monotonic clock.
+        # Samples carry wall-clock capture time; scheduling uses a monotonic clock.
         self.publish_observation(payload, timestamp_ns=time.time_ns())
-        self._last_publish_ns = time.monotonic_ns()
 
     def _apply_action(self, message: ReceivedMessage) -> None:
-        """Read once before dispatching both arms, then publish that observation."""
+        """Apply against one pre-action state; retain diagnostics for the next observation."""
         try:
             with self._device_lock:
                 if not self._active:
                     return
-                observations, payload = self._read_observations()
+                observations, _payload = self._read_observations()
+                payload: dict[str, Any] = {}
                 actions = _decode_bimanual_action(message)
                 payload["received_action"] = float64_tensor(
                     (*actions[LEFT_ARM], *actions[RIGHT_ARM]), shape=(14,)
@@ -488,7 +529,7 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
                         pre_apply_obs=observation_state(observations[arm]),
                     )
                     payload.update(_action_info_payload(arm, action_info))
-                self._publish_observation(payload)
+                self._latest_action_info = payload
         except Exception as error:
             self._fault("robot_action_failed", error)
             raise
@@ -502,7 +543,7 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
                     raise RuntimeError("Vega Robot Node is not active")
                 for applier in self._appliers.values():
                     applier.home()
-                self._read_and_publish()
+                self._latest_action_info = {}
         except Exception as error:
             self._fault("robot_home_failed", error)
             raise
@@ -539,45 +580,15 @@ def _action_info_payload(arm: str, action_info: Mapping[str, Any]) -> dict[str, 
     return payload
 
 
-_SERIAL_GRIPPERS = ("robotiq", "sr_gripper")
-
-
-def _dual_arm_comports(
-    service_kwargs: dict[str, Any],
-    left_robotiq_comport: str | None,
-    right_robotiq_comport: str | None,
-) -> tuple[str | None, str | None]:
-    """Resolve each arm's gripper comport for dual-arm, rejecting the same-port footgun.
-
-    Per-arm overrides win; both fall back to the shared ``robotiq_comport``. A serial
-    gripper (robotiq/sr_gripper) is one physical device per port — two arms on the
-    SAME port would corrupt comms, so that is rejected. Distinct ports are fine: each
-    arm's VegaRobot opens its own gripper independent of the shared arm hardware.
-    """
-    base = service_kwargs.get("robotiq_comport")
-    left = left_robotiq_comport or base
-    right = right_robotiq_comport or base
-    gripper = service_kwargs.get("gripper_type", "default")
-    if gripper == "default":
-        gripper = service_kwargs.get("hand_type", "default")
-    if gripper in _SERIAL_GRIPPERS and left == right:
-        raise ValueError(
-            f"dual-arm with a serial gripper ({gripper!r}) needs a DISTINCT comport per arm; "
-            f"both arms resolved to {left!r}. Pass --robotiq-comport-left / --robotiq-comport-right."
-        )
-    return left, right
-
-
 @contextlib.contextmanager
-def _open_arm_services(
-    *,
-    left_robotiq_comport: str | None = None,
-    right_robotiq_comport: str | None = None,
-    **service_kwargs: Any,
-) -> Iterator[ArmServices]:
-    left_port, right_port = _dual_arm_comports(
-        service_kwargs, left_robotiq_comport, right_robotiq_comport
-    )
+def _open_arm_services(config: VegaRobotNodeConfig) -> Iterator[ArmServices]:
+    service_kwargs = {
+        **_SERVICE_DEFAULTS,
+        "gripper_type": config.gripper_type,
+        "control_hz": config.control_hz,
+    }
+    left_port = config.left_gripper_device
+    right_port = config.right_gripper_device
     with contextlib.ExitStack() as resources:
         left = _LockedStepService(
             arm_side="left", **{**service_kwargs, "robotiq_comport": left_port}
@@ -596,22 +607,12 @@ def serve_dual_arm(
     *,
     node_id: str,
     connection: NodeConnectionConfig,
-    left_robotiq_comport: str | None = None,
-    right_robotiq_comport: str | None = None,
-    **service_kwargs: Any,
 ) -> None:
     """Register in IDLE; the first Graph Start opens one shared Vega connection."""
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    _dual_arm_comports(service_kwargs, left_robotiq_comport, right_robotiq_comport)
-    node = VegaRobotNode(
-        service_factory=lambda: _open_arm_services(
-            left_robotiq_comport=left_robotiq_comport,
-            right_robotiq_comport=right_robotiq_comport,
-            **service_kwargs,
-        )
-    )
+    node = VegaRobotNode(service_factory=_open_arm_services)
     stop_requested = threading.Event()
 
     def request_stop(_signum: int, _frame: Any) -> None:
