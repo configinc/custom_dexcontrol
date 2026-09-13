@@ -1,0 +1,7 @@
+---
+- name: Stop the deployed repository services
+  ansible.builtin.command:
+    argv: ["{{ dexcontrol_staging_dir }}/loop-service.sh", stop]
+  environment:
+    LOOP_NODE_GRAPH_NODE_ENDPOINT: "{{ ansible_facts['env'].get('LOOP_NODE_GRAPH_NODE_ENDPOINT', '') }}"
+  changed_when: true

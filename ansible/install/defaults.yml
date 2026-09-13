@@ -1,0 +1,33 @@
+---
+dexmate_ip: "192.168.5.20"
+dexmate_user: dexmate
+# Existing deployment credential; can be overridden by inventory or extra vars.
+dexmate_pass: "hello-dex"
+
+dexcontrol_source_dir: "{{ (playbook_dir ~ '/../..') | realpath }}"
+dexcontrol_staging_dir: "{{ ansible_facts['user_dir'] }}/loop-v2/custom_dexcontrol"
+dexcontrol_project_dir: "/home/{{ dexmate_user }}/loop-v2/custom_dexcontrol"
+dexcontrol_tools_dir: "/home/{{ dexmate_user }}/.local/share/dexcontrol-tools"
+dexcontrol_python: "3.12"
+dexcontrol_uv_version: "0.11.28"
+dexcontrol_start_script: "/home/{{ dexmate_user }}/start_vega_robot_node.sh"
+dexcontrol_tmux_session: vega-loop-robot
+dexcontrol_node_id: robot
+# GPU endpoint override for the Teleop relay; empty reads its environment.
+dexcontrol_loop_endpoint: ""
+dexcontrol_relay_tmux_session: vega-loop-relay
+dexcontrol_relay_port: 7448
+# Empty detects the Teleop address used to reach dexmate_ip.
+dexcontrol_relay_bind_address: ""
+dexcontrol_robot_name: ""
+dexcontrol_zenoh_config: ""
+dexmate_ssh_argv:
+  - sshpass
+  - -e
+  - ssh
+  - -T
+  - -o
+  - StrictHostKeyChecking=accept-new
+  - -o
+  - ConnectTimeout=10
+  - "{{ dexmate_user }}@{{ dexmate_ip }}"

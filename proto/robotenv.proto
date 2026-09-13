@@ -152,6 +152,14 @@ message StepRequest {
     // Gripper action space: "position" (absolute) or "velocity" (delta)
     // If not specified, inferred from action_space (velocity actions → velocity, otherwise position)
     string gripper_action_space = 3;
+
+    // Pre-apply robot state captured by the caller BEFORE dispatching this
+    // action. When present, the server dispatches against this snapshot
+    // (skipping its own internal state read) so the caller and the server
+    // share a single source of truth for the (state, action) pair recorded
+    // by downstream pipelines. When empty (legacy clients / direct RPC),
+    // the server falls back to reading state internally.
+    map<string, Value> pre_action_state = 4;
 }
 
 message StepResponse {

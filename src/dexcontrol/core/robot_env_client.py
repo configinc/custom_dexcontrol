@@ -19,21 +19,14 @@ Usage:
     obs_dict, images = env.get_observation()
 """
 
-import sys
-from pathlib import Path
-from typing import Dict, Any, Optional
-import numpy as np
-import grpc
 import time
+from typing import Any, Dict, Optional
 
-# Add proto directory to path - adjusted for custom_dexcontrol structure
-_current_file = Path(__file__).resolve()
-_proto_path = _current_file.parents[3] / "proto"  # /custom_dexcontrol/proto
-if str(_proto_path) not in sys.path:
-    sys.path.insert(0, str(_proto_path))
+import grpc
+import numpy as np
 
-from proto import robotenv_pb2
-from proto import robotenv_pb2_grpc
+from dexcontrol.core.robotenv_vega.proto import robotenv_pb2, robotenv_pb2_grpc
+
 
 class _RobotProxy:
     # Gains applied by teleop master before emitting cartesian_velocity.
@@ -60,8 +53,8 @@ class _RobotProxy:
     def __init__(self, control_hz: int = 20):
         # Try to import robot-specific IK solver if available
         try:
-            from core.robot_ik.robot_ik_solver import RobotIKSolver
             from core.misc.transformations import add_poses
+            from core.robot_ik.robot_ik_solver import RobotIKSolver
             self._ik_solver = RobotIKSolver(control_hz=control_hz)
             self._add_poses = add_poses
         except ImportError:

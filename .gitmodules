@@ -1,6 +1,6 @@
 [submodule "robotiq_2f_85_controller"]
 	path = robotiq_2f_85_controller
-	url = https://github.com/configint/robotiq_2f_85_controller.git
+	url = git@github.com:configinc/robotiq_2f_85_controller.git
 [submodule "sr_gripper_controller"]
 	path = sr_gripper_controller
-	url = https://github.com/configint/sr_gripper_controller.git
+	url = git@github.com:configinc/sr_gripper_controller.git

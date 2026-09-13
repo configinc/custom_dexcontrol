@@ -29,12 +29,11 @@ dependencies = [
     "rich",
     "dexcomm>=0.6.0rc2,<0.7.0",
     "dexbot-utils>=0.5.0",
-    "grpcio",
-    "protobuf",
+    "grpcio>=1.81.1",
+    "protobuf>=6.33.5",
     "scipy",
     "pytransform3d",
     "dexmotion",
-    "dualsense-controller",
     "proxsuite"
 ]
 requires-python = ">=3.10,<=3.13.11"
@@ -57,9 +56,19 @@ docs = [
     "markitdown[all]>=0.1.0",
 ]
 example = [
+    "dualsense-controller",
     "matplotlib>=3.8.0",
     "tyro",
 ]
+loop = [
+    "loop-sdk>=0.4.2.dev0",
+    "loop-node>=0.1.0,<0.2.0",
+]
+robotiq = ["robotiq-2f-85-controller==0.1.0"]
+sr-gripper = ["sr-gripper-controller"]
+
+[project.scripts]
+dexcontrol-loop-robot-node = "loop_bridge.__main__:main"
 
 [project.urls]
 Repository = "https://github.com/dexmate-ai/dexcontrol"
@@ -85,6 +94,24 @@ ignore = ["F722", "E501"]
 [tool.ruff.lint.per-file-ignores]
 "**/__init__.py" = ["F401"]
 
+[tool.uv.sources]
+loop-sdk = { path = "third_party/loop-sdk", editable = true }
+loop-node = { path = "third_party/loop/packages/loop-node", editable = true }
+robotiq-2f-85-controller = { path = "robotiq_2f_85_controller", editable = true }
+sr-gripper-controller = { path = "sr_gripper_controller", editable = true }
+
+[tool.uv]
+# ruckig 0.17.3 still uses the cmake.targets setting removed in 0.10.
+build-constraint-dependencies = ["scikit-build-core==0.9.10"]
+# Match Vega's existing runtime: newer viser keeps URDF viewer dependencies optional.
+constraint-dependencies = ["viser==1.0.30"]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64' and python_version == '3.12'",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dexcontrol", "src/loop_bridge"]
+
 [tool.pyright]
-include = ["src/dexcontrol/core/", "src/dexcontrol/config/", "examples/"]
+include = ["src/dexcontrol/core/", "src/dexcontrol/config/", "src/loop_bridge/", "examples/"]
 typeCheckingMode = "standard"

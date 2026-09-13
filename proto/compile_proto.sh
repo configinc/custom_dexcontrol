@@ -1,29 +1,10 @@
-#!/bin/bash
-# Compile robotenv.proto to Python code
-#
-# Required packages (must be compatible with protobuf==3.20.1):
-#   pip install "grpcio>=1.44.0,<1.49.0" "grpcio-tools>=1.44.0,<1.49.0" "protobuf==3.20.1"
-#
-# NOTE: protobuf 3.20.1 is required for compatibility with polymetis (Franka).
-#       grpcio-tools >= 1.50.0 requires protobuf >= 4.21.6 and is NOT compatible.
+#!/usr/bin/env bash
+set -euo pipefail
 
-set -e
-
-echo "Compiling robotenv.proto..."
-
-python -m grpc_tools.protoc \
-    -I./proto \
-    --python_out=./proto \
-    --grpc_python_out=./proto \
-    proto/robotenv.proto
-
-echo "✓ Generated proto/robotenv_pb2.py"
-echo "✓ Generated proto/robotenv_pb2_grpc.py"
-
-# Fix imports in generated files
-echo "Fixing imports..."
-sed -i 's/^import robotenv_pb2/from proto import robotenv_pb2/' proto/robotenv_pb2_grpc.py
-echo "✓ Fixed imports in robotenv_pb2_grpc.py"
-
-echo ""
-echo "Protobuf compilation complete!"
+project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+output="$project_dir/src/dexcontrol/core/robotenv_vega/proto"
+# Install grpcio-tools compatible with the runtime before regenerating.
+python -m grpc_tools.protoc -I"$project_dir/proto" \
+    --python_out="$output" --grpc_python_out="$output" \
+    "$project_dir/proto/robotenv.proto"
+sed -i 's/^import robotenv_pb2/from dexcontrol.core.robotenv_vega.proto import robotenv_pb2/' "$output/robotenv_pb2_grpc.py"
