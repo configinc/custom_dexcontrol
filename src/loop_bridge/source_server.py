@@ -326,6 +326,7 @@ class _ObservationSnapshot:
     timestamp_ns: int
     states: dict[str, dict[str, Any]]
     action_info: dict[str, Any]
+    captured_at_ns: int
 
 
 class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
@@ -351,6 +352,9 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
                 self._resources.callback(service.close)
         self._device_lock = threading.RLock()
         self._tick_lock = threading.Lock()
+        self._publish_lock = threading.Lock()
+        self._homing = threading.Event()
+        self._home_completed_at_ns = 0
         self._worker_stop = threading.Event()
         self._worker_error: tuple[str, Exception] | None = None
         self._control_thread: threading.Thread | None = None
@@ -518,6 +522,7 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
                             for arm, service in self._arm_services
                         },
                         action_info=self._latest_action_info,
+                        captured_at_ns=time.monotonic_ns(),
                     )
                     for _arm, service in self._arm_services:
                         if self._worker_stop.is_set():
@@ -566,13 +571,26 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
             state = service.observation_from_state(snapshot.states[arm])
             payload.update(state_payload(state, arm))
         payload.update(snapshot.action_info)
-        self.publish_observation(payload, timestamp_ns=snapshot.timestamp_ns)
+        with self._publish_lock:
+            if (
+                self._homing.is_set()
+                or snapshot.captured_at_ns < self._home_completed_at_ns
+            ):
+                return
+            self.publish_observation(payload, timestamp_ns=snapshot.timestamp_ns)
 
     def _apply_action(self, message: ReceivedMessage) -> None:
         """Apply against one pre-action state; retain diagnostics for the next observation."""
+        # Drain callbacks during Home instead of parking them behind the device lock.
+        if self._homing.is_set():
+            return
         try:
             with self._device_lock:
-                if not self._active:
+                if (
+                    not self._active
+                    or self._homing.is_set()
+                    or message.received_at_ns < self._home_completed_at_ns
+                ):
                     return
                 observations = self._read_observations()
                 payload: dict[str, Any] = {}
@@ -596,17 +614,23 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
     def _handle_command(self, command: RobotCommand) -> None:
         if command is not RobotCommand.HOME:
             raise ValueError(f"unsupported robot command: {command.value!r}")
+        self._homing.set()
         try:
             with self._device_lock:
                 if not self._active:
                     raise RuntimeError("Vega Robot Node is not active")
-                with self._tick_lock:
+                with self._tick_lock, self._publish_lock:
                     for applier in self._appliers.values():
                         applier.home()
                     self._latest_action_info = {}
+                    with self._snapshot_ready:
+                        self._pending_snapshot = None
+                    self._home_completed_at_ns = time.monotonic_ns()
         except Exception as error:
             self._fault("robot_home_failed", error)
             raise
+        finally:
+            self._homing.clear()
 
 
 def _decode_bimanual_action(message: ReceivedMessage) -> dict[str, list[float]]:

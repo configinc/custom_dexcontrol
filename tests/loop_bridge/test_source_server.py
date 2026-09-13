@@ -5,14 +5,19 @@ from __future__ import annotations
 import importlib
 import sys
 import threading
+import time
 import types
 from contextlib import contextmanager
 
 import pytest
 from conftest import make_observation
-from loop_sdk import ReceivedMessage
+from loop_sdk import ReceivedMessage, RobotCommand
 
-from loop_bridge.contracts import float64_tensor, float64_values
+from loop_bridge.contracts import (
+    ROBOT_OBSERVATION_CONTRACT,
+    float64_tensor,
+    float64_values,
+)
 
 
 class _ProtoMap(dict[str, object]):
@@ -332,6 +337,7 @@ def test_action_uses_pre_action_state_and_observations_include_latest_diagnostic
             123,
             {"left": left.capture_state(), "right": right.capture_state()},
             node._latest_action_info,
+            time.monotonic_ns(),
         )
     )
     assert len(published) == 1
@@ -716,16 +722,48 @@ def test_control_ticks_continue_without_targets_or_waiting_for_publication(monke
 
 
 def test_home_excludes_interpolation_and_control_resumes_after_both_arms(monkeypatch):
+    from loop_node import Message, OverflowPolicy, PolledInputPort
     from loop_node.runtime import NodeRuntime
+    from loop_node.testing import InMemoryRequest, InMemoryStream
 
     module = _import_source_server(monkeypatch)
+    from loop_bridge.source_server import _ObservationSnapshot
+
     left, right = _FakeService(), _FakeService()
     node = module.VegaRobotNode([("left", left), ("right", right)])
     runtime = NodeRuntime(node)
+    actions, observations = InMemoryStream(), InMemoryStream()
+    commands = InMemoryRequest()
+    output = actions.output_binding()
+    captured = PolledInputPort(
+        "captured",
+        ROBOT_OBSERVATION_CONTRACT,
+        capacity=100,
+        overflow=OverflowPolicy.DROP_OLDEST,
+    )
+    captured.bind(observations.polled_input_binding())
     home_entered = threading.Event()
     finish_home = threading.Event()
     ticked = threading.Event()
     errors = []
+    action_applied = threading.Event()
+    old_snapshot = _ObservationSnapshot(
+        123,
+        {arm: service.capture_state() for arm, service in node._arm_services},
+        {},
+        time.monotonic_ns(),
+    )
+    payload = {
+        "left.target_cartesian_delta": float64_tensor((0.0,) * 6, shape=(6,)),
+        "left.gripper_position": 0.2,
+        "right.target_cartesian_delta": float64_tensor((0.0,) * 6, shape=(6,)),
+        "right.gripper_position": 0.2,
+    }
+
+    def step(request, context):
+        result = _FakeService.Step(right, request, context)
+        action_applied.set()
+        return result
 
     def home(request, context):
         home_entered.set()
@@ -739,20 +777,34 @@ def test_home_excludes_interpolation_and_control_resumes_after_both_arms(monkeyp
 
     def request_home():
         try:
-            node._handle_command(module.RobotCommand.HOME)
+            commands.client_binding().request(RobotCommand.HOME.to_payload())
         except Exception as error:
             errors.append(error)
 
     left.Reset = home
     right.execute_control_tick = tick
+    right.Step = step
     home_thread = threading.Thread(target=request_home)
     try:
         runtime.configure({})
-        runtime.start({"action_command": _InputBinding()})
+        runtime.start(
+            {
+                "action_command": actions.callback_input_binding(),
+                "robot_command": commands.server_binding(),
+                "robot_observation": observations.output_binding(),
+            }
+        )
         assert ticked.wait(2)
         home_thread.start()
         assert home_entered.wait(2)
         ticked.clear()
+        output.publish(Message(timestamp_ns=1, sequence=0, payload=payload))
+        stale_action = ReceivedMessage(
+            timestamp_ns=1,
+            sequence=1,
+            payload=payload,
+            received_at_ns=time.monotonic_ns(),
+        )
         assert not ticked.wait(0.03), "Interpolation commands overlapped Home"
         finish_home.set()
         home_thread.join(timeout=2)
@@ -760,9 +812,23 @@ def test_home_excludes_interpolation_and_control_resumes_after_both_arms(monkeyp
         assert not errors
         assert len(left.resets) == len(right.resets) == 1
         assert ticked.wait(2)
+        node._apply_action(stale_action)
+        assert not action_applied.wait(0.03), (
+            "An action queued during Home was replayed"
+        )
+        assert left.requests == right.requests == []
+        node._publish_snapshot(old_snapshot)
+        while (message := captured.poll_next()) is not None:
+            assert message.timestamp_ns != 123, (
+                "A pre-Home snapshot was published after Home"
+            )
+        output.publish(Message(timestamp_ns=2, sequence=2, payload=payload))
+        assert action_applied.wait(2), "Fresh actions did not resume after Home"
+        assert len(left.requests) == len(right.requests) == 1
         assert node._worker_error is None
     finally:
         finish_home.set()
         if home_thread.ident is not None:
             home_thread.join(timeout=2)
         runtime.shutdown()
+        captured.unbind()
