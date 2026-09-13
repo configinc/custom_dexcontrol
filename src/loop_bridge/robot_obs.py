@@ -37,7 +37,11 @@ def observation_state(observation: Mapping[str, Any]) -> dict[str, float | list[
 def observation_payload(observation: Mapping[str, Any], arm: str) -> dict[str, Any]:
     """Encode one arm under explicit ``left.*`` or ``right.*`` Node fields."""
 
-    state = observation_state(observation)
+    return state_payload(observation_state(observation), arm)
+
+
+def state_payload(state: Mapping[str, Any], arm: str) -> dict[str, Any]:
+    """Encode a measured arm state directly, without a RobotEnv proto round trip."""
     payload: dict[str, Any] = {}
     for field, count, scalar in _OBS_FIELDS:
         value = state[field]

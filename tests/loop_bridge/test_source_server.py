@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import threading
 import types
 from contextlib import contextmanager
 
@@ -108,11 +109,23 @@ class _FakeService:
         self.resets: list[_ResetRequest] = []
         self.paused = True
         self.closed = False
-        self.control_error = None
         self.queued_commands = []
+        self.control_ticks = 0
 
-    def resume(self):
+    def resume(self, control_frequency_hz):
         self.paused = False
+        self.control_frequency_hz = control_frequency_hz
+
+    def execute_control_tick(self):
+        self.control_ticks += 1
+
+    def capture_state(self):
+        from loop_bridge.robot_obs import observation_state
+
+        return observation_state(make_observation())
+
+    def observation_from_state(self, state):
+        return state
 
     def pause(self):
         self.paused = True
@@ -314,7 +327,13 @@ def test_action_uses_pre_action_state_and_observations_include_latest_diagnostic
     ]
     assert right.requests[0].pre_action_state["gripper_position"].float_value == 0.5
     assert published == []
-    node._read_and_publish()
+    node._publish_snapshot(
+        source_server._ObservationSnapshot(
+            123,
+            {"left": left.capture_state(), "right": right.capture_state()},
+            node._latest_action_info,
+        )
+    )
     assert len(published) == 1
     assert published[0]["left.gripper_position"] == 0.5
     assert published[0]["right.gripper_position"] == 0.5
@@ -396,10 +415,11 @@ def test_lifecycle_opens_on_start_pauses_and_reuses_then_closes(monkeypatch):
         assert left.paused and right.paused
         assert not left.queued_commands
         assert not left.closed and not right.closed
-        runtime.configure({})
+        runtime.configure({"control_frequency_hz": 100})
         runtime.start({"action_command": _InputBinding()})
         assert len(opened) == 1
         assert not left.queued_commands
+        assert left.control_frequency_hz == right.control_frequency_hz == 100
     finally:
         runtime.shutdown()
     assert left.closed and right.closed
@@ -413,7 +433,7 @@ def test_lifecycle_opens_on_start_pauses_and_reuses_then_closes(monkeypatch):
             "gripper_type": "sr_gripper",
             "left_gripper_device": "enp1s0",
             "right_gripper_device": "enp2s0",
-            "control_hz": 30,
+            "action_frequency_hz": 30,
         },
     ],
 )
@@ -451,7 +471,11 @@ def test_reconfigure_reopens_hardware_with_new_settings(
         assert (
             left[0]["gripper_type"] == right[0]["gripper_type"] == config.gripper_type
         )
-        assert left[0]["control_hz"] == right[0]["control_hz"] == config.control_hz
+        assert (
+            left[0]["control_hz"]
+            == right[0]["control_hz"]
+            == config.action_frequency_hz
+        )
         assert left[0]["frame_type"] == right[0]["frame_type"] == config.frame_type
         assert right[0]["robot"] is left[1]._robot.robot
     finally:
@@ -491,7 +515,7 @@ def test_failed_start_releases_opened_hardware(monkeypatch):
 
     module = _import_source_server(monkeypatch)
     left, right = _FakeService(), _FakeService()
-    right.resume = lambda: (_ for _ in ()).throw(RuntimeError("right unavailable"))
+    right.resume = lambda hz: (_ for _ in ()).throw(RuntimeError("right unavailable"))
     node = module.VegaRobotNode([("left", left), ("right", right)])
     runtime = NodeRuntime(node)
     with pytest.raises(NodeOperationError, match="right unavailable"):
@@ -585,9 +609,8 @@ def test_action_failure_pauses_both_arms_without_dispatching_the_other(monkeypat
         runtime.shutdown()
 
 
-def test_observation_failure_can_pause_its_own_worker(monkeypatch):
-    import threading
-
+@pytest.mark.parametrize("failure", ["capture", "publish", "control"])
+def test_worker_failure_stops_ticks_and_faults_both_arms(monkeypatch, failure):
     from loop_node.runtime import NodeRuntime
     from loop_sdk import LifecycleState
 
@@ -595,56 +618,151 @@ def test_observation_failure_can_pause_its_own_worker(monkeypatch):
     left, right = _FakeService(), _FakeService()
     node = module.VegaRobotNode([("left", left), ("right", right)])
     runtime = NodeRuntime(node)
-    paused = threading.Event()
-    original_pause = right.pause
+    failed = threading.Event()
 
-    def pause():
-        original_pause()
-        paused.set()
+    def fail(*args, **kwargs):
+        failed.set()
+        raise RuntimeError("disconnected")
 
-    right.pause = pause
     try:
-        runtime.configure({"observation_frequency_hz": 100})
+        if failure == "capture":
+            left.capture_state = fail
+        elif failure == "publish":
+            node.publish_observation = fail
+        else:
+            service = module._LockedStepService.__new__(module._LockedStepService)
+            service.arm_side = "left"
+            service._robot = types.SimpleNamespace(
+                execute_interpolated_tick=lambda: (failed.set(), True)[1],
+                _prev_command_successful=False,
+            )
+            left.execute_control_tick = service.execute_control_tick
+        runtime.configure({})
         runtime.start({"action_command": _InputBinding()})
-        left._create_observation = lambda: (_ for _ in ()).throw(
-            RuntimeError("disconnected")
-        )
-        assert paused.wait(2), (
-            "Observation worker could not finish its own fault cleanup"
-        )
+        assert failed.wait(2)
+        assert node._worker_stop.wait(2)
+        node.check_health()
         assert runtime.status.lifecycle is LifecycleState.FAULT
         assert left.paused and right.paused
+        assert node._control_thread is None and node._observation_thread is None
     finally:
         runtime.shutdown()
 
 
-def test_interpolation_failure_reaches_node_and_pauses_both_arms(monkeypatch):
-    import threading
-
+def test_control_ticks_continue_without_targets_or_waiting_for_publication(monkeypatch):
     from loop_node.runtime import NodeRuntime
-    from loop_sdk import LifecycleState
 
     module = _import_source_server(monkeypatch)
-    service = module._LockedStepService.__new__(module._LockedStepService)
-    service.arm_side = "left"
-    service._control_loop_hz = 200
-    service._control_loop_stop = threading.Event()
-    service._robot = types.SimpleNamespace(
-        execute_interpolated_tick=lambda: True,
-        _prev_command_successful=False,
-    )
-    service._control_loop_run()
-
     left, right = _FakeService(), _FakeService()
     node = module.VegaRobotNode([("left", left), ("right", right)])
     runtime = NodeRuntime(node)
+    publishing = threading.Event()
+    release = threading.Event()
+    advanced = threading.Event()
+    resumed_publish = threading.Event()
+    published = []
+    tick_order = []
+
+    def capture(arm, service):
+        tick_order.append(f"capture {arm}")
+        state = _FakeService.capture_state(service)
+        state["gripper_position"] = service.control_ticks
+        return state
+
+    def tick(arm, service):
+        tick_order.append(f"command {arm}")
+        service.control_ticks += 1
+        if arm == "right" and publishing.is_set() and service.control_ticks >= 5:
+            advanced.set()
+
+    def publish(payload, timestamp_ns):
+        published.append((payload, timestamp_ns))
+        if len(published) == 1:
+            publishing.set()
+            assert release.wait(2)
+        else:
+            resumed_publish.set()
+
+    left.capture_state = lambda: capture("left", left)
+    right.capture_state = lambda: capture("right", right)
+    left.execute_control_tick = lambda: tick("left", left)
+    right.execute_control_tick = lambda: tick("right", right)
+    node.publish_observation = publish
     try:
         runtime.configure({})
         runtime.start({"action_command": _InputBinding()})
-        left.control_error = service.control_error
-        node.check_health()
-        assert runtime.status.lifecycle is LifecycleState.FAULT
-        assert left.paused and right.paused
-        assert service._control_loop_stop.is_set()
+        assert publishing.wait(2), "No observations before the first action"
+        # Action/Home serialization must not hold up ordinary control ticks.
+        with node._device_lock:
+            assert advanced.wait(2), "Publication blocked motor control"
+        with node._tick_lock:
+            assert len(published) == 1
+            assert tick_order[:4] == [
+                "capture left",
+                "capture right",
+                "command left",
+                "command right",
+            ]
+            assert published[0][0]["left.gripper_position"] == 0
+            release.set()
+            assert resumed_publish.wait(2)
+            assert published[1][0]["left.gripper_position"] == left.control_ticks - 1
+            assert published[1][0]["right.gripper_position"] == right.control_ticks - 1
+            assert published[1][1] > published[0][1]
     finally:
+        release.set()
+        runtime.shutdown()
+    assert node._pending_snapshot is None
+
+
+def test_home_excludes_interpolation_and_control_resumes_after_both_arms(monkeypatch):
+    from loop_node.runtime import NodeRuntime
+
+    module = _import_source_server(monkeypatch)
+    left, right = _FakeService(), _FakeService()
+    node = module.VegaRobotNode([("left", left), ("right", right)])
+    runtime = NodeRuntime(node)
+    home_entered = threading.Event()
+    finish_home = threading.Event()
+    ticked = threading.Event()
+    errors = []
+
+    def home(request, context):
+        home_entered.set()
+        assert finish_home.wait(2)
+        return _FakeService.Reset(left, request, context)
+
+    def tick():
+        assert not home_entered.is_set() or finish_home.is_set()
+        _FakeService.execute_control_tick(right)
+        ticked.set()
+
+    def request_home():
+        try:
+            node._handle_command(module.RobotCommand.HOME)
+        except Exception as error:
+            errors.append(error)
+
+    left.Reset = home
+    right.execute_control_tick = tick
+    home_thread = threading.Thread(target=request_home)
+    try:
+        runtime.configure({})
+        runtime.start({"action_command": _InputBinding()})
+        assert ticked.wait(2)
+        home_thread.start()
+        assert home_entered.wait(2)
+        ticked.clear()
+        assert not ticked.wait(0.03), "Interpolation commands overlapped Home"
+        finish_home.set()
+        home_thread.join(timeout=2)
+        assert not home_thread.is_alive()
+        assert not errors
+        assert len(left.resets) == len(right.resets) == 1
+        assert ticked.wait(2)
+        assert node._worker_error is None
+    finally:
+        finish_home.set()
+        if home_thread.ident is not None:
+            home_thread.join(timeout=2)
         runtime.shutdown()

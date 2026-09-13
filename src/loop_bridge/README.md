@@ -30,8 +30,8 @@ Match `--node-id` to the Robot Node ID in the Loop Cell Config.
 ```json
 {
   "frame_type": "vega-1-pro_torso_frame_v1",
-  "control_hz": 20,
-  "observation_frequency_hz": 20.0,
+  "action_frequency_hz": 20,
+  "control_frequency_hz": 200,
   "gripper_type": "robotiq",
   "left_gripper_device": "/dev/ttyUSB0",
   "right_gripper_device": "/dev/ttyUSB1"
@@ -41,16 +41,20 @@ Match `--node-id` to the Robot Node ID in the Loop Cell Config.
 | Field | Meaning |
 | --- | --- |
 | `frame_type` | Arm startup and Home preset: `vega-1-pro_torso_frame_v1` (default) or `vega-1-pro_torso_frame_v2` |
-| `control_hz` | Main Controller’s action frequency, used by the arm controller |
-| `observation_frequency_hz` | Regular state publication rate, independent of action arrivals |
+| `action_frequency_hz` | Main Controller’s action frequency, used to interpret action deltas and velocities; default 20 Hz |
+| `control_frequency_hz` | Common tick for both arms’ interpolation commands and observation sampling; default 200 Hz |
 | `gripper_type` | `default` (built-in), `robotiq`, or `sr_gripper` |
 | `left_gripper_device`, `right_gripper_device` | Distinct serial paths for Robotiq or network interfaces for SR; ignored for built-in grippers |
 
 For SR, set both devices to EtherCAT interfaces such as `enp1s0` and `enp2s0`.
 The selected driver must be installed; Ansible installs both optional drivers.
-The existing deployed IK and interpolation tuning remain internal defaults,
-including the 200 Hz control loop. Actions use `target_cartesian_delta` and
+The existing deployed IK and interpolation tuning remain internal defaults.
+Actions use `target_cartesian_delta` and
 normalized gripper `position`. No DS Layout Unit Config lookup is required.
+
+In existing Cell Configs, rename `control_hz` to `action_frequency_hz` and replace
+`observation_frequency_hz` with `control_frequency_hz` (normally 200). The latter
+now controls motor command timing as well as observation sampling.
 
 The two frame presets use the joint targets from the existing Interface's
 `frame.yaml`. On hardware initialization and Home, each arm opens its gripper,
@@ -64,15 +68,15 @@ change the torso or head pose.
 | --- | --- |
 | Process start | Register with Loop in IDLE; no arm service is opened yet. |
 | Configure | Validate and save Node Config without opening hardware. |
-| Start | Open hardware, or reuse it if hardware settings are unchanged; resume control and publish an initial observation. |
+| Start | Open hardware, or reuse it if hardware settings are unchanged; begin control ticks and observations. |
 | Stop | Stop observation/control workers, discard pending arm/gripper commands, and hold the current arm position. Keep the hardware connection. |
 | Fault | Pause both arms and report the failure to Loop. Reset Fault returns to IDLE; Configure then Start resumes operation. |
 | Shutdown / process exit | Stop workers and close grippers and the shared Vega connection. |
 
 The existing hardware initialization, including control-mode/head initialization,
 happens on the first Start. After Stop, changing `frame_type`, the gripper, or
-`control_hz` rebuilds the services on the next Start. Changing only the observation
-rate reuses the hardware connection. Every Start requires Configure.
+`action_frequency_hz` rebuilds the services on the next Start. Changing only
+`control_frequency_hz` reuses the hardware connection. Every Start requires Configure.
 
 ## Data and commands
 
@@ -83,10 +87,22 @@ rate reuses the hardware connection. Every Start requires Configure.
 | `robot_command` request/reply | Home both arms through the existing reset paths; return failure if either arm fails. |
 
 For an action, the Node reads both arms once and passes those pre-action states to
-each arm’s Step. A failed Step faults the Node. Observations are published on their
-own timer with current state and the latest successful action’s diagnostics
-(`received_action`, `left/right.action.*`). These diagnostics persist until the next
-action and are cleared on Home or Start; they are not an action/observation pair.
+each arm’s Step. A failed Step faults the Node. Each common control tick:
+
+1. Copies the latest measured state for both arms.
+2. Sends both arms’ interpolated commands, if targets are available.
+3. Passes the captured state to the observation worker for FK and publication.
+
+The worker uses its own FK working data and keeps only the newest pending snapshot.
+Slow encoding or publication does not block the control tick. Observations continue
+before the first action arrives; their timestamp is the capture time. Sensor updates
+remain asynchronous, and the publication rate can be lower than the tick rate when
+processing cannot keep up.
+
+Snapshots include the latest successful action’s diagnostics (`received_action`,
+`left/right.action.*`). These persist until the next action and are cleared on Home
+or Start; they are not an action/observation pair. Home suspends common control ticks
+until both arms have completed the existing reset paths.
 Loop’s Main Controller builds the final ControlStep for recording.
 The action input keeps only the latest pending target.
 

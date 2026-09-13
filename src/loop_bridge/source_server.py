@@ -1,19 +1,8 @@
 """Expose one bimanual Vega as a Loop Robot Node.
 
-This is the Node-Graph migration of the previous ``LoopRobotClient`` bridge. It
-keeps the device-side behavior in this repository: one shared physical Vega,
-two per-arm RobotEnv services, one pre-action observation snapshot, and the
-same per-arm ``Step`` calls.
-
-- ``_LockedStepService`` is the upstream ``VegaRobotEnvService`` plus one fix: it
-  serializes ``Step`` on the upstream ``_cmd_lock`` (upstream guards only ``Reset``),
-  so the bus action lane can't race a Reset on shared IK/filter state.
-- ``VegaRobotNode`` publishes one typed bimanual observation, receives one typed
-  bimanual action, and dispatches each arm's slice to that arm's Step.
-
-A bimanual robot is ONE ``Robot`` exposing both arms; two per-arm services share it
-(``VegaRobot``/service take an injected ``robot``), reusing every per-arm
-gain/frame/interpolation/IK/gripper path verbatim.
+Both arm services share the physical robot and retain the existing Step, Home,
+IK, interpolation, and gripper behavior. The Node runs a common control tick;
+an independent worker computes and publishes observations from its snapshots.
 """
 
 from __future__ import annotations
@@ -24,6 +13,7 @@ import signal
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from typing import Any, Literal, Sequence, cast
 
 from loop_sdk import (
@@ -47,8 +37,8 @@ from loop_bridge.contracts import (
     float64_values,
     is_action_info_scalar,
 )
-from loop_bridge.obs_publisher import merge_observations
-from loop_bridge.robot_obs import observation_state
+from loop_bridge.robot_obs import observation_state, state_payload
+from loop_bridge.state_reader import ArmStateReader
 
 LOGGER = logging.getLogger("loop_bridge.vega")
 
@@ -66,8 +56,16 @@ class VegaRobotNodeConfig(BaseModel):
             description="Arm startup and Home pose preset; does not rotate the coordinate frame.",
         )
     )
-    control_hz: int = Field(default=20, gt=0)
-    observation_frequency_hz: float = Field(default=20.0, gt=0)
+    action_frequency_hz: int = Field(
+        default=20,
+        gt=0,
+        description="Main Controller action rate, used to interpret actions.",
+    )
+    control_frequency_hz: int = Field(
+        default=200,
+        gt=0,
+        description="Shared interpolation and observation sampling rate.",
+    )
     gripper_type: Literal["default", "robotiq", "sr_gripper"] = "robotiq"
     left_gripper_device: str = Field(
         default="/dev/ttyUSB0",
@@ -106,7 +104,6 @@ _SERVICE_DEFAULTS: dict[str, Any] = {
     "use_velocity_feedforward": True,
     "interpolation_method": "linear",
     "interpolation_history": 3,
-    "control_loop_hz": 200,
     "filter_type": "none",
     "vel_smoothing_alpha": 1.0,
     "hw_correction_alpha": 0.5,
@@ -273,59 +270,62 @@ class _LockedStepService(_vega_server.VegaRobotEnvService):
     def __init__(self, **kwargs: Any) -> None:
         try:
             super().__init__(auto_start_control_loop=False, **kwargs)
+            self._state_reader = ArmStateReader(self._robot)
         except BaseException:
             robot = getattr(self, "_robot", None)
             if robot is not None:
                 robot.close()
             raise
-        self.control_error: Exception | None = None
         self._paused = False
 
     def Step(self, request, context):
         with self._cmd_lock:
             return super().Step(request, context)
 
-    def resume(self) -> None:
+    def resume(self, control_frequency_hz: int) -> None:
         self._paused = False
-        self.control_error = None
+        self._control_loop_hz = control_frequency_hz
         self._robot.reset_filter_state()
         self._robot._start_gripper_worker()
-        if self._robot.interpolation_enabled and self._control_loop_hz > 0:
-            self._start_control_loop()
 
     def pause(self) -> None:
         if self._paused:
             return
-        self._stop_control_loop()
         with self._cmd_lock:
             self._robot.pause_commands()
         self._paused = True
 
     def close(self) -> None:
-        self._stop_control_loop()
         self._robot.close()
 
-    def _control_loop_run(self) -> None:
-        period_s = 1.0 / self._control_loop_hz
-        while not self._control_loop_stop.is_set():
-            started = time.perf_counter()
-            try:
-                sent = self._robot.execute_interpolated_tick()
-                if sent and not self._robot._prev_command_successful:
-                    raise RuntimeError(f"{self.arm_side} interpolated command failed")
-            except Exception as error:
-                self.control_error = error
-                self._control_loop_stop.set()
-                return
-            self._control_loop_stop.wait(
-                max(0.0, period_s - (time.perf_counter() - started))
+    def execute_control_tick(self) -> None:
+        sent = self._robot.execute_interpolated_tick()
+        if sent and not self._robot._prev_command_successful:
+            raise RuntimeError(f"{self.arm_side} interpolated command failed")
+
+    def capture_state(self) -> dict[str, Any]:
+        return self._state_reader.capture()
+
+    def observation_from_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        observation = self._state_reader.complete(state)
+        if self.R_robot_to_world is not None:
+            observation["cartesian_position"] = self._transform_state_to_env_frame(
+                observation["cartesian_position"]
             )
+        return observation
 
 
 ArmServices = Sequence[tuple[str, Any]]
 ServiceFactory = Callable[
     [VegaRobotNodeConfig], contextlib.AbstractContextManager[ArmServices]
 ]
+
+
+@dataclass(frozen=True)
+class _ObservationSnapshot:
+    timestamp_ns: int
+    states: dict[str, dict[str, Any]]
+    action_info: dict[str, Any]
 
 
 class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
@@ -350,9 +350,13 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
             for _arm, service in arm_services:
                 self._resources.callback(service.close)
         self._device_lock = threading.RLock()
-        self._observation_stop = threading.Event()
+        self._tick_lock = threading.Lock()
+        self._worker_stop = threading.Event()
+        self._worker_error: tuple[str, Exception] | None = None
+        self._control_thread: threading.Thread | None = None
         self._observation_thread: threading.Thread | None = None
-        self._observation_hz = 20.0
+        self._snapshot_ready = threading.Condition()
+        self._pending_snapshot: _ObservationSnapshot | None = None
         self._action_space = DEFAULT_ACTION_SPACE
         self._gripper_action_space = "position"
         self._latest_action_info: dict[str, Any] = {}
@@ -383,7 +387,6 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
 
     def _on_configure(self, config: VegaRobotNodeConfig) -> None:
         self._config = config
-        self._observation_hz = config.observation_frequency_hz
 
     def _on_start(self) -> None:
         config = self._config
@@ -396,9 +399,9 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
                     and self._opened_config is not None
                 ):
                     previous = self._opened_config.model_dump(
-                        exclude={"observation_frequency_hz"}
+                        exclude={"control_frequency_hz"}
                     )
-                    current = config.model_dump(exclude={"observation_frequency_hz"})
+                    current = config.model_dump(exclude={"control_frequency_hz"})
                     if previous != current:
                         self._close_services()
                 if not self._arm_services:
@@ -410,31 +413,46 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
                 self._opened_config = config
                 self._latest_action_info = {}
                 for _arm, service in self._arm_services:
-                    service.resume()
-                self._observation_stop.clear()
+                    service.resume(config.control_frequency_hz)
+                self._worker_stop.clear()
+                self._worker_error = None
+                self._pending_snapshot = None
                 self._active = True
-                self._read_and_publish()
                 self._observation_thread = threading.Thread(
                     target=self._observation_loop,
                     name="vega-robot-observation",
                     daemon=True,
                 )
                 self._observation_thread.start()
+                self._control_thread = threading.Thread(
+                    target=self._control_loop,
+                    args=(config.control_frequency_hz,),
+                    name="vega-robot-control",
+                    daemon=True,
+                )
+                self._control_thread.start()
         except BaseException:
             self._on_shutdown()
             raise
 
     def _on_stop(self) -> None:
+        self._worker_stop.set()
+        with self._snapshot_ready:
+            self._snapshot_ready.notify_all()
         with self._device_lock:
             self._active = False
-            self._observation_stop.set()
-            thread = self._observation_thread
-            self._observation_thread = None
         errors: list[Exception] = []
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
-            if thread.is_alive():
-                errors.append(RuntimeError("Observation thread did not stop"))
+        for name in ("_control_thread", "_observation_thread"):
+            thread = getattr(self, name)
+            if thread is not None:
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    errors.append(RuntimeError(f"{thread.name} did not stop"))
+                else:
+                    setattr(self, name, None)
+        if errors:
+            raise RuntimeError("; ".join(map(str, errors)))
+        self._pending_snapshot = None
         with self._device_lock:
             for arm, service in self._arm_services:
                 try:
@@ -456,10 +474,8 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
             self._opened_config = None
 
     def _on_shutdown(self) -> None:
-        try:
-            self._on_stop()
-        finally:
-            self._close_services()
+        self._on_stop()
+        self._close_services()
 
     def _fault(self, code: str, error: Exception) -> None:
         self.report_fault(code, str(error))
@@ -469,50 +485,88 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
             LOGGER.exception("Failed to pause Vega after %s", code)
 
     def check_health(self) -> None:
-        """Called by the host loop so control-thread faults stop both arms."""
+        """Report worker failures from the host loop, which can join both workers."""
         with self._device_lock:
             if not self._active:
                 return
-            error = next(
-                (
-                    service.control_error
-                    for _, service in self._arm_services
-                    if service.control_error is not None
-                ),
-                None,
-            )
+            error = self._worker_error
         if error is not None:
-            self._fault("robot_control_failed", error)
+            self._fault(*error)
         elif self.status.lifecycle is LifecycleState.FAULT:
             self._on_stop()
 
-    def _observation_loop(self) -> None:
-        period_s = 1.0 / self._observation_hz
-        while not self._observation_stop.wait(period_s):
+    def _fail_worker(self, code: str, error: Exception) -> None:
+        with self._snapshot_ready:
+            if self._worker_error is None:
+                self._worker_error = (code, error)
+            self._worker_stop.set()
+            self._snapshot_ready.notify_all()
+
+    def _control_loop(self, frequency_hz: int) -> None:
+        period_s = 1.0 / frequency_hz
+        deadline = time.perf_counter()
+        while not self._worker_stop.is_set():
             try:
-                with self._device_lock:
-                    if not self._active:
+                # Home excludes ticks; action IK and observation FK do not.
+                with self._tick_lock:
+                    if self._worker_stop.is_set():
                         return
-                    self._read_and_publish()
+                    snapshot = _ObservationSnapshot(
+                        timestamp_ns=time.time_ns(),
+                        states={
+                            arm: service.capture_state()
+                            for arm, service in self._arm_services
+                        },
+                        action_info=self._latest_action_info,
+                    )
+                    for _arm, service in self._arm_services:
+                        if self._worker_stop.is_set():
+                            return
+                        service.execute_control_tick()
+                    with self._snapshot_ready:
+                        self._pending_snapshot = snapshot
+                        self._snapshot_ready.notify()
             except Exception as error:
-                self._fault("robot_observation_failed", error)
+                self._fail_worker("robot_control_failed", error)
+                return
+            # Maintain the cadence without bursting through missed ticks.
+            deadline = max(deadline + period_s, time.perf_counter())
+            self._worker_stop.wait(max(0.0, deadline - time.perf_counter()))
+
+    def _observation_loop(self) -> None:
+        while True:
+            with self._snapshot_ready:
+                self._snapshot_ready.wait_for(
+                    lambda: (
+                        self._pending_snapshot is not None or self._worker_stop.is_set()
+                    )
+                )
+                if self._worker_stop.is_set():
+                    return
+                snapshot = self._pending_snapshot
+                self._pending_snapshot = None
+            if snapshot is None:
+                continue
+            try:
+                self._publish_snapshot(snapshot)
+            except Exception as error:
+                self._fail_worker("robot_observation_failed", error)
                 return
 
-    def _read_observations(self) -> tuple[dict[str, Mapping[str, Any]], dict[str, Any]]:
+    def _read_observations(self) -> dict[str, Mapping[str, Any]]:
         observations: dict[str, Mapping[str, Any]] = {}
         for arm, service in self._arm_services:
             observation, _sample_timestamp_us = service._create_observation()
             observations[arm] = observation
-        return observations, merge_observations(observations)
+        return observations
 
-    def _read_and_publish(self) -> None:
-        _observations, payload = self._read_observations()
-        payload.update(self._latest_action_info)
-        self._publish_observation(payload)
-
-    def _publish_observation(self, payload: Mapping[str, Any]) -> None:
-        # Samples carry wall-clock capture time; scheduling uses a monotonic clock.
-        self.publish_observation(payload, timestamp_ns=time.time_ns())
+    def _publish_snapshot(self, snapshot: _ObservationSnapshot) -> None:
+        payload: dict[str, Any] = {}
+        for arm, service in self._arm_services:
+            state = service.observation_from_state(snapshot.states[arm])
+            payload.update(state_payload(state, arm))
+        payload.update(snapshot.action_info)
+        self.publish_observation(payload, timestamp_ns=snapshot.timestamp_ns)
 
     def _apply_action(self, message: ReceivedMessage) -> None:
         """Apply against one pre-action state; retain diagnostics for the next observation."""
@@ -520,7 +574,7 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
             with self._device_lock:
                 if not self._active:
                     return
-                observations, _payload = self._read_observations()
+                observations = self._read_observations()
                 payload: dict[str, Any] = {}
                 actions = _decode_bimanual_action(message)
                 payload["received_action"] = float64_tensor(
@@ -546,9 +600,10 @@ class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
             with self._device_lock:
                 if not self._active:
                     raise RuntimeError("Vega Robot Node is not active")
-                for applier in self._appliers.values():
-                    applier.home()
-                self._latest_action_info = {}
+                with self._tick_lock:
+                    for applier in self._appliers.values():
+                        applier.home()
+                    self._latest_action_info = {}
         except Exception as error:
             self._fault("robot_home_failed", error)
             raise
@@ -591,7 +646,8 @@ def _open_arm_services(config: VegaRobotNodeConfig) -> Iterator[ArmServices]:
         **_SERVICE_DEFAULTS,
         "frame_type": config.frame_type,
         "gripper_type": config.gripper_type,
-        "control_hz": config.control_hz,
+        "control_hz": config.action_frequency_hz,
+        "control_loop_hz": config.control_frequency_hz,
     }
     left_port = config.left_gripper_device
     right_port = config.right_gripper_device
