@@ -757,7 +757,8 @@ class VegaRobot:
                 pos = self._filter_pos.copy()
 
         try:
-            self.update_joints(pos, velocity=False, blocking=False)
+            # Action IK runs concurrently and owns the solver's working state.
+            self.update_joints(pos, velocity=False, blocking=False, sync_ik_state=False)
             self.update_gripper(gripper_action, velocity=gripper_vel, blocking=False)
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
@@ -800,6 +801,8 @@ class VegaRobot:
         joint_pos_command: np.ndarray,
         velocity: bool = False,
         blocking: bool = False,
+        *,
+        sync_ik_state: bool = True,
     ) -> None:
         run_id = f"joint-diagnostics-{self.arm_side}"
         target_joint_pos = np.asarray(joint_pos_command, dtype=np.float64)
@@ -954,7 +957,8 @@ class VegaRobot:
         else:
             self.arm._send_position_command(target_joint_pos)
         self._last_cmd_joint_pos = target_joint_pos.copy()
-        self.sync_motion_manager_with_arm(target_joint_pos)
+        if sync_ik_state:
+            self.sync_motion_manager_with_arm(target_joint_pos)
 
     def update_gripper(self, command: float, velocity: bool = True, blocking: bool = False) -> None:
         if self.hand is None:
