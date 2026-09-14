@@ -357,6 +357,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description="Scalar gripper position in [0,1]",
             )
         )
+        spec.fields["gripper_current"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64",
+                shape=[],
+                required=False,
+                description="Gripper motor current (A). 0 when the gripper driver doesn't report current (e.g. sr_gripper).",
+            )
+        )
         spec.fields["cartesian_position"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="float64",
@@ -731,6 +739,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             ),
             "gripper_position": robotenv_pb2.Value(
                 float_value=float(state_dict["gripper_position"])
+            ),
+            "gripper_current": robotenv_pb2.Value(
+                float_value=float(state_dict.get("gripper_current", 0.0))
             ),
             "cartesian_position": robotenv_pb2.Value(
                 float_array=robotenv_pb2.FloatArray(values=cartesian_position.tolist())

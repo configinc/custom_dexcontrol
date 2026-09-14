@@ -97,6 +97,7 @@ class RobotiqGripper:
 
         # Cached state (updated by worker thread only — measured, never commanded)
         self._cached_pos = self._gripper.get_pos()
+        self._cached_current = self._gripper.get_current()
 
         # Worker thread
         self._command_queue: Queue[tuple[float, float, float]] = Queue(maxsize=1)
@@ -140,6 +141,7 @@ class RobotiqGripper:
                 if status_ok:
                     with self._state_lock:
                         self._cached_pos = self._gripper.get_pos()
+                        self._cached_current = self._gripper.get_current()
             except Exception as e:
                 logger.warning("Robotiq worker state refresh error: {}", e)
 
@@ -166,6 +168,11 @@ class RobotiqGripper:
         """Return current measured gripper position (1-element array in metres)."""
         with self._state_lock:
             return np.array([self._cached_pos], dtype=np.float64)
+
+    def get_current(self) -> float:
+        """Return the gripper motor current from the last measured Modbus read."""
+        with self._state_lock:
+            return float(self._cached_current)
 
     def set_joint_pos(
         self,

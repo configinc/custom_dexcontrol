@@ -207,6 +207,7 @@ class VegaRobot:
         self._gripper_poll_interval_s = 1.0 / max(1, self.control_hz)
         self._gripper_position = 0.0
         self._gripper_joint_pos = np.asarray(self._gripper_open_pos, dtype=np.float64).copy()
+        self._gripper_current = 0.0
         self._gripper_command_queue: Queue[float] | None = None
         self._gripper_stop_event = threading.Event()
         self._gripper_worker: threading.Thread | None = None
@@ -453,10 +454,13 @@ class VegaRobot:
         try:
             with self._gripper_io_lock:
                 hand_joint_pos = np.asarray(self.hand.get_joint_pos(), dtype=np.float64)
+                get_current = getattr(self.hand, "get_current", None)
+                gripper_current = float(get_current()) if get_current is not None else 0.0
             gripper_position = float(self._normalize_gripper_position(hand_joint_pos))
             with self._gripper_state_lock:
                 self._gripper_joint_pos = hand_joint_pos.copy()
                 self._gripper_position = gripper_position
+                self._gripper_current = gripper_current
             return True
         except Exception:
             self._prev_gripper_command_successful = False
@@ -522,6 +526,12 @@ class VegaRobot:
             return np.zeros(1, dtype=np.float64)
         with self._gripper_state_lock:
             return np.asarray(self._gripper_joint_pos, dtype=np.float64).copy()
+
+    def get_cached_gripper_current(self) -> float:
+        if self.hand is None:
+            return 0.0
+        with self._gripper_state_lock:
+            return float(self._gripper_current)
 
     def update_command(
         self,
@@ -943,6 +953,7 @@ class VegaRobot:
         except ValueError:
             joint_currents = np.zeros(7, dtype=np.float64)
         gripper_position = self.get_cached_gripper_position() if self.hand is not None else 0.0
+        gripper_current = self.get_cached_gripper_current() if self.hand is not None else 0.0
 
         wrench_state = np.zeros(6, dtype=np.float64)
         if getattr(self.arm, "wrench_sensor", None) is not None:
@@ -965,6 +976,7 @@ class VegaRobot:
             "prev_joint_torques_computed_safened": joint_torques.copy(),
             "motor_torques_measured": joint_torques.copy(),
             "gripper_position": gripper_position,
+            "gripper_current": gripper_current,
             "cartesian_position": cartesian_position,
             "wrench_state": wrench_state,
             "joint_currents": joint_currents,
