@@ -28,7 +28,7 @@ fetch_source() {
     fi
 
     if [[ "$name" == loop-sdk ]]; then
-        # hatch-vcs needs tags and commit history to calculate the SDK version.
+        # setuptools-scm needs tags and commit history to calculate the SDK version.
         git -C "$destination" fetch --filter=blob:none --tags origin "$revision"
     else
         git -C "$destination" fetch --filter=blob:none --depth=1 --no-tags origin "$revision"
@@ -44,11 +44,11 @@ prepare_dependency() {
     case "$1" in
         loop-sdk)
             fetch_source loop-sdk git@github.com:configinc/loop-sdk.git \
-                cab0a54b3cb3d1b00b9676d5742eb5ca1db57ea5
+                55020fc0088f9dd90c4285823bdc7aaa64846736
             ;;
         loop)
             fetch_source loop git@github.com:configinc/loop.git \
-                a3ef49573c7c58ed98c80b908995bc15a208ca27 packages/loop-node
+                a904a63c28e68f473889be46420f53abd5f4f876 packages/loop-node
             ;;
         *)
             printf 'Unknown dependency: %s\n' "$1" >&2
