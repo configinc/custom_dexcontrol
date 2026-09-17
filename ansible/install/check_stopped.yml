@@ -12,5 +12,12 @@
       done
   environment:
     SSHPASS: "{{ dexmate_pass }}"
+  register: dexcontrol_stopped_check
+  failed_when: false
   no_log: true
   changed_when: false
+
+- name: Report why Vega cannot be installed
+  ansible.builtin.fail:
+    msg: "{{ dexcontrol_stopped_check.stderr | default('Could not verify that Vega robot services are stopped.', true) }}"
+  when: dexcontrol_stopped_check.rc | default(1) != 0
