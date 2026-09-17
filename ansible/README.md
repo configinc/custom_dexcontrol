@@ -4,7 +4,7 @@ Data Studio Layout's **Loop v2** mode installs under `~/loop-v2/`.
 Deployment never stops or starts Robot/UTI services. Stop Loop Robot/UTI before updating an
 existing Loop installation.
 
-- To use Loop: **Deploy Loop Nodes → Stop Existing Services → Start / Restart Robot/UTI**.
+- To use Loop: **Stop Existing Services → Deploy Loop Nodes → Start / Restart Robot/UTI**.
 - To return: **Stop Robot/UTI**, then use the existing Robot, Inference and Recorder restart buttons.
 
 The deployment server copies this checkout through the Teleop PC to the Vega PC.
@@ -68,13 +68,20 @@ Vega's installation process. Each stage defaults to 15 minutes. Data Studio's
 overall deployment timeout is separate and is not extended by this setting.
 The proxy is not needed when starting or running the installed Robot Node.
 
-Before Vega package downloads, host setup copies the Teleop PC's current time
-to Vega and saves it to Vega's hardware clock. This also runs with `--tags runtime`.
-Vega's NTP synchronization is disabled persistently: its isolated robot time source
-can report an old date as synchronized and would otherwise undo the correction.
-Teleop must have the correct time. Vega keeps its clock locally between deployments;
-this does not add a continuous time synchronization service. APT date checks and TLS
-certificate verification remain enabled.
+Each Vega installation stage temporarily uses the Teleop PC's current time for
+APT/TLS date validation. The wrapper pauses active time synchronization services,
+runs the installer, then restores Vega's original time plus elapsed monotonic time
+and restarts only the services it paused. Restoration also runs on installation
+failure, timeout, and handled termination signals. This includes `--tags runtime`.
+NTP server configuration and service enablement remain unchanged, and the wrapper
+does not write the hardware clock. Keep Robot/UTI stopped during installation.
+SIGKILL or power loss can interrupt restoration; the existing NTP service remains
+enabled for the next boot. APT date checks and TLS verification remain enabled.
+
+Teleop must have the correct time. This workaround only unblocks installation:
+Vega resumes its original NTP source afterward, so an incorrect source can still
+cause HTTPS/authentication errors at runtime. Correcting that source is a separate
+device setup task.
 
 Local proxy integration tests use loopback HTTP/HTTPS servers and do not contact
 robots. With `tinyproxy`, `curl`, `openssl`, and pytest available, run
@@ -92,7 +99,8 @@ Python under `.python` with EtherCAT permissions. It does not change permissions
 on a shared or system interpreter. Hardware selection happens at Configure.
 
 Sync preserves `.venv`, `.python`, `third_party`, environment files, and `unit_config.json`.
-Running `vega-loop-robot` sessions block deployment; stop Robot/UTI first.
+Running `vega-loop-robot` or legacy `robot-server` sessions block deployment;
+stop Robot/UTI and existing robot services first.
 Stop any old `vega-loop-relay` manually before starting Loop on Teleop's port
 7448. The new service controls do not manage that relay.
 The legacy `robot-server` session is separate. Deployment also saves the robot SSH

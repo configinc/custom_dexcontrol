@@ -27,29 +27,6 @@
       ansible.builtin.import_tasks: check_stopped.yml
       tags: [host, runtime]
 
-    - name: Read the current Teleop clock
-      ansible.builtin.command:
-        argv: [date, +%s]
-      register: dexcontrol_gateway_time
-      changed_when: false
-      tags: [host, runtime]
-
-    - name: Set the Vega clock from Teleop before package downloads
-      ansible.builtin.command:
-        argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
-        stdin: |
-          set -euo pipefail
-          # The robot's isolated NTP source can report an old date as synchronized.
-          # Disable it persistently so it cannot undo this correction or reset it at boot.
-          sudo -n timedatectl set-ntp false
-          sudo -n date --utc --set {{ ('@' ~ dexcontrol_gateway_time.stdout) | quote }}
-          sudo -n hwclock --systohc
-      environment:
-        SSHPASS: "{{ dexmate_pass }}"
-      no_log: true
-      changed_when: true
-      tags: [host, runtime]
-
     - name: Ensure the gateway deployment tools directory exists
       ansible.builtin.file:
         path: "{{ dexcontrol_deploy_tools_dir }}"
@@ -57,11 +34,12 @@
         mode: "0700"
       tags: [host, runtime]
 
-    - name: Install the temporary deployment proxy helper on the gateway
+    - name: Install the temporary deployment helpers on the gateway
       ansible.builtin.copy:
-        src: ../files/with_deploy_proxy.py
-        dest: "{{ dexcontrol_deploy_tools_dir }}/with_deploy_proxy.py"
+        src: "../files/{{ item }}"
+        dest: "{{ dexcontrol_deploy_tools_dir }}/{{ item }}"
         mode: "0700"
+      loop: [with_deploy_proxy.py, with_install_clock.py]
       tags: [host, runtime]
 
     - name: Install Vega host tools and pinned uv

@@ -74,7 +74,7 @@ def wait_for_proxy(process, address):
     raise RuntimeError("The temporary deployment proxy did not become ready.")
 
 
-def run_install(vega_host, ssh_argv, script, timeout_seconds):
+def run_install(vega_host, ssh_argv, script, timeout_seconds, temporary_clock=False):
     gateway_ip, vega_ip = gateway_addresses(vega_host)
     with socket.socket() as reservation:
         reservation.bind((gateway_ip, 0))
@@ -115,6 +115,16 @@ def run_install(vega_host, ssh_argv, script, timeout_seconds):
                 start_new_session=True,
             )
             wait_for_proxy(proxy, (gateway_ip, port))
+            payload = proxy_environment(f"http://{gateway_ip}:{port}") + script
+            if temporary_clock:
+                # Send code and credentials over SSH stdin, never temporary files.
+                # Capture Teleop time immediately before starting the remote stage.
+                helper = Path(__file__).with_name("with_install_clock.py").read_text()
+                settings = json.dumps({"epoch": time.time(), "script": payload})
+                payload = (
+                    f"python3 -c {shlex.quote(helper)} <<'DEXCONTROL_INSTALL_CLOCK'\n"
+                    f"{settings}\nDEXCONTROL_INSTALL_CLOCK\n"
+                )
             remaining = max(1, int(deadline - time.monotonic()))
             # Bound the remote process group too: closing SSH alone need not
             # stop a non-interactive apt/build process on Vega.
@@ -123,7 +133,7 @@ def run_install(vega_host, ssh_argv, script, timeout_seconds):
                 + [
                     "timeout",
                     "--signal=TERM",
-                    "--kill-after=10s",
+                    "--kill-after=30s" if temporary_clock else "--kill-after=10s",
                     f"{remaining}s",
                     "bash",
                     "-s",
@@ -132,7 +142,7 @@ def run_install(vega_host, ssh_argv, script, timeout_seconds):
                 start_new_session=True,
             )
             install.communicate(
-                (proxy_environment(f"http://{gateway_ip}:{port}") + script).encode(),
+                payload.encode(),
                 timeout=max(0.1, deadline - time.monotonic()),
             )
             return install.returncode
@@ -154,6 +164,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vega-host", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=900)
+    parser.add_argument("--temporary-clock", action="store_true")
     parser.add_argument("ssh_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.ssh_argv
@@ -165,7 +176,8 @@ def main():
         signal.signal(sig, interrupted)
     try:
         return run_install(
-            args.vega_host, command, sys.stdin.read(), args.timeout_seconds
+            args.vega_host, command, sys.stdin.read(), args.timeout_seconds,
+            temporary_clock=args.temporary_clock,
         )
     except (
         OSError,

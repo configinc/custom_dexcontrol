@@ -38,4 +38,5 @@ dexcontrol_proxy_ssh_argv: >-
   {{ ['python3', dexcontrol_deploy_tools_dir ~ '/with_deploy_proxy.py',
       '--vega-host', dexmate_ip,
       '--timeout-seconds', dexcontrol_install_timeout_seconds | string,
+      '--temporary-clock',
       '--'] + dexmate_ssh_argv }}
