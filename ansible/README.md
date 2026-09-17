@@ -25,6 +25,7 @@ existing deployment. Override the Vega connection settings in inventory.
 | --- | --- |
 | `dexmate_ip`, `dexmate_user`, `dexmate_pass` | Existing Vega connection settings; traffic passes through the Teleop PC |
 | `dexcontrol_python` | `3.12`; the pinned OMPL dependency has no Python 3.13 wheel |
+| `dexcontrol_install_timeout_seconds` | `900`; maximum duration of each Vega installation stage and its temporary proxy |
 | `dexcontrol_project_dir` | `/home/<dexmate_user>/loop-v2/custom_dexcontrol` on Vega |
 | `dexcontrol_node_id` | `robot` |
 | `dexcontrol_loop_endpoint` | GPU endpoint override; empty reads the Teleop PC's `LOOP_NODE_GRAPH_NODE_ENDPOINT` at start |
@@ -53,8 +54,30 @@ opens the robot control resources. Arm pose presets, gripper devices, and contro
 rates come from [Node Config](../src/loop_bridge/README.md#node-config).
 Unit Config is not read.
 
+Vega does not need its own internet connection for deployment. Each installation
+stage starts a temporary Tinyproxy process on the Teleop PC and routes Vega's
+APT, pip, uv, and Git HTTPS downloads through it. Teleop must have internet access
+and be able to reach Vega over SSH. The proxy binds only to Teleop's Vega-facing
+IPv4 address, on an automatically allocated port, and accepts only Vega's IPv4
+address. DNS for downloads is resolved on Teleop. No route, DNS, firewall, or
+persistent proxy environment is changed on either host. The gateway installs
+`tinyproxy-bin`, which does not install a background proxy service.
+
+The helper stops the proxy and removes its temporary configuration on success,
+failure, or a handled termination signal. An independent process deadline stops
+the proxy even if the helper is forcibly killed; a separate timeout also bounds
+Vega's installation process. Each stage defaults to 15 minutes. Data Studio's
+overall deployment timeout is separate and is not extended by this setting.
+The proxy is not needed when starting or running the installed Robot Node.
+
+Local proxy integration tests use loopback HTTP/HTTPS servers and do not contact
+robots. With `tinyproxy`, `curl`, `openssl`, and pytest available, run
+`python -m pytest tests/deploy/test_proxy.py` from the repository root.
+
 `DOCKER_GITHUB_PAT` on the deployment server is passed transiently to the installer
-for private SDK/Node downloads. Without it, Vega needs GitHub SSH access. An optional
+for private SDK/Node downloads. GitHub SSH URLs are rewritten to HTTPS so they use
+the proxy. Without a token, Vega needs existing GitHub HTTPS credentials; SSH keys
+alone cannot authenticate this deployment path. An optional
 `UV_DEFAULT_INDEX` is also forwarded when a private Python package index is used.
 Neither is written into the startup script or Git configuration.
 

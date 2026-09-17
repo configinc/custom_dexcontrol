@@ -25,19 +25,24 @@
 
     - name: Install the Loop runtime on Vega
       ansible.builtin.command:
-        argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
+        argv: "{{ dexcontrol_proxy_ssh_argv }}"
         stdin: |
           set -euo pipefail
           export PATH={{ (dexcontrol_tools_dir ~ '/bin') | quote }}:"$PATH"
           export GIT_TERMINAL_PROMPT=0
-          export GIT_SSH_COMMAND='ssh -o BatchMode=yes'
+          # Git SSH cannot use an HTTP proxy. Rewrite GitHub downloads to HTTPS,
+          # with transient token authentication when supplied by the deploy server.
+          export GIT_CONFIG_COUNT=3
           {% if lookup('ansible.builtin.env', 'DOCKER_GITHUB_PAT') %}
-          export GIT_CONFIG_COUNT=2
           export GIT_CONFIG_KEY_0={{ ('url.https://' ~ lookup('ansible.builtin.env', 'DOCKER_GITHUB_PAT') ~ '@github.com/.insteadOf') | quote }}
+          {% else %}
+          export GIT_CONFIG_KEY_0='url.https://github.com/.insteadOf'
+          {% endif %}
           export GIT_CONFIG_VALUE_0='git@github.com:'
           export GIT_CONFIG_KEY_1="$GIT_CONFIG_KEY_0"
           export GIT_CONFIG_VALUE_1='https://github.com/'
-          {% endif %}
+          export GIT_CONFIG_KEY_2="$GIT_CONFIG_KEY_0"
+          export GIT_CONFIG_VALUE_2='ssh://git@github.com/'
           {% if lookup('ansible.builtin.env', 'UV_DEFAULT_INDEX') %}
           export UV_DEFAULT_INDEX={{ lookup('ansible.builtin.env', 'UV_DEFAULT_INDEX') | quote }}
           {% endif %}

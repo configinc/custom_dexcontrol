@@ -10,6 +10,9 @@ dexcontrol_project_dir: "/home/{{ dexmate_user }}/loop-v2/custom_dexcontrol"
 dexcontrol_tools_dir: "/home/{{ dexmate_user }}/.local/share/dexcontrol-tools"
 dexcontrol_python: "3.12"
 dexcontrol_uv_version: "0.11.28"
+# Temporary proxy helper on Teleop; no persistent proxy service or network changes.
+dexcontrol_deploy_tools_dir: "{{ ansible_facts['user_dir'] }}/.local/share/dexcontrol-deploy"
+dexcontrol_install_timeout_seconds: 900
 dexcontrol_start_script: "/home/{{ dexmate_user }}/start_vega_robot_node.sh"
 dexcontrol_tmux_session: vega-loop-robot
 dexcontrol_node_id: robot
@@ -30,4 +33,13 @@ dexmate_ssh_argv:
   - StrictHostKeyChecking=accept-new
   - -o
   - ConnectTimeout=10
+  - -o
+  - ServerAliveInterval=5
+  - -o
+  - ServerAliveCountMax=3
   - "{{ dexmate_user }}@{{ dexmate_ip }}"
+dexcontrol_proxy_ssh_argv: >-
+  {{ ['python3', dexcontrol_deploy_tools_dir ~ '/with_deploy_proxy.py',
+      '--vega-host', dexmate_ip,
+      '--timeout-seconds', dexcontrol_install_timeout_seconds | string,
+      '--'] + dexmate_ssh_argv }}

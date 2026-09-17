@@ -10,24 +10,42 @@
         that:
           - dexcontrol_project_dir.startswith('/') and dexcontrol_project_dir != '/'
           - dexcontrol_staging_dir.startswith('/') and dexcontrol_staging_dir != '/'
+          - dexcontrol_install_timeout_seconds | int > 0
       tags: always
 
     - name: Install gateway transfer tools
       become: true
       ansible.builtin.apt:
-        name: [sshpass, rsync, tmux, socat, iproute2, python3]
+        # The binary-only package does not install a system-wide proxy service.
+        name: [sshpass, rsync, tmux, socat, iproute2, python3, tinyproxy-bin]
         state: present
         update_cache: true
         cache_valid_time: 3600
-      tags: host
+      tags: [host, runtime]
+
+    - name: Ensure the gateway deployment tools directory exists
+      ansible.builtin.file:
+        path: "{{ dexcontrol_deploy_tools_dir }}"
+        state: directory
+        mode: "0700"
+      tags: [host, runtime]
+
+    - name: Install the temporary deployment proxy helper on the gateway
+      ansible.builtin.copy:
+        src: ../files/with_deploy_proxy.py
+        dest: "{{ dexcontrol_deploy_tools_dir }}/with_deploy_proxy.py"
+        mode: "0700"
+      tags: [host, runtime]
 
     - name: Install Vega host tools and pinned uv
       ansible.builtin.command:
-        argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
+        argv: "{{ dexcontrol_proxy_ssh_argv }}"
         stdin: |
           set -euo pipefail
-          sudo -n apt-get update
-          sudo -n apt-get install -y ca-certificates git rsync tmux python3-venv build-essential cmake ninja-build libgl1 libegl1 libcap2-bin
+          # sudo normally drops proxy environment variables; pass APT options explicitly.
+          apt=(sudo -n apt-get -o "Acquire::http::Proxy=$http_proxy" -o "Acquire::https::Proxy=$https_proxy")
+          "${apt[@]}" update
+          "${apt[@]}" install -y ca-certificates git rsync tmux python3-venv build-essential cmake ninja-build libgl1 libegl1 libcap2-bin
           tools_dir={{ dexcontrol_tools_dir | quote }}
           if [ ! -x "$tools_dir/bin/python" ]; then
             python3 -m venv "$tools_dir"
