@@ -17,7 +17,7 @@
       become: true
       ansible.builtin.apt:
         # The binary-only package does not install a system-wide proxy service.
-        name: [sshpass, rsync, tmux, socat, iproute2, python3, tinyproxy-bin]
+        name: [sshpass, rsync, iproute2, python3, tinyproxy-bin]
         state: present
         update_cache: true
         cache_valid_time: 3600

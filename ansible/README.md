@@ -8,13 +8,12 @@ existing Loop installation.
 - To return: **Stop Robot/UTI**, then use the existing Robot, Inference and Recorder restart buttons.
 
 The deployment server copies this checkout through the Teleop PC to the Vega PC.
-Vega runs one dual-arm Loop Robot Node in a uv environment. The Teleop PC runs
-a `socat` relay; UTI runs separately. Deployment installs both launchers without
-starting either process.
+Vega runs one dual-arm Loop Robot Node in a uv environment and connects directly
+to Loop on the Teleop PC. UTI runs on Teleop separately. Deployment installs the
+Vega launcher without starting the Robot Node.
 
 ```bash
-ansible-playbook -i inventory.ini ansible/install/deploy.yml --ask-become-pass \
-  -e dexcontrol_loop_endpoint=tcp/loop-host:7448
+ansible-playbook -i inventory.ini ansible/install/deploy.yml --ask-become-pass
 ```
 
 The checkout must include its gripper submodules (`git submodule update --init`).
@@ -28,28 +27,33 @@ existing deployment. Override the Vega connection settings in inventory.
 | `dexcontrol_install_timeout_seconds` | `900`; maximum duration of each Vega installation stage and its temporary proxy |
 | `dexcontrol_project_dir` | `/home/<dexmate_user>/loop-v2/custom_dexcontrol` on Vega |
 | `dexcontrol_node_id` | `robot` |
-| `dexcontrol_loop_endpoint` | GPU endpoint override; empty reads the Teleop PC's `LOOP_NODE_GRAPH_NODE_ENDPOINT` at start |
-| `dexcontrol_relay_port` | `7448` on the Teleop PC |
-| `dexcontrol_relay_bind_address` | Empty; detect the Teleop IPv4 address used to reach Vega |
-| `dexcontrol_relay_tmux_session` | `vega-loop-relay` |
+| `dexcontrol_loop_endpoint` | Direct Loop endpoint override; empty reads Teleop's `LOOP_NODE_GRAPH_NODE_ENDPOINT` at start |
 | `dexcontrol_robot_name`, `dexcontrol_zenoh_config` | Optional overrides for Vega's DexComm environment, separate from the Loop connection |
 
 The Vega launcher loads `/etc/profile.d/10-dexmate-robot.sh` when present, just
 as the legacy login shell did. This reads the device's existing `ROBOT_NAME`;
 explicit deployment overrides are applied afterward.
 
-Set `LOOP_NODE_GRAPH_NODE_ENDPOINT=tcp/GPU_HOST:7448` in the **Teleop PC's**
-SSH environment. The relay accepts Vega connections on the Teleop interface
-facing `dexmate_ip`, then forwards them to that GPU endpoint. TCP IPv4 addresses
-and hostnames are supported. Use the GPU's wired address for the wired path.
+Run Loop on the **Teleop PC**, listening on its Vega-facing interface. Loop's
+default `tcp/0.0.0.0:7448` listener supports this. Set the direct endpoint manually
+in Teleop's SSH environment, replacing any previous GPU address:
 
-```text
-Vega Robot Node -> Teleop socat (:7448) -> GPU Loop
+```bash
+export LOOP_NODE_GRAPH_NODE_ENDPOINT=tcp/TELEOP_VEGA_IP:7448
 ```
 
-Deployment writes the relay address into Vega's startup script. Service start
-redetects the address and passes it to the node, so it does not depend on a stale
-tmux environment. The launcher registers in IDLE; Loop Start
+Use Teleop's wired IP reachable from Vega, not `127.0.0.1` or `0.0.0.0`.
+UTI on Teleop can use the same endpoint. Alternatively, set
+`-e dexcontrol_loop_endpoint=tcp/TELEOP_VEGA_IP:7448` when deploying this robot.
+The script passes the configured address directly to Vega; it does not detect
+addresses or create a runtime TCP relay.
+
+```text
+Vega Robot Node -> Teleop Loop (:7448)
+```
+
+Service start passes the configured endpoint to the node explicitly, so it does
+not depend on a stale Vega tmux environment. The launcher registers in IDLE; Loop Start
 opens the robot control resources. Arm pose presets, gripper devices, and control
 rates come from [Node Config](../src/loop_bridge/README.md#node-config).
 Unit Config is not read.
@@ -86,7 +90,9 @@ Python under `.python` with EtherCAT permissions. It does not change permissions
 on a shared or system interpreter. Hardware selection happens at Configure.
 
 Sync preserves `.venv`, `.python`, `third_party`, environment files, and `unit_config.json`.
-Running `vega-loop-robot` or `vega-loop-relay` sessions block deployment; stop Robot/UTI first.
+Running `vega-loop-robot` sessions block deployment; stop Robot/UTI first.
+Stop any old `vega-loop-relay` manually before starting Loop on Teleop's port
+7448. The new service controls do not manage that relay.
 The legacy `robot-server` session is separate. Deployment also saves the robot SSH
 connection in `~/loop-v2/vega-connection.json` on the Teleop PC (owner access only),
 so Service Controls can stop Vega without downloading a repository.
@@ -101,10 +107,10 @@ DS Layout calls `~/loop-v2/custom_dexcontrol/loop-service.sh` on the Teleop PC:
 
 | Command | Behavior |
 | --- | --- |
-| `preflight COMMIT` | Check the installed robot revision, relay tools, and connection settings |
-| `start` | Start the relay tmux, then the Vega robot tmux; remove the relay if robot startup fails |
-| `stop` | Stop Vega, then the relay; attempt relay cleanup even if Vega is unreachable |
-| `check-stopped` | Require both tmux sessions to be stopped |
+| `preflight COMMIT` | Check the installed robot revision, SSH tools, and direct Loop endpoint |
+| `start` | Start the Vega robot tmux with the manually configured Loop endpoint |
+| `stop` | Stop the Vega robot tmux |
+| `check-stopped` | Require the Vega robot tmux to be stopped |
 
 The same commands can be run manually from the Teleop PC. Deployment saves paths
 and session names in `.env.loop-service`; the robot SSH password remains in the
