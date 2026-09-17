@@ -1,7 +1,7 @@
 # Vega deployment
 
 Data Studio Layout's **Loop v2** mode installs under `~/loop-v2/`.
-Deployment never stops or starts services. Stop Loop Robot/UTI before updating an
+Deployment never stops or starts Robot/UTI services. Stop Loop Robot/UTI before updating an
 existing Loop installation.
 
 - To use Loop: **Deploy Loop Nodes → Stop Existing Services → Start / Restart Robot/UTI**.
@@ -67,6 +67,14 @@ the proxy even if the helper is forcibly killed; a separate timeout also bounds
 Vega's installation process. Each stage defaults to 15 minutes. Data Studio's
 overall deployment timeout is separate and is not extended by this setting.
 The proxy is not needed when starting or running the installed Robot Node.
+
+Before Vega package downloads, host setup copies the Teleop PC's current time
+to Vega and saves it to Vega's hardware clock. This also runs with `--tags runtime`.
+Vega's NTP synchronization is disabled persistently: its isolated robot time source
+can report an old date as synchronized and would otherwise undo the correction.
+Teleop must have the correct time. Vega keeps its clock locally between deployments;
+this does not add a continuous time synchronization service. APT date checks and TLS
+certificate verification remain enabled.
 
 Local proxy integration tests use loopback HTTP/HTTPS servers and do not contact
 robots. With `tinyproxy`, `curl`, `openssl`, and pytest available, run
