@@ -30,7 +30,6 @@ def service(tmp_path):
         "robot_start_script": str(robot / "start.sh"),
         "robot_session": "vega-loop-robot",
         "connection_file": str(connection),
-        "loop_endpoint": "",
     }
     (robot / "ansible/files/service_control.sh").write_text(
         """record() {
@@ -63,8 +62,7 @@ sys.exit(subprocess.call(shlex.split(sys.argv[-1])))
         script.chmod(0o755)
     log = tmp_path / "calls.jsonl"
 
-    def run(*args, endpoint="", **overrides):
-        settings["loop_endpoint"] = endpoint
+    def run(*args, **overrides):
         (teleop / ".env.loop-service").write_text(
             "".join(f"{key}={shlex.quote(value)}\n" for key, value in settings.items())
         )
@@ -89,31 +87,12 @@ sys.exit(subprocess.call(shlex.split(sys.argv[-1])))
     return run
 
 
-def test_start_passes_manually_configured_endpoint_directly(service):
-    for address in ("192.168.5.17", "192.168.5.19"):
-        result, calls = service(
-            "start", LOOP_NODE_GRAPH_NODE_ENDPOINT=f"tcp/{address}:7448"
-        )
-        assert result.returncode == 0, result.stderr
-        assert [call[0] for call in calls] == ["check-stopped", "start"]
-        assert calls[-1][-2:] == ["--loop-endpoint", f"tcp/{address}:7448"]
-
-
-def test_deployment_override_takes_priority_over_the_environment(service):
-    result, calls = service(
-        "start",
-        endpoint="tcp/teleop-wired:17448",
-        LOOP_NODE_GRAPH_NODE_ENDPOINT="tcp/previous-gpu:7448",
-    )
+@pytest.mark.parametrize("endpoint", ["", "tcp/0.0.0.0:7448", "tcp/previous-gpu:7448"])
+def test_start_uses_vega_launcher_without_a_teleop_endpoint(service, endpoint):
+    result, calls = service("start", LOOP_NODE_GRAPH_NODE_ENDPOINT=endpoint)
     assert result.returncode == 0, result.stderr
-    assert calls[-1][-2:] == ["--loop-endpoint", "tcp/teleop-wired:17448"]
-
-
-def test_missing_endpoint_requires_manual_configuration(service):
-    result, calls = service("start", LOOP_NODE_GRAPH_NODE_ENDPOINT="")
-    assert result.returncode != 0
-    assert "Set LOOP_NODE_GRAPH_NODE_ENDPOINT" in result.stderr
-    assert calls == []
+    assert [call[0] for call in calls] == ["check-stopped", "start"]
+    assert len(calls[-1]) == 4  # start_session receives only session, project, script.
 
 
 def test_busy_robot_is_not_restarted(service):
@@ -129,7 +108,9 @@ def test_failed_start_cleans_up_only_the_robot(service):
 
 
 def test_preflight_checks_robot_revision_without_relay(service):
-    result, calls = service("preflight", "fixture-commit")
+    result, calls = service(
+        "preflight", "fixture-commit", LOOP_NODE_GRAPH_NODE_ENDPOINT=""
+    )
     assert result.returncode == 0, result.stderr
     assert [call[0] for call in calls] == ["preflight"]
     assert calls[0][2] == "fixture-commit"

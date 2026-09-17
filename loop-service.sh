@@ -20,31 +20,21 @@ shift 4
 source "$project/ansible/files/service_control.sh"
 case "$action" in
     preflight) check_install "$project" "$1" "$script" .venv/bin/dexcontrol-loop-robot-node ;;
-    start) start_session "$session" "$project" "$script" --loop-endpoint "$1" ;;
+    start) start_session "$session" "$project" "$script" ;;
     stop) stop_session "$session" ;;
     check-stopped) require_stopped "$session" ;;
 esac
 ROBOT
 }
 
-resolve_loop_endpoint() {
-    loop_endpoint=${loop_endpoint:-${LOOP_NODE_GRAPH_NODE_ENDPOINT:-}}
-    if [[ ! "$loop_endpoint" =~ ^tcp/([a-zA-Z0-9_.-]+):([0-9]+)$ ]]; then
-        echo 'Set LOOP_NODE_GRAPH_NODE_ENDPOINT on Teleop to tcp/TELEOP_VEGA_IP:PORT, or set dexcontrol_loop_endpoint when deploying.' >&2
-        return 1
-    fi
-}
-
 case "${1:-}" in
     preflight)
         for tool in sshpass python3; do command -v "$tool" >/dev/null; done
-        resolve_loop_endpoint
         remote_robot preflight "${2:?Expected deployed commit is required}"
         ;;
     start)
-        resolve_loop_endpoint
         remote_robot check-stopped
-        if ! remote_robot start "$loop_endpoint"; then
+        if ! remote_robot start; then
             remote_robot stop || true
             exit 1
         fi

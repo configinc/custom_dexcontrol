@@ -9,7 +9,6 @@ From the repository root, with Git, uv, a C++ compiler, CMake, and GitHub access
 
 ```bash
 ./install.sh --extra robotiq
-export LOOP_NODE_GRAPH_NODE_ENDPOINT=tcp/loop-host:7448
 ./run.sh --node-id robot
 ```
 
@@ -20,7 +19,9 @@ per-arm Node Config devices are network interface names. Ansible configures the
 required EtherCAT permissions.
 
 `--loop-endpoint` overrides `LOOP_NODE_GRAPH_NODE_ENDPOINT`; the fallback is
-`tcp/127.0.0.1:7448`. This is the Loop connection. DexComm's `ROBOT_NAME` and
+`tcp/192.168.5.17:7448`, Teleop's fixed wired address on the Vega network.
+Teleop's Loop listener uses `tcp/0.0.0.0:7448`; no manual endpoint setting is
+needed for this layout. This is the Loop connection. DexComm's `ROBOT_NAME` and
 `ZENOH_CONFIG` still configure communication with the physical Vega.
 
 Match `--node-id` to the Robot Node ID in the Loop Cell Config.

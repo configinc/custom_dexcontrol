@@ -27,33 +27,27 @@ existing deployment. Override the Vega connection settings in inventory.
 | `dexcontrol_install_timeout_seconds` | `900`; maximum duration of each Vega installation stage and its temporary proxy |
 | `dexcontrol_project_dir` | `/home/<dexmate_user>/loop-v2/custom_dexcontrol` on Vega |
 | `dexcontrol_node_id` | `robot` |
-| `dexcontrol_loop_endpoint` | Direct Loop endpoint override; empty reads Teleop's `LOOP_NODE_GRAPH_NODE_ENDPOINT` at start |
+| `dexcontrol_loop_endpoint` | `tcp/192.168.5.17:7448`; Teleop's fixed wired address, written to Vega's launcher |
 | `dexcontrol_robot_name`, `dexcontrol_zenoh_config` | Optional overrides for Vega's DexComm environment, separate from the Loop connection |
 
 The Vega launcher loads `/etc/profile.d/10-dexmate-robot.sh` when present, just
 as the legacy login shell did. This reads the device's existing `ROBOT_NAME`;
 explicit deployment overrides are applied afterward.
 
-Run Loop on the **Teleop PC**, listening on its Vega-facing interface. Loop's
-default `tcp/0.0.0.0:7448` listener supports this. Set the direct endpoint manually
-in Teleop's SSH environment, replacing any previous GPU address:
-
-```bash
-export LOOP_NODE_GRAPH_NODE_ENDPOINT=tcp/TELEOP_VEGA_IP:7448
-```
-
-Use Teleop's wired IP reachable from Vega, not `127.0.0.1` or `0.0.0.0`.
-UTI on Teleop can use the same endpoint. Alternatively, set
-`-e dexcontrol_loop_endpoint=tcp/TELEOP_VEGA_IP:7448` when deploying this robot.
-The script passes the configured address directly to Vega; it does not detect
-addresses or create a runtime TCP relay.
+Loop on the **Teleop PC** listens on `tcp/0.0.0.0:7448` by default. The **Vega
+Robot Node** connects to `tcp/192.168.5.17:7448`, Teleop's fixed wired address on
+the Vega network. Both the node CLI and the deployed Vega launcher use this
+default, so no manual endpoint configuration is needed for this network layout.
+For a different layout, override `dexcontrol_loop_endpoint` when deploying.
+Teleop's environment does not control Vega's endpoint. No runtime TCP relay or
+address detection is used.
 
 ```text
-Vega Robot Node -> Teleop Loop (:7448)
+Vega Robot Node (192.168.5.20) -> Teleop Loop (192.168.5.17:7448)
 ```
 
-Service start passes the configured endpoint to the node explicitly, so it does
-not depend on a stale Vega tmux environment. The launcher registers in IDLE; Loop Start
+Service start launches Vega's configured script without passing a Teleop endpoint.
+The launcher registers in IDLE; Loop Start
 opens the robot control resources. Arm pose presets, gripper devices, and control
 rates come from [Node Config](../src/loop_bridge/README.md#node-config).
 Unit Config is not read.
@@ -107,8 +101,8 @@ DS Layout calls `~/loop-v2/custom_dexcontrol/loop-service.sh` on the Teleop PC:
 
 | Command | Behavior |
 | --- | --- |
-| `preflight COMMIT` | Check the installed robot revision, SSH tools, and direct Loop endpoint |
-| `start` | Start the Vega robot tmux with the manually configured Loop endpoint |
+| `preflight COMMIT` | Check the installed robot revision and SSH tools |
+| `start` | Start the Vega robot tmux; the node reads its Loop endpoint on Vega |
 | `stop` | Stop the Vega robot tmux |
 | `check-stopped` | Require the Vega robot tmux to be stopped |
 

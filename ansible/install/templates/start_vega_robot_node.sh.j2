@@ -6,9 +6,7 @@ if [[ -r /etc/profile.d/10-dexmate-robot.sh ]]; then
     source /etc/profile.d/10-dexmate-robot.sh
 fi
 
-{% if dexcontrol_loop_endpoint %}
 export LOOP_NODE_GRAPH_NODE_ENDPOINT={{ dexcontrol_loop_endpoint | quote }}
-{% endif %}
 {% if dexcontrol_robot_name %}
 export ROBOT_NAME={{ dexcontrol_robot_name | quote }}
 {% endif %}

@@ -18,8 +18,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--node-id", required=True)
     parser.add_argument(
         "--loop-endpoint",
-        default=os.environ.get("LOOP_NODE_GRAPH_NODE_ENDPOINT") or "tcp/127.0.0.1:7448",
-        help="Loop address (default: LOOP_NODE_GRAPH_NODE_ENDPOINT or tcp/127.0.0.1:7448)",
+        default=os.environ.get("LOOP_NODE_GRAPH_NODE_ENDPOINT")
+        or "tcp/192.168.5.17:7448",
+        help="Loop address (default: LOOP_NODE_GRAPH_NODE_ENDPOINT or tcp/192.168.5.17:7448)",
     )
     parser.add_argument("--status-period-ms", type=_positive_int, default=250)
     parser.add_argument("--control-request-capacity", type=_positive_int, default=16)

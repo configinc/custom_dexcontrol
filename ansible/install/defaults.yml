@@ -16,8 +16,8 @@ dexcontrol_install_timeout_seconds: 900
 dexcontrol_start_script: "/home/{{ dexmate_user }}/start_vega_robot_node.sh"
 dexcontrol_tmux_session: vega-loop-robot
 dexcontrol_node_id: robot
-# Direct Loop endpoint override; empty reads the Teleop environment at start.
-dexcontrol_loop_endpoint: ""
+# Teleop's fixed wired address on the Vega network, written to Vega's launcher.
+dexcontrol_loop_endpoint: "tcp/192.168.5.17:7448"
 dexcontrol_robot_name: ""
 dexcontrol_zenoh_config: ""
 dexmate_ssh_argv:
