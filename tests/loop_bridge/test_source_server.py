@@ -703,12 +703,16 @@ def test_control_ticks_continue_without_targets_or_waiting_for_publication(monke
             assert advanced.wait(2), "Publication blocked motor control"
         with node._tick_lock:
             assert len(published) == 1
-            assert tick_order[:4] == [
-                "capture left",
-                "capture right",
-                "command left",
-                "command right",
-            ]
+            assert (
+                tick_order[:12]
+                == [
+                    "capture left",
+                    "capture right",
+                    "command left",
+                    "command right",
+                ]
+                * 3
+            )
             assert published[0][0]["left.gripper_position"] == 0
             release.set()
             assert resumed_publish.wait(2)
@@ -719,6 +723,28 @@ def test_control_ticks_continue_without_targets_or_waiting_for_publication(monke
         release.set()
         runtime.shutdown()
     assert node._pending_snapshot is None
+
+
+@pytest.mark.parametrize("stop_after_commands", [1, 3])
+def test_stop_between_arms_prevents_the_remaining_command(
+    monkeypatch, stop_after_commands
+):
+    module = _import_source_server(monkeypatch)
+    left, right = _FakeService(), _FakeService()
+    node = module.VegaRobotNode([("left", left), ("right", right)])
+    commands = []
+
+    def tick(arm):
+        commands.append(arm)
+        if len(commands) == stop_after_commands:
+            node._worker_stop.set()
+
+    left.execute_control_tick = lambda: tick("left")
+    right.execute_control_tick = lambda: tick("right")
+    node._control_loop(200)
+
+    assert commands == ["left", "right", "left"][:stop_after_commands]
+    assert node._worker_error is None
 
 
 def test_home_excludes_interpolation_and_control_resumes_after_both_arms(monkeypatch):
