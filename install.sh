@@ -3,9 +3,6 @@ set -euo pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
-source "$project_dir/scripts/dependencies.sh"
-prepare_dependency loop-sdk
-prepare_dependency loop
 
 for gripper in robotiq_2f_85_controller sr_gripper_controller; do
     if [[ ! -f "$project_dir/$gripper/pyproject.toml" ]]; then

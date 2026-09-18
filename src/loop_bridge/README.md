@@ -12,8 +12,10 @@ From the repository root, with Git, uv, a C++ compiler, CMake, and GitHub access
 ./run.sh --node-id robot
 ```
 
-The installer creates a Python 3.12 `.venv`, downloads pinned SDK/Node sources to
-`third_party`, and installs the selected gripper. Use `--extra sr-gripper` for SR
+The installer creates a Python 3.12 `.venv`, installs the published `loop-sdk`
+0.6.x and `loop-node` 0.3.x wheels from PyPI using `uv.lock`, and installs the
+selected gripper. Loop must use `loop-node` 0.3.x (control protocol version 2);
+update Loop and external Nodes together. Use `--extra sr-gripper` for SR
 EtherCAT grippers, or omit the gripper extra for built-in hands. With SR, the
 per-arm Node Config devices are network interface names. Ansible configures the
 required EtherCAT permissions.

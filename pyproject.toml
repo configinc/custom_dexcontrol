@@ -61,8 +61,8 @@ example = [
     "tyro",
 ]
 loop = [
-    "loop-sdk>=0.4.2.dev0",
-    "loop-node>=0.1.0,<0.2.0",
+    "loop-sdk>=0.6.0,<0.7.0",
+    "loop-node>=0.3.0,<0.4.0",
 ]
 robotiq = ["robotiq-2f-85-controller==0.1.0"]
 sr-gripper = ["sr-gripper-controller"]
@@ -95,8 +95,6 @@ ignore = ["F722", "E501"]
 "**/__init__.py" = ["F401"]
 
 [tool.uv.sources]
-loop-sdk = { path = "third_party/loop-sdk", editable = true }
-loop-node = { path = "third_party/loop/packages/loop-node", editable = true }
 robotiq-2f-85-controller = { path = "robotiq_2f_85_controller", editable = true }
 sr-gripper-controller = { path = "sr_gripper_controller", editable = true }
 
