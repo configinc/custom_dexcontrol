@@ -1,10 +1,17 @@
 # Vega deployment
 
 Data Studio Layout's **Loop v2** mode installs under `~/loop-v2/`.
-Deployment never stops or starts Robot/UTI services. Stop Loop Robot/UTI before updating an
+Host setup gracefully stops Vega's legacy `robot-server` and Loop robot sessions
+before installation. It does not start services or stop Teleop's UTI, Inference,
+or Recorder. DS Layout still requires **Stop Robot/UTI** before updating an
 existing Loop installation.
 
-- To use Loop: **Stop Existing Services → Deploy Loop Nodes → Start / Restart Robot/UTI**.
+- First installation: **Deploy Vega Robot Node → Deploy UTI → Stop Existing Services → Start / Restart Robot/UTI**.
+  Vega deployment stops its old robot server and creates the connection file
+  needed by **Stop Existing Services**. That button can then stop the remaining
+  legacy services on Teleop.
+- With an existing Vega connection file, **Stop Existing Services** can also run
+  before deployment.
 - To return: **Stop Robot/UTI**, then use the existing Robot, Inference and Recorder restart buttons.
 
 The deployment server copies this checkout through the Teleop PC to the Vega PC.
@@ -99,8 +106,12 @@ Python under `.python` with EtherCAT permissions. It does not change permissions
 on a shared or system interpreter. Hardware selection happens at Configure.
 
 Sync preserves `.venv`, `.python`, `third_party`, environment files, and `unit_config.json`.
-Running `vega-loop-robot` or legacy `robot-server` sessions block deployment;
-stop Robot/UTI and existing robot services first.
+Host setup sends Ctrl+C to `vega-loop-robot` and legacy `robot-server`, waits up to
+30 seconds per session, and closes any remaining idle shell. If either service
+does not finish shutdown, installation stops before changing Vega's clock or
+replacing its source. Source synchronization checks again that both are stopped.
+The stop script is supplied by the deployment checkout over SSH; it does not
+require an installed Loop repository or `vega-connection.json` on the target.
 Stop any old `vega-loop-relay` manually before starting Loop on Teleop's port
 7448. The new service controls do not manage that relay.
 The legacy `robot-server` session is separate. Deployment also saves the robot SSH

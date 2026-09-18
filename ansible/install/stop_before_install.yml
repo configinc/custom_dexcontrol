@@ -1,0 +1,18 @@
+---
+- name: Stop Vega robot services before installation
+  ansible.builtin.command:
+    argv: "{{ dexmate_ssh_argv + ['bash', '-s'] }}"
+    stdin: |
+      {{ lookup('ansible.builtin.file', '../files/service_control.sh') }}
+      stop_sessions {{ dexcontrol_tmux_session | quote }} robot-server
+  environment:
+    SSHPASS: "{{ dexmate_pass }}"
+  register: dexcontrol_install_stop
+  failed_when: false
+  no_log: true
+  changed_when: "'Stopped ' in (dexcontrol_install_stop.stdout | default(''))"
+
+- name: Report why Vega services could not be stopped
+  ansible.builtin.fail:
+    msg: "{{ dexcontrol_install_stop.stderr | default('Could not stop Vega robot services before installation.', true) }}"
+  when: dexcontrol_install_stop.rc | default(1) != 0

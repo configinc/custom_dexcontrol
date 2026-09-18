@@ -23,8 +23,8 @@
         cache_valid_time: 3600
       tags: [host, runtime]
 
-    - name: Require the Vega process to be stopped before adjusting its clock
-      ansible.builtin.import_tasks: check_stopped.yml
+    - name: Stop Vega robot services before adjusting its clock
+      ansible.builtin.import_tasks: stop_before_install.yml
       tags: [host, runtime]
 
     - name: Ensure the gateway deployment tools directory exists

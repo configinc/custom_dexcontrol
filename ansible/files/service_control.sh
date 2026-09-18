@@ -36,6 +36,20 @@ stop_session() {
     return 1
 }
 
+stop_sessions() {
+    local session failed=0
+    for session in "$@"; do
+        has_session "$session" || continue
+        if stop_session "$session"; then
+            echo "Stopped $session"
+        else
+            failed=1
+        fi
+    done
+    require_stopped "$@" || failed=1
+    return "$failed"
+}
+
 check_install() {
     local project=$1 commit=$2 script=$3 executable=$4
     if ! test -x "$script" || ! test -x "$project/$executable" ||
