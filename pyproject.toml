@@ -101,8 +101,15 @@ sr-gripper-controller = { path = "sr_gripper_controller", editable = true }
 [tool.uv]
 # ruckig 0.17.3 still uses the cmake.targets setting removed in 0.10.
 build-constraint-dependencies = ["scikit-build-core==0.9.10"]
-# Match Vega's existing runtime: newer viser keeps URDF viewer dependencies optional.
-constraint-dependencies = ["viser==1.0.30"]
+constraint-dependencies = [
+    # Match the working RCI runtime's IK library, robot model, and NumPy.
+    "dexmotion==0.4.1",
+    "dexmate-urdf==0.8.3",
+    # NumPy 2.4 requires Python 3.11; keep Python 3.10 on its compatible release.
+    "numpy==2.4.6; python_version >= '3.11'",
+    # Newer viser keeps URDF viewer dependencies optional.
+    "viser==1.0.30",
+]
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'aarch64' and python_version == '3.12'",
 ]

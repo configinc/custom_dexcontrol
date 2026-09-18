@@ -20,6 +20,12 @@ EtherCAT grippers, or omit the gripper extra for built-in hands. With SR, the
 per-arm Node Config devices are network interface names. Ansible configures the
 required EtherCAT permissions.
 
+The deployment constraints in `pyproject.toml` and `uv.lock` keep DexMotion at
+0.4.1, `dexmate-urdf` at 0.8.3, and NumPy at 2.4.6 to match the working RCI
+runtime's IK library and robot model. The NumPy pin applies to Python 3.11 and
+later; Python 3.10 retains a compatible NumPy release. Use the installer to
+apply these constraints; a plain `pip install` does not apply uv constraints.
+
 `--loop-endpoint` overrides `LOOP_NODE_GRAPH_NODE_ENDPOINT`; the fallback is
 `tcp/192.168.5.17:7448`, Teleop's fixed wired address on the Vega network.
 Teleop's Loop listener uses `tcp/0.0.0.0:7448`; no manual endpoint setting is

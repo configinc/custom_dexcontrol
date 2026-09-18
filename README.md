@@ -22,8 +22,9 @@ Loop sends Configure before Start. Configure applies Node Config; Start activate
 the robot. Stop and ResetFault return to IDLE, requiring Configure for the next run.
 
 Use the [Vega Robot Node](src/loop_bridge/README.md) for Loop integration.
-It controls both arms in one process, with uv installation and pinned SDK/Node
-sources. See [Ansible deployment](ansible/README.md) for the Teleop-to-Vega setup.
+It controls both arms in one process, with uv installation, published SDK/Node
+packages, and control dependencies matched to the working RCI runtime.
+See [Ansible deployment](ansible/README.md) for the Teleop-to-Vega setup.
 
 ### Robotiq 2F-85 Gripper (optional)
 
