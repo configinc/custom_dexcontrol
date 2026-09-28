@@ -192,11 +192,14 @@
         right_gripper_port: ""
       when: gripper_type in ["vega_hand", "wuji_hand_v1", "wuji_hand_v2"]
 
-    # Installed for every 5-finger unit, vega_hand included: the hand on a
-    # unit can be swapped without a host visit, so the driver is pre-staged.
-    # Required only for wuji_hand_v1/v2 — for vega_hand it is a convenience,
-    # so a pip failure there must NOT abort the play before the servers are
-    # (re)started further down.
+    # Installed on EVERY unit, whatever gripper_type says right now: a unit is
+    # expected to switch between vega_hand and wuji_hand_v1/v2 with a config
+    # change alone, and the driver has to already be in the robot env when that
+    # happens (no host visit). Same contract RCI's deploy.yml gives the teleop
+    # host, which installs wuji-sdk unconditionally and best-effort.
+    # Hard failure ONLY when a wuji hand is the gripper actually selected — on
+    # any other unit this is pre-staging, and a pip failure there must NOT abort
+    # the play before the servers are (re)started further down.
     # The wuji hand v1 is a raw libusb device (VID 0483 / PID 2000, no tty).
     # Its /dev/bus/usb node must be writable by the dexmate user or the SDK's
     # scan() silently finds nothing. Installing the udev rule needs root —
@@ -232,12 +235,27 @@
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
           'source ~/miniconda3/etc/profile.d/conda.sh && conda activate robot && python -c "import wuji_sdk" \
-           || (conda activate robot && pip install wuji-sdk && python -c "import wuji_sdk")'
+           || (conda activate robot && python -m pip install --no-deps wuji-sdk && python -c "import wuji_sdk")'
       args:
         executable: /bin/bash
       become: false
-      when: gripper_type in ["vega_hand", "wuji_hand_v1", "wuji_hand_v2"]
-      ignore_errors: "{{ gripper_type == 'vega_hand' }}"
+      register: wuji_sdk_install
+      ignore_errors: "{{ gripper_type not in ['wuji_hand_v1', 'wuji_hand_v2'] }}"
+
+    # An ignored failure still prints as a red "fatal:" block, which reads like
+    # an abort. Say plainly what it means for a unit that does not need it.
+    - name: Note that wuji-sdk pre-staging did not land (not needed by this gripper)
+      debug:
+        msg: >-
+          wuji-sdk is NOT installed in the robot env on dexmate. Harmless for
+          gripper_type={{ gripper_type }} — the servers start without it — but
+          switching this unit to wuji_hand_v1/v2 later will need it. Usual cause
+          is no PyPI route from dexmate; fix that and rerun, or install by hand:
+          conda activate robot && python -m pip install --no-deps wuji-sdk
+      when:
+        - gripper_type not in ["wuji_hand_v1", "wuji_hand_v2"]
+        - wuji_sdk_install is defined
+        - wuji_sdk_install.failed | default(false)
 
     # ── Wuji hand identity (per-unit left/right serial map) ─────────────────
     # Serials carry no handedness on shipped units, so each host keeps its own
