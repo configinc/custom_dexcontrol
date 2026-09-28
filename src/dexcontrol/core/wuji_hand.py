@@ -318,6 +318,10 @@ class WujiHandAdapter:
         if handedness not in ("left", "right"):
             raise ValueError(f"handedness must be 'left' or 'right', got {handedness!r}")
         self._handedness = handedness
+        self._current_summary = None
+        if os.environ.get("WUJI_LOG_CURRENT", "0").lower() in ("1", "on", "true"):
+            from dexcontrol.core.wuji_current import CurrentSummary
+            self._current_summary = CurrentSummary(handedness, effort_limit, mit_kp, mit_kd)
         self._tactile_raw = os.environ.get("WUJI_TACTILE_RAW", "0").lower() in (
             "1", "on", "true",
         )
@@ -1168,6 +1172,19 @@ class WujiHandAdapter:
             # not a live link, and must pause the command stream like silence.
             if any_valid:
                 self._last_state_time = now
+            if self._is_hand2 and getattr(self, "_current_summary", None) is not None:
+                # Observe the existing subscription only; never connect a second
+                # SDK client or change stream rates while teleop owns the hand.
+                try:
+                    report = self._current_summary.sample(
+                        latest.joints, lambda nid: _nid_to_joint(nid, scheme),
+                        self._cmd_pos, now,
+                    )
+                    if report is not None:
+                        logger.info("WUJI_CURRENT {}", json.dumps(report, allow_nan=False))
+                except Exception as exc:
+                    logger.warning("Wuji current logging disabled after error: {}", exc)
+                    self._current_summary = None
         except Exception as e:
             logger.warning("Wuji hand worker state refresh error: {}", e)
 
