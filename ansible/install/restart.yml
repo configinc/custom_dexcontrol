@@ -29,8 +29,8 @@
     # These stay empty; use `-e wuji_right_sn=...` only for a one-off override.
     wuji_left_sn: ""
     wuji_right_sn: ""
-    # Read-only Hand 2 current/position-error logs, once per second. No gain changes.
-    wuji_log_current: true
+    # Opt-in Hand 2 diagnostics: -e wuji_log_current=true adds WUJI_LOG_CURRENT=1.
+    wuji_log_current: false
     # Try identify_hands.py --auto (reads the handedness the SDK reports; no
     # motion) when the host has no map yet. Set false to always identify by hand.
     wuji_auto_identify: true

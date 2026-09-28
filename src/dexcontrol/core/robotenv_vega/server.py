@@ -77,7 +77,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         ik_solver_type: str = "pink",
         robotiq_comport: str = "/dev/ttyUSB0",
         wuji_sn: Optional[str] = None,
-        wuji_effort_limit: float = 1.5,
+        wuji_effort_limit: Optional[float] = None,
         ema_alpha: float = 0.0,
         ik_damping_default: float = 1e-3,
         ik_damping_torso: float = 30000.0,
@@ -1018,7 +1018,7 @@ def serve(
     ik_solver_type: str = "pink",
     robotiq_comport: str = "/dev/ttyUSB0",
     wuji_sn: Optional[str] = None,
-    wuji_effort_limit: float = 1.5,
+    wuji_effort_limit: Optional[float] = None,
     ema_alpha: float = 0.0,
     ik_damping_default: float = 1e-3,
     ik_damping_torso: float = 30000.0,
@@ -1211,9 +1211,9 @@ def main() -> None:
     parser.add_argument(
         "--wuji-effort-limit",
         type=float,
-        default=1.5,
-        help="Wuji hand per-joint current limit in Amps (default: 1.5; keep low "
-             "during bring-up).",
+        default=None,
+        help="Wuji hand per-joint current limit in Amps "
+             "(default: 1.7 for wuji_hand_v2, 1.5 for wuji_hand_v1).",
     )
     parser.add_argument(
         "--ema-alpha",

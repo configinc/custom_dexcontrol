@@ -129,7 +129,7 @@ class VegaRobot:
         use_velocity_feedforward: bool = False,
         robotiq_comport: str = "/dev/ttyUSB0",
         wuji_sn: str | None = None,
-        wuji_effort_limit: float = 1.5,
+        wuji_effort_limit: float | None = None,
         ema_alpha: float = 0.0,
         interpolation_method: str = "none",
         interpolation_history: int = 4,
@@ -202,6 +202,8 @@ class VegaRobot:
             self.hand = SrGripperAdapter(comport=self._robotiq_comport)
         elif gripper_type in ("wuji_hand_v1", "wuji_hand_v2"):
             from dexcontrol.core.wuji_hand import WujiHandAdapter  # lazy import
+            if wuji_effort_limit is None:
+                wuji_effort_limit = 1.7 if gripper_type == "wuji_hand_v2" else 1.5
             self.hand = WujiHandAdapter(
                 handedness=arm_side,
                 sn=wuji_sn,
