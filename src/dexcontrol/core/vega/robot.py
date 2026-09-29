@@ -940,12 +940,6 @@ class VegaRobot:
             joint_torques = np.zeros(7, dtype=np.float64)
         gripper_position = self.get_cached_gripper_position() if self.hand is not None else 0.0
 
-        external_wrench_world = np.zeros(6, dtype=np.float64)
-        if getattr(self.arm, "wrench_sensor", None) is not None:
-            external_wrench_world = np.asarray(
-                self.arm.wrench_sensor.get_wrench_state(), dtype=np.float64
-            )
-
         cartesian_position = self._get_cartesian_pose(joint_positions=joint_positions)
 
         timestamp_ns = int(self.arm.get_timestamp_ns())
@@ -964,11 +958,15 @@ class VegaRobot:
             "motor_torques_measured": joint_torques.copy(),
             "gripper_position": gripper_position,
             "cartesian_position": cartesian_position,
-            "external_wrench_world": external_wrench_world,
             "prev_controller_latency_ms": float(self._prev_controller_latency_ms),
             "prev_command_successful": bool(self._prev_command_successful),
             "prev_gripper_command_successful": bool(self._prev_gripper_command_successful),
         }
+        wrench_sensor = getattr(self.arm, "wrench_sensor", None)
+        if wrench_sensor is not None:
+            state_dict["external_wrench_world"] = np.asarray(
+                wrench_sensor.get_wrench_state(), dtype=np.float64
+            )
         return state_dict, timestamp_dict
 
     def validate_joint_limits(self, target_joint_pos: np.ndarray) -> None:
