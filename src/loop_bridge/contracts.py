@@ -22,8 +22,10 @@ _OBSERVATION_TENSOR_SHAPES: Mapping[str, tuple[int, ...]] = {
     "external_wrench_world": (6,),
 }
 
-# ``external_wrench_world`` is the raw physical F/T sensor measurement expressed
-# in world axes. Force and torque are referenced at the sensor measurement origin.
+# ``external_wrench_world`` is the upstream ``wrench_on_robot`` measurement:
+# [Fx, Fy, Fz, Tx, Ty, Tz] in N/N*m, expressed in world axes. Force and torque are
+# referenced at the physical F/T sensor measurement origin. No numeric transform
+# is applied by the Vega producer or Loop bridge.
 
 _ACTION_INFO_TENSOR_SHAPES: Mapping[str, tuple[int, ...]] = {
     "cartesian_velocity": (6,),
