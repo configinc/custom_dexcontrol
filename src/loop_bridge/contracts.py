@@ -19,7 +19,7 @@ _OBSERVATION_TENSOR_SHAPES: Mapping[str, tuple[int, ...]] = {
     "cartesian_position": (6,),
     "joint_velocities": (7,),
     "joint_torques_computed": (7,),
-    "wrench_state": (6,),
+    "external_wrench_world": (6,),
 }
 
 _ACTION_INFO_TENSOR_SHAPES: Mapping[str, tuple[int, ...]] = {

@@ -12,7 +12,7 @@ _OBS_FIELDS: tuple[tuple[str, int, bool], ...] = (
     ("cartesian_position", 6, False),
     ("joint_velocities", 7, False),
     ("joint_torques_computed", 7, False),
-    ("wrench_state", 6, False),
+    ("external_wrench_world", 6, False),
 )
 
 

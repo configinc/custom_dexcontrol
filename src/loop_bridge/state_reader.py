@@ -37,7 +37,7 @@ class ArmStateReader:
             "gripper_position": (
                 robot.get_cached_gripper_position() if robot.hand is not None else 0.0
             ),
-            "wrench_state": (
+            "external_wrench_world": (
                 np.array(wrench.get_wrench_state(), dtype=np.float64)
                 if wrench is not None
                 else np.zeros(6)

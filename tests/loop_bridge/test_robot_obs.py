@@ -18,7 +18,7 @@ def test_observation_state_preserves_every_legacy_value() -> None:
         "cartesian_position": [10.0, 11.0, 12.0, 0.1, 0.2, 0.3],
         "joint_velocities": [21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0],
         "joint_torques_computed": [31.0, 32.0, 33.0, 34.0, 35.0, 36.0, 37.0],
-        "wrench_state": [41.0, 42.0, 43.0, 0.4, 0.5, 0.6],
+        "external_wrench_world": [41.0, 42.0, 43.0, 0.4, 0.5, 0.6],
     }
 
 
@@ -31,7 +31,7 @@ def test_observation_payload_uses_canonical_arm_fields_and_tensors() -> None:
         "left.cartesian_position",
         "left.joint_velocities",
         "left.joint_torques_computed",
-        "left.wrench_state",
+        "left.external_wrench_world",
     }
     assert payload["left.gripper_position"] == 0.5
     assert float64_values(
@@ -56,7 +56,7 @@ def test_observation_state_raises_on_wrong_array_length() -> None:
 
 def test_observation_state_raises_on_missing_field() -> None:
     observation = make_observation()
-    del observation["wrench_state"]
+    del observation["external_wrench_world"]
     with pytest.raises(KeyError):
         observation_state(observation)
 
