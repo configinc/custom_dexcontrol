@@ -2,6 +2,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from dexcontrol.core.arm import ArmWrenchSensor
+from dexcontrol.core.component import RobotComponent
 from dexcontrol.core.robotenv_vega.server import VegaRobotEnvService
 from dexcontrol.core.vega.robot import VegaRobot
 
@@ -23,6 +25,21 @@ def test_observation_contract_uses_external_wrench_world_only() -> None:
     assert "external_wrench_world" in spec.fields
     assert "wrench_state" not in spec.fields
     assert list(spec.fields["external_wrench_world"].shape) == [6]
+
+
+def test_sensor_boundary_preserves_world_wrench_order_and_sign(monkeypatch) -> None:
+    upstream_wrench_on_robot = [1.0, -2.0, 3.0, -0.1, 0.2, -0.3]
+    monkeypatch.setattr(
+        RobotComponent,
+        "get_state",
+        lambda _sensor: {"wrench": upstream_wrench_on_robot},
+    )
+    sensor = ArmWrenchSensor.__new__(ArmWrenchSensor)
+
+    np.testing.assert_array_equal(
+        sensor.get_wrench_state(),
+        np.asarray(upstream_wrench_on_robot, dtype=np.float32),
+    )
 
 
 def test_observation_preserves_external_world_wrench_values() -> None:
