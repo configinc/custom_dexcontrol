@@ -257,13 +257,14 @@
         - wuji_sdk_install is defined
         - wuji_sdk_install.failed | default(false)
 
-    # ── Wuji hand identity (per-unit left/right serial map) ─────────────────
-    # Serials carry no handedness on shipped units, so each host keeps its own
+    # ── Wuji Hand 1 identity (per-unit left/right serial map) ───────────────
+    # V1 STM32 UID serials carry no handedness, so each host keeps its own
     # ~/.wuji/hands.json. Deploy verifies it, tries a hands-off auto-identify
     # (reads the handedness the SDK reports; commands no motion), and only then
     # asks the operator to run the guided one-off. Without a map the servers
     # still start — they just fall back to SDK auto-selection, which is why a
-    # 2-hand unit must not be left in that state.
+    # 2-hand v1 unit must not be left in that state. V2 uses the SN J/K rule
+    # and the separate two-hand discovery check below; no map is required.
     - name: Check Wuji hand map on dexmate
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
@@ -282,7 +283,7 @@
       register: wuji_map_check
       become: false
       changed_when: false
-      when: gripper_type in ["wuji_hand_v1", "wuji_hand_v2"]
+      when: gripper_type == "wuji_hand_v1"
 
     - name: Auto-identify Wuji hands from SDK-reported handedness (best effort)
       shell: |
@@ -295,7 +296,7 @@
       become: false
       ignore_errors: true
       when:
-        - gripper_type in ["wuji_hand_v1", "wuji_hand_v2"]
+        - gripper_type == "wuji_hand_v1"
         - wuji_auto_identify | bool
         - wuji_map_check.stdout is defined and wuji_map_check.stdout != "OK"
 
@@ -318,7 +319,7 @@
       become: false
       changed_when: false
       when:
-        - gripper_type in ["wuji_hand_v1", "wuji_hand_v2"]
+        - gripper_type == "wuji_hand_v1"
         - wuji_map_check.stdout is defined and wuji_map_check.stdout != "OK"
 
     - name: Fail with hand-identification instructions when the map is still incomplete
@@ -333,7 +334,7 @@
           Then rerun this playbook. Inspect the result with the same script and --show.
           To proceed anyway on a single-hand bring-up, pass -e wuji_require_hand_map=false
       when:
-        - gripper_type in ["wuji_hand_v1", "wuji_hand_v2"]
+        - gripper_type == "wuji_hand_v1"
         - wuji_require_hand_map | bool
         - wuji_map_recheck.stdout is defined and wuji_map_recheck.stdout != "OK"
 
