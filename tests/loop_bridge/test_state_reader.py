@@ -32,6 +32,7 @@ def test_snapshot_fk_matches_controller_without_using_its_working_data():
     )
     reader = ArmStateReader(robot)
     snapshot = reader.capture()
+    assert "external_wrench_world" not in snapshot
     expected = manager.fk(["L_ee"], qpos=positions, update_robot_state=False)["L_ee"].np
 
     # New hardware data and an IK/FK update must not change the captured pose.

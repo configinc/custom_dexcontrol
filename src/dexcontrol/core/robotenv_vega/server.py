@@ -785,11 +785,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             "cartesian_position": robotenv_pb2.Value(
                 float_array=robotenv_pb2.FloatArray(values=cartesian_position.tolist())
             ),
-            "external_wrench_world": robotenv_pb2.Value(
-                float_array=robotenv_pb2.FloatArray(
-                    values=np.asarray(state_dict["external_wrench_world"]).tolist()
-                )
-            ),
             "prev_controller_latency_ms": robotenv_pb2.Value(
                 float_value=float(state_dict.get("prev_controller_latency_ms", 0.0))
             ),
@@ -803,6 +798,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 int_value=int(timestamp_us)
             ),
         }
+        if "external_wrench_world" in state_dict:
+            observation["external_wrench_world"] = robotenv_pb2.Value(
+                float_array=robotenv_pb2.FloatArray(
+                    values=np.asarray(state_dict["external_wrench_world"]).tolist()
+                )
+            )
         return observation, int(timestamp_us)
 
     @staticmethod

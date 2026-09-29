@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from conftest import arr, make_observation, scalar
 
-from loop_bridge.contracts import float64_values
+from loop_bridge.contracts import ROBOT_OBSERVATION_CONTRACT, float64_values
 from loop_bridge.robot_obs import observation_payload, observation_state
 
 
@@ -54,11 +54,17 @@ def test_observation_state_raises_on_wrong_array_length() -> None:
         observation_state(observation)
 
 
-def test_observation_state_raises_on_missing_field() -> None:
+def test_observation_state_omits_unavailable_optional_wrench() -> None:
     observation = make_observation()
     del observation["external_wrench_world"]
-    with pytest.raises(KeyError):
-        observation_state(observation)
+    state = observation_state(observation)
+    payload = observation_payload(observation, "left")
+
+    assert "external_wrench_world" not in state
+    assert "left.external_wrench_world" not in payload
+    assert not ROBOT_OBSERVATION_CONTRACT.fields[
+        "left.external_wrench_world"
+    ].required
 
 
 def test_observation_state_reads_gripper_scalar() -> None:

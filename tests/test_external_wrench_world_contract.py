@@ -69,3 +69,29 @@ def test_robot_state_renames_sensor_wrench_without_changing_values() -> None:
 
     assert "wrench_state" not in state
     np.testing.assert_array_equal(state["external_wrench_world"], expected)
+
+
+def test_sensor_absence_omits_optional_external_wrench() -> None:
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.arm = SimpleNamespace(
+        get_joint_pos=lambda: np.zeros(7),
+        get_joint_vel=lambda: np.zeros(7),
+        get_joint_torque=lambda: np.zeros(7),
+        get_timestamp_ns=lambda: 123_456_000,
+        wrench_sensor=None,
+    )
+    robot.hand = None
+    robot._get_cartesian_pose = lambda *, joint_positions: np.zeros(6)
+    robot._prev_controller_latency_ms = 0.0
+    robot._prev_command_successful = True
+    robot._prev_gripper_command_successful = True
+
+    state, _ = robot.get_robot_state()
+    assert "external_wrench_world" not in state
+
+    service = _service()
+    service._robot = SimpleNamespace(
+        get_robot_state=lambda: (state, {"robot_timestamp_us": 123})
+    )
+    observation, _ = service._create_observation()
+    assert "external_wrench_world" not in observation

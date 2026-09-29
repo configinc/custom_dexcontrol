@@ -50,7 +50,9 @@ def _observation_fields() -> dict[str, FieldContract]:
     fields: dict[str, FieldContract] = {}
     for arm in ARM_NAMES:
         for field, shape in _OBSERVATION_TENSOR_SHAPES.items():
-            fields[f"{arm}.{field}"] = _tensor_contract(shape)
+            fields[f"{arm}.{field}"] = _tensor_contract(
+                shape, required=field != "external_wrench_world"
+            )
         fields[f"{arm}.gripper_position"] = FieldContract(kind=ValueKind.SCALAR)
 
         for field, shape in _ACTION_INFO_TENSOR_SHAPES.items():
