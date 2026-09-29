@@ -22,6 +22,9 @@ _OBSERVATION_TENSOR_SHAPES: Mapping[str, tuple[int, ...]] = {
     "external_wrench_world": (6,),
 }
 
+# ``external_wrench_world`` is the raw physical F/T sensor measurement expressed
+# in world axes. Force and torque are referenced at the sensor measurement origin.
+
 _ACTION_INFO_TENSOR_SHAPES: Mapping[str, tuple[int, ...]] = {
     "cartesian_velocity": (6,),
     "target_cartesian_delta": (7,),
