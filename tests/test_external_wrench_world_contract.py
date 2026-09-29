@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from dexcontrol.core.robotenv_vega.server import VegaRobotEnvService
+from dexcontrol.core.vega.robot import VegaRobot
 
 
 def _service() -> VegaRobotEnvService:
@@ -46,3 +47,25 @@ def test_observation_preserves_external_world_wrench_values() -> None:
     assert list(observation["external_wrench_world"].float_array.values) == list(
         expected
     )
+
+
+def test_robot_state_renames_sensor_wrench_without_changing_values() -> None:
+    expected = np.array([4.0, -5.0, 6.0, -0.4, 0.5, -0.6])
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.arm = SimpleNamespace(
+        get_joint_pos=lambda: np.zeros(7),
+        get_joint_vel=lambda: np.zeros(7),
+        get_joint_torque=lambda: np.zeros(7),
+        get_timestamp_ns=lambda: 123_456_000,
+        wrench_sensor=SimpleNamespace(get_wrench_state=lambda: expected.copy()),
+    )
+    robot.hand = None
+    robot._get_cartesian_pose = lambda *, joint_positions: np.zeros(6)
+    robot._prev_controller_latency_ms = 0.0
+    robot._prev_command_successful = True
+    robot._prev_gripper_command_successful = True
+
+    state, _ = robot.get_robot_state()
+
+    assert "wrench_state" not in state
+    np.testing.assert_array_equal(state["external_wrench_world"], expected)
