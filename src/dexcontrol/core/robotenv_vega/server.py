@@ -365,12 +365,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description="End-effector pose [x, y, z, roll, pitch, yaw]",
             )
         )
-        spec.fields["wrench_state"].CopyFrom(
+        spec.fields["external_wrench_world"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="float64",
                 shape=[6],
                 required=False,
-                description="Wrench state [fx, fy, fz, tx, ty, tz]",
+                description=(
+                    "External wrench in the world frame "
+                    "[fx, fy, fz, tx, ty, tz] (N, N, N, N*m, N*m, N*m)"
+                ),
             )
         )
         spec.fields["prev_controller_latency_ms"].CopyFrom(
@@ -727,8 +730,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             "cartesian_position": robotenv_pb2.Value(
                 float_array=robotenv_pb2.FloatArray(values=cartesian_position.tolist())
             ),
-            "wrench_state": robotenv_pb2.Value(
-                float_array=robotenv_pb2.FloatArray(values=np.asarray(state_dict["wrench_state"]).tolist())
+            "external_wrench_world": robotenv_pb2.Value(
+                float_array=robotenv_pb2.FloatArray(
+                    values=np.asarray(state_dict["external_wrench_world"]).tolist()
+                )
             ),
             "prev_controller_latency_ms": robotenv_pb2.Value(
                 float_value=float(state_dict.get("prev_controller_latency_ms", 0.0))
