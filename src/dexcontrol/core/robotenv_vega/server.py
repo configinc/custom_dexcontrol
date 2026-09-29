@@ -417,7 +417,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description=(
                     "Raw external wrench from the physical F/T sensor, expressed "
                     "in world axes at the sensor measurement origin "
-                    "[fx, fy, fz, tx, ty, tz] (N, N, N, N*m, N*m, N*m)"
+                    "[fx, fy, fz, tx, ty, tz] (N, N, N, Nm, Nm, Nm)"
                 ),
             )
         )
