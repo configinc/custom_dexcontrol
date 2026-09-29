@@ -19,8 +19,13 @@ _OBSERVATION_TENSOR_SHAPES: Mapping[str, tuple[int, ...]] = {
     "cartesian_position": (6,),
     "joint_velocities": (7,),
     "joint_torques_computed": (7,),
-    "wrench_state": (6,),
+    "external_wrench_world": (6,),
 }
+
+# ``external_wrench_world`` is the upstream ``wrench_on_robot`` measurement:
+# [Fx, Fy, Fz, Tx, Ty, Tz] in N/Nm, expressed in world axes. Force and torque are
+# referenced at the physical F/T sensor measurement origin. No numeric transform
+# is applied by the Vega producer or Loop bridge.
 
 _ACTION_INFO_TENSOR_SHAPES: Mapping[str, tuple[int, ...]] = {
     "cartesian_velocity": (6,),
@@ -47,7 +52,9 @@ def _observation_fields() -> dict[str, FieldContract]:
     fields: dict[str, FieldContract] = {}
     for arm in ARM_NAMES:
         for field, shape in _OBSERVATION_TENSOR_SHAPES.items():
-            fields[f"{arm}.{field}"] = _tensor_contract(shape)
+            fields[f"{arm}.{field}"] = _tensor_contract(
+                shape, required=field != "external_wrench_world"
+            )
         fields[f"{arm}.gripper_position"] = FieldContract(kind=ValueKind.SCALAR)
 
         for field, shape in _ACTION_INFO_TENSOR_SHAPES.items():

@@ -28,7 +28,7 @@ class ArmStateReader:
         robot = self._robot
         state = robot.arm.get_state()
         wrench = getattr(robot.arm, "wrench_sensor", None)
-        return {
+        captured = {
             "joint_positions": np.array(state["pos"], dtype=np.float64),
             "joint_velocities": np.array(state["vel"], dtype=np.float64),
             "joint_torques_computed": np.array(
@@ -37,12 +37,12 @@ class ArmStateReader:
             "gripper_position": (
                 robot.get_cached_gripper_position() if robot.hand is not None else 0.0
             ),
-            "wrench_state": (
-                np.array(wrench.get_wrench_state(), dtype=np.float64)
-                if wrench is not None
-                else np.zeros(6)
-            ),
         }
+        if wrench is not None:
+            captured["external_wrench_world"] = np.array(
+                wrench.get_wrench_state(), dtype=np.float64
+            )
+        return captured
 
     def complete(self, state: dict[str, Any]) -> dict[str, Any]:
         """Compute Cartesian pose from the captured joints, using private FK data."""
