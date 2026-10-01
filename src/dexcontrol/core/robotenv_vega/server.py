@@ -450,13 +450,17 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
         with self._cmd_lock:
             self._cancel_move.clear()
+            status, message = "SUCCESS", f"Reset to {mode}"
             try:
                 if mode == "home":
                     target_joints = self.reset_joints
                     self._execute_reset_sequence(target_joints)
                 elif mode == "target":
                     target_joints = self._extract_target_joints(request)
+                    torso_target = self._extract_torso_target(request)  # validate before moving
                     self._execute_reset_sequence(target_joints)
+                    if torso_target is not None and not self._move_torso(torso_target):
+                        status, message = "ERROR", "Arm reset done, torso did not reach target"
                 elif mode == "random":
                     target_joints = self._sample_random_target()
                     self._execute_reset_sequence(target_joints)
@@ -468,10 +472,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     return robotenv_pb2.ResetResponse()
 
                 observation, timestamp_us = self._create_observation()
+                try:
+                    observation["torso_joint_positions"] = _to_proto_value(
+                        self._robot.robot.torso.get_joint_pos()
+                    )
+                except Exception as exc:
+                    LOGGER.warning("Reset: torso state unavailable: %s", exc)
                 return robotenv_pb2.ResetResponse(
                     observation=observation,
-                    status="SUCCESS",
-                    message=f"Reset to {mode}",
+                    status=status,
+                    message=message,
                     timestamp_us=timestamp_us,
                 )
             except Exception as exc:
@@ -899,6 +909,61 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 )
         self._robot.validate_joint_limits(target)
         return target
+
+    def _extract_torso_target(self, request) -> np.ndarray | None:
+        """Optional params['torso_joint_positions'] (torso_j1..j3 [rad]); rejected if outside limits."""
+        if "torso_joint_positions" not in request.params:
+            return None
+        values = request.params["torso_joint_positions"].float_array.values
+        if len(values) != 3:
+            raise ValueError(f"Expected 3 torso joint values, got {len(values)}")
+        target = np.asarray(values, dtype=np.float64)
+        limits = self._robot.robot.torso.joint_pos_limit
+        if limits is not None and np.any((target < limits[:, 0]) | (target > limits[:, 1])):
+            raise ValueError(f"Torso target {target.tolist()} outside limits {limits.tolist()}")
+        return target
+
+    _TORSO_TOLERANCE_RAD = 0.01
+    _TORSO_SPEED_SCALE = 0.3  # fraction of the torso velocity ceiling (0.9 rad/s)
+    _TORSO_TIMEOUT_S = 15.0
+
+    def _move_torso(self, target: np.ndarray) -> bool:
+        """Move the torso to target after the arm reset; returns whether it was reached.
+
+        Both arm servers receive the torso target (resets are called one after the
+        other), so the second one normally finds it already there and skips.
+        """
+        torso = self._robot.robot.torso
+        actual = np.asarray(torso.get_joint_pos(), dtype=np.float64)
+        if np.max(np.abs(target - actual)) <= self._TORSO_TOLERANCE_RAD:
+            LOGGER.info("Reset[%s]: torso already at target %s", self.arm_side, actual.round(4).tolist())
+            return True
+
+        t0 = time.time()
+        LOGGER.info(
+            "Reset[%s]: moving torso %s -> %s",
+            self.arm_side, actual.round(4).tolist(), target.round(4).tolist(),
+        )
+        torso.set_idle_mode(False)  # keep it actively held after the move
+        handle = torso.set_joint_target(target, scale=self._TORSO_SPEED_SCALE, tracked=True)
+        try:
+            handle.wait(timeout=self._TORSO_TIMEOUT_S)
+        except Exception as exc:
+            LOGGER.error("Reset[%s]: torso motion failed: %s", self.arm_side, exc)
+            handle.cancel()
+
+        reached = torso.is_joint_pos_reached(target, tolerance=self._TORSO_TOLERANCE_RAD)
+        actual = np.asarray(torso.get_joint_pos(), dtype=np.float64)
+        log = LOGGER.info if reached else LOGGER.error
+        log(
+            "Reset[%s]: torso %s at %s (%.2fs)",
+            self.arm_side, "reached" if reached else "NOT reached", actual.round(4).tolist(), time.time() - t0,
+        )
+        # IK model must see the new torso, or cartesian_position / IK go stale.
+        self._robot.sync_motion_manager_with_arm(
+            np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
+        )
+        return bool(reached)
 
     def _sample_random_target(self) -> np.ndarray:
         limits = self._robot.arm.joint_pos_limit
