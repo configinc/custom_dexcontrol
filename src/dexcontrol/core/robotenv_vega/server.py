@@ -365,12 +365,24 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description="End-effector pose [x, y, z, roll, pitch, yaw]",
             )
         )
-        spec.fields["wrench_state"].CopyFrom(
+        spec.fields["external_wrench_world"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="float64",
                 shape=[6],
                 required=False,
-                description="Wrench state [fx, fy, fz, tx, ty, tz]",
+                description=(
+                    "Raw external wrench from the physical F/T sensor, expressed "
+                    "in world axes at the sensor measurement origin "
+                    "[fx, fy, fz, tx, ty, tz] (N, N, N, Nm, Nm, Nm)"
+                ),
+            )
+        )
+        spec.fields["external_wrench_world_reference_point"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="string",
+                shape=[],
+                required=False,
+                description="Physical reference point of external_wrench_world",
             )
         )
         spec.fields["prev_controller_latency_ms"].CopyFrom(
@@ -727,9 +739,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             "cartesian_position": robotenv_pb2.Value(
                 float_array=robotenv_pb2.FloatArray(values=cartesian_position.tolist())
             ),
-            "wrench_state": robotenv_pb2.Value(
-                float_array=robotenv_pb2.FloatArray(values=np.asarray(state_dict["wrench_state"]).tolist())
-            ),
             "prev_controller_latency_ms": robotenv_pb2.Value(
                 float_value=float(state_dict.get("prev_controller_latency_ms", 0.0))
             ),
@@ -743,6 +752,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 int_value=int(timestamp_us)
             ),
         }
+        if "external_wrench_world" in state_dict:
+            observation["external_wrench_world"] = robotenv_pb2.Value(
+                float_array=robotenv_pb2.FloatArray(
+                    values=np.asarray(state_dict["external_wrench_world"]).tolist()
+                )
+            )
+            observation["external_wrench_world_reference_point"] = robotenv_pb2.Value(
+                string_value="physical F/T sensor measurement origin"
+            )
         return observation, int(timestamp_us)
 
     @staticmethod
