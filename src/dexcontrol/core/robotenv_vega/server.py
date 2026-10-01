@@ -409,6 +409,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
     def GetConfig(self, request, context):
         del request, context
+        metadata = {
+            "robot_model": self.robot_model,
+            "control_hz": str(self.control_hz),
+            "arm_side": self.arm_side,
+        }
+        # Torso state is read live on every call; omitted if unreadable.
+        try:
+            torso = self._robot.robot.torso
+            metadata["torso_joint_pos"] = ",".join(f"{v:.4f}" for v in torso.get_joint_pos())
+            metadata["torso_pitch"] = f"{float(torso.pitch_angle):.4f}"
+        except Exception as exc:
+            LOGGER.warning("GetConfig: torso state unavailable: %s", exc)
         return robotenv_pb2.RobotConfig(
             gripper_type=self.gripper_type,
             frame_type=self.frame_type,
@@ -421,11 +433,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "cartesian_delta",
                 "target_cartesian_delta",
             ],
-            metadata={
-                "robot_model": self.robot_model,
-                "control_hz": str(self.control_hz),
-                "arm_side": self.arm_side,
-            },
+            metadata=metadata,
         )
 
     def Reset(self, request, context):
