@@ -25,6 +25,7 @@ def test_observation_contract_uses_external_wrench_world_only() -> None:
     assert "external_wrench_world" in spec.fields
     assert "wrench_state" not in spec.fields
     assert list(spec.fields["external_wrench_world"].shape) == [6]
+    assert spec.fields["external_wrench_world_reference_point"].dtype == "string"
 
 
 def test_sensor_boundary_preserves_world_wrench_order_and_sign(monkeypatch) -> None:
@@ -63,6 +64,10 @@ def test_observation_preserves_external_world_wrench_values() -> None:
     assert "wrench_state" not in observation
     assert list(observation["external_wrench_world"].float_array.values) == list(
         expected
+    )
+    assert (
+        observation["external_wrench_world_reference_point"].string_value
+        == "physical F/T sensor measurement origin"
     )
 
 
@@ -112,3 +117,4 @@ def test_sensor_absence_omits_optional_external_wrench() -> None:
     )
     observation, _ = service._create_observation()
     assert "external_wrench_world" not in observation
+    assert "external_wrench_world_reference_point" not in observation

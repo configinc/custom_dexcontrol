@@ -377,6 +377,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 ),
             )
         )
+        spec.fields["external_wrench_world_reference_point"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="string",
+                shape=[],
+                required=False,
+                description="Physical reference point of external_wrench_world",
+            )
+        )
         spec.fields["prev_controller_latency_ms"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="float64",
@@ -749,6 +757,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 float_array=robotenv_pb2.FloatArray(
                     values=np.asarray(state_dict["external_wrench_world"]).tolist()
                 )
+            )
+            observation["external_wrench_world_reference_point"] = robotenv_pb2.Value(
+                string_value="physical F/T sensor measurement origin"
             )
         return observation, int(timestamp_us)
 
