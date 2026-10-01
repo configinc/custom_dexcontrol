@@ -1041,6 +1041,14 @@ class VegaRobot:
             for i, joint_name in enumerate(self._arm_joint_names):
                 if joint_name in qpos_dict:
                     qpos_dict[joint_name] = float(arm_joint_pos[i])
+            # The torso may be moved by a reset (either server process), so refresh
+            # it every sync; keep the previous values if it can't be read.
+            try:
+                for joint_name, value in self.robot.torso.get_joint_pos_dict().items():
+                    if joint_name in qpos_dict:
+                        qpos_dict[joint_name] = float(value)
+            except Exception:
+                pass
             # Clip to joint limits so motion manager accepts the configuration
             # even when the real arm is marginally outside limits (IK numerical error)
             if robot_utils is not None:
