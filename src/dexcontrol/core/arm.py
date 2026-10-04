@@ -780,9 +780,9 @@ class ArmWrenchSensor(RobotComponent):
     """Wrench sensor reader for the robot arm.
 
     The upstream sensor contract is ``wrench_on_robot``: the environment's wrench
-    acting on the robot, expressed in world axes and referenced at the physical F/T
-    sensor measurement origin. Components are ordered ``[Fx, Fy, Fz, Tx, Ty, Tz]``
-    with force in N and torque in Nm.
+    acting on the robot, expressed in source-native sensor axes and referenced at
+    the physical F/T sensor measurement origin. Components are ordered
+    ``[Fx, Fy, Fz, Tx, Ty, Tz]`` with force in N and torque in Nm.
 
     This reader copies the decoded sensor values without axis reordering, sign
     changes, rotation, or reference-point translation.
@@ -842,8 +842,8 @@ class ArmWrenchSensor(RobotComponent):
         """Get the current upstream ``wrench_on_robot`` reading unchanged.
 
         Returns:
-            World-axis wrench ``[Fx, Fy, Fz, Tx, Ty, Tz]`` at the physical sensor
-            measurement origin. Force is in N and torque is in Nm.
+            Source-native sensor-axis wrench ``[Fx, Fy, Fz, Tx, Ty, Tz]`` at the
+            physical sensor measurement origin. Force is in N and torque is in Nm.
         """
         state = super().get_state()
         return np.array(state["wrench"], dtype=np.float32)
