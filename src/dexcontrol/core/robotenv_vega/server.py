@@ -34,7 +34,6 @@ from core.robotenv_vega.wrench_contract import (  # noqa: E402
     sensor_frame_wrench_to_wrist,
 )
 from proto import robotenv_pb2, robotenv_pb2_grpc  # noqa: E402
-from dexcontrol.exceptions import ServiceUnavailableError  # noqa: E402
 
 
 LOGGER = logging.getLogger("robotenv_vega")
@@ -795,7 +794,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     sensor_wrench,
                     sensor_to_wrist_yaw_degrees=yaw_degrees,
                 )
-            except (KeyError, ServiceUnavailableError, TypeError, ValueError):
+            except Exception as exc:
                 now = time.monotonic()
                 last_warning = getattr(
                     self, "_last_wrench_warning_monotonic", float("-inf")
@@ -803,7 +802,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 if now - last_warning >= self._WRENCH_WARNING_INTERVAL_SECONDS:
                     LOGGER.warning(
                         "Omitting unavailable or malformed source-native F/T "
-                        "sample; expected six finite values"
+                        "sample; expected six finite values (%s: %s)",
+                        type(exc).__name__,
+                        exc,
                     )
                     self._last_wrench_warning_monotonic = now
             else:
