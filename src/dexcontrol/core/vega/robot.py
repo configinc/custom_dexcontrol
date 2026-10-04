@@ -79,7 +79,7 @@ class _RobotWithCustomHeadPose(Robot):
 _base_arm_teleop_error = None
 try:
     from base_arm_teleop import BaseIKController
-except (ImportError, OSError) as e:
+except ImportError as e:
     BaseIKController = None
     _base_arm_teleop_error = e
 
