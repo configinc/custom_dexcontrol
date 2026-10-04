@@ -203,6 +203,65 @@ def test_silent_sensor_omits_wrench_without_breaking_observation() -> None:
     assert "external_wrench_wrist" not in observation
 
 
+def test_sensor_payload_missing_wrench_omits_only_optional_signal() -> None:
+    state = {
+        "joint_positions": np.zeros(7),
+        "joint_velocities": np.zeros(7),
+        "joint_torques_computed": np.zeros(7),
+        "gripper_position": 0.0,
+        "cartesian_position": np.zeros(6),
+    }
+    service = _service()
+    service.external_wrench_sensor_to_wrist_yaw_degrees = 0.0
+    service._robot = SimpleNamespace(
+        get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
+        arm=SimpleNamespace(
+            wrench_sensor=SimpleNamespace(
+                get_wrench_state=lambda: (_ for _ in ()).throw(KeyError("wrench"))
+            )
+        ),
+    )
+
+    observation, timestamp_us = service._create_observation()
+
+    assert timestamp_us == 123
+    assert "joint_positions" in observation
+    assert "external_wrench_wrist" not in observation
+
+
+def test_unavailable_sensor_warning_is_rate_limited(caplog) -> None:
+    state = {
+        "joint_positions": np.zeros(7),
+        "joint_velocities": np.zeros(7),
+        "joint_torques_computed": np.zeros(7),
+        "gripper_position": 0.0,
+        "cartesian_position": np.zeros(6),
+    }
+    service = _service()
+    service.external_wrench_sensor_to_wrist_yaw_degrees = 0.0
+    service._robot = SimpleNamespace(
+        get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
+        arm=SimpleNamespace(
+            wrench_sensor=SimpleNamespace(
+                get_wrench_state=lambda: (_ for _ in ()).throw(
+                    ServiceUnavailableError("no sensor sample")
+                )
+            )
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="robotenv_vega"):
+        service._create_observation()
+        service._create_observation()
+
+    records = [
+        record
+        for record in caplog.records
+        if "Omitting unavailable or malformed" in record.message
+    ]
+    assert len(records) == 1
+
+
 def test_sensor_absence_omits_optional_external_wrench() -> None:
     robot = VegaRobot.__new__(VegaRobot)
     robot.arm = SimpleNamespace(

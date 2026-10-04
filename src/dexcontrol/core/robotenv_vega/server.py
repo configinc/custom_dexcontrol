@@ -69,6 +69,8 @@ _RESET_MIDDLE_JOINTS = {
 class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     """RobotEnv service implementation for one Vega arm."""
 
+    _WRENCH_WARNING_INTERVAL_SECONDS = 10.0
+
     def __init__(
         self,
         robot_model: str = "vega_1",
@@ -793,11 +795,17 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     sensor_wrench,
                     sensor_to_wrist_yaw_degrees=yaw_degrees,
                 )
-            except (ServiceUnavailableError, TypeError, ValueError):
-                LOGGER.warning(
-                    "Omitting unavailable or malformed source-native F/T sample; "
-                    "expected six finite values"
+            except (KeyError, ServiceUnavailableError, TypeError, ValueError):
+                now = time.monotonic()
+                last_warning = getattr(
+                    self, "_last_wrench_warning_monotonic", float("-inf")
                 )
+                if now - last_warning >= self._WRENCH_WARNING_INTERVAL_SECONDS:
+                    LOGGER.warning(
+                        "Omitting unavailable or malformed source-native F/T "
+                        "sample; expected six finite values"
+                    )
+                    self._last_wrench_warning_monotonic = now
             else:
                 observation["external_wrench_wrist"] = robotenv_pb2.Value(
                     float_array=robotenv_pb2.FloatArray(
