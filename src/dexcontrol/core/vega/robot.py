@@ -962,13 +962,6 @@ class VegaRobot:
             "prev_command_successful": bool(self._prev_command_successful),
             "prev_gripper_command_successful": bool(self._prev_gripper_command_successful),
         }
-        wrench_sensor = getattr(self.arm, "wrench_sensor", None)
-        if wrench_sensor is not None:
-            # Source-native sensor axes. The RobotEnv boundary applies the
-            # configured sensor-to-company-wrist yaw before publishing it.
-            state_dict["external_wrench_sensor_frame"] = np.asarray(
-                wrench_sensor.get_wrench_state(), dtype=np.float64
-            )
         return state_dict, timestamp_dict
 
     def validate_joint_limits(self, target_joint_pos: np.ndarray) -> None:

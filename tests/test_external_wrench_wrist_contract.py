@@ -1,14 +1,21 @@
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 
-from dexcontrol.core.arm import ArmWrenchSensor
-from dexcontrol.core.component import RobotComponent
-from dexcontrol.core.robotenv_vega.server import (
+# Keep this contract test independent of the optional DualSense/hidapi stack.
+_base_arm_teleop = ModuleType("base_arm_teleop")
+_base_arm_teleop.BaseIKController = object
+sys.modules.setdefault("base_arm_teleop", _base_arm_teleop)
+
+from dexcontrol.core.arm import ArmWrenchSensor  # noqa: E402
+from dexcontrol.core.component import RobotComponent  # noqa: E402
+from dexcontrol.core.robotenv_vega.server import (  # noqa: E402
     VegaRobotEnvService,
     sensor_frame_wrench_to_wrist,
 )
-from dexcontrol.core.vega.robot import VegaRobot
+from dexcontrol.core.vega.robot import VegaRobot  # noqa: E402
+from dexcontrol.exceptions import ServiceUnavailableError  # noqa: E402
 
 
 def _service() -> VegaRobotEnvService:
@@ -67,12 +74,14 @@ def test_observation_publishes_configured_external_wrist_wrench() -> None:
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
-        "external_wrench_sensor_frame": source,
     }
     service = _service()
     service.external_wrench_sensor_to_wrist_yaw_degrees = 90.0
     service._robot = SimpleNamespace(
-        get_robot_state=lambda: (state, {"robot_timestamp_us": 123})
+        get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
+        arm=SimpleNamespace(
+            wrench_sensor=SimpleNamespace(get_wrench_state=lambda: source.copy())
+        ),
     )
 
     observation, timestamp_us = service._create_observation()
@@ -90,15 +99,18 @@ def test_observation_publishes_configured_external_wrist_wrench() -> None:
     )
 
 
-def test_robot_state_keeps_source_wrench_internal_until_server_conversion() -> None:
-    expected = np.array([4.0, -5.0, 6.0, -0.4, 0.5, -0.6])
+def test_robot_state_does_not_read_or_leak_source_wrench() -> None:
     robot = VegaRobot.__new__(VegaRobot)
     robot.arm = SimpleNamespace(
         get_joint_pos=lambda: np.zeros(7),
         get_joint_vel=lambda: np.zeros(7),
         get_joint_torque=lambda: np.zeros(7),
         get_timestamp_ns=lambda: 123_456_000,
-        wrench_sensor=SimpleNamespace(get_wrench_state=lambda: expected.copy()),
+        wrench_sensor=SimpleNamespace(
+            get_wrench_state=lambda: (_ for _ in ()).throw(
+                AssertionError("robot state must not read optional F/T sensor")
+            )
+        ),
     )
     robot.hand = None
     robot._get_cartesian_pose = lambda *, joint_positions: np.zeros(6)
@@ -111,7 +123,7 @@ def test_robot_state_keeps_source_wrench_internal_until_server_conversion() -> N
     assert "wrench_state" not in state
     assert "external_wrench_world" not in state
     assert "external_wrench_wrist" not in state
-    np.testing.assert_array_equal(state["external_wrench_sensor_frame"], expected)
+    assert "external_wrench_sensor_frame" not in state
 
 
 def test_unconfigured_yaw_omits_canonical_wrist_wrench() -> None:
@@ -121,11 +133,17 @@ def test_unconfigured_yaw_omits_canonical_wrist_wrench() -> None:
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
-        "external_wrench_sensor_frame": np.ones(6),
     }
     service = _service()
     service._robot = SimpleNamespace(
-        get_robot_state=lambda: (state, {"robot_timestamp_us": 123})
+        get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
+        arm=SimpleNamespace(
+            wrench_sensor=SimpleNamespace(
+                get_wrench_state=lambda: (_ for _ in ()).throw(
+                    AssertionError("unset yaw must not read optional F/T sensor")
+                )
+            )
+        ),
     )
 
     observation, _ = service._create_observation()
@@ -141,18 +159,48 @@ def test_malformed_source_wrench_omits_optional_wrist_wrench() -> None:
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
-        "external_wrench_sensor_frame": np.ones(5),
     }
     service = _service()
     service.external_wrench_sensor_to_wrist_yaw_degrees = 0.0
     service._robot = SimpleNamespace(
-        get_robot_state=lambda: (state, {"robot_timestamp_us": 123})
+        get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
+        arm=SimpleNamespace(
+            wrench_sensor=SimpleNamespace(get_wrench_state=lambda: np.ones(5))
+        ),
     )
 
     observation, _ = service._create_observation()
 
     assert "external_wrench_wrist" not in observation
     assert "external_wrench_wrist_reference_point" not in observation
+
+
+def test_silent_sensor_omits_wrench_without_breaking_observation() -> None:
+    state = {
+        "joint_positions": np.zeros(7),
+        "joint_velocities": np.zeros(7),
+        "joint_torques_computed": np.zeros(7),
+        "gripper_position": 0.0,
+        "cartesian_position": np.zeros(6),
+    }
+    service = _service()
+    service.external_wrench_sensor_to_wrist_yaw_degrees = 0.0
+    service._robot = SimpleNamespace(
+        get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
+        arm=SimpleNamespace(
+            wrench_sensor=SimpleNamespace(
+                get_wrench_state=lambda: (_ for _ in ()).throw(
+                    ServiceUnavailableError("no sensor sample")
+                )
+            )
+        ),
+    )
+
+    observation, timestamp_us = service._create_observation()
+
+    assert timestamp_us == 123
+    assert "joint_positions" in observation
+    assert "external_wrench_wrist" not in observation
 
 
 def test_sensor_absence_omits_optional_external_wrench() -> None:

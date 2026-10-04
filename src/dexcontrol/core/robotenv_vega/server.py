@@ -34,6 +34,7 @@ from core.robotenv_vega.wrench_contract import (  # noqa: E402
     sensor_frame_wrench_to_wrist,
 )
 from proto import robotenv_pb2, robotenv_pb2_grpc  # noqa: E402
+from dexcontrol.exceptions import ServiceUnavailableError  # noqa: E402
 
 
 LOGGER = logging.getLogger("robotenv_vega")
@@ -127,6 +128,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         ):
             raise ValueError(
                 "external_wrench_sensor_to_wrist_yaw_degrees must be finite"
+            )
+        if self.external_wrench_sensor_to_wrist_yaw_degrees is None:
+            LOGGER.warning(
+                "external_wrench_wrist disabled: sensor-to-wrist yaw is unset"
+            )
+        else:
+            LOGGER.info(
+                "external_wrench_wrist enabled: sensor-to-wrist yaw=%.6f degrees",
+                self.external_wrench_sensor_to_wrist_yaw_degrees,
             )
         self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(
             self.control_hz, rot_sensitivity=rot_sensitivity,
@@ -389,7 +399,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description=(
                     "External wrench after the configured sensor-to-company-wrist "
                     "yaw rotation, expressed in wrist axes at the sensor origin "
-                    "[fx, fy, fz, tx, ty, tz] (N, N, N, Nm, Nm, Nm)"
+                    "[fx, fy, fz, tx, ty, tz] (N, N, N, Nm, Nm, Nm); "
+                    "wrench_on_robot sign; no bias or gravity compensation"
                 ),
             )
         )
@@ -453,6 +464,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "robot_model": self.robot_model,
                 "control_hz": str(self.control_hz),
                 "arm_side": self.arm_side,
+                "external_wrench_sensor_to_wrist_yaw_degrees": (
+                    "unset"
+                    if self.external_wrench_sensor_to_wrist_yaw_degrees is None
+                    else str(self.external_wrench_sensor_to_wrist_yaw_degrees)
+                ),
             },
         )
 
@@ -768,18 +784,19 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 int_value=int(timestamp_us)
             ),
         }
-        sensor_wrench = state_dict.get("external_wrench_sensor_frame")
         yaw_degrees = self.external_wrench_sensor_to_wrist_yaw_degrees
-        if sensor_wrench is not None and yaw_degrees is not None:
+        wrench_sensor = getattr(getattr(self._robot, "arm", None), "wrench_sensor", None)
+        if wrench_sensor is not None and yaw_degrees is not None:
             try:
+                sensor_wrench = wrench_sensor.get_wrench_state()
                 wrist_wrench = sensor_frame_wrench_to_wrist(
                     sensor_wrench,
                     sensor_to_wrist_yaw_degrees=yaw_degrees,
                 )
-            except (TypeError, ValueError):
+            except (ServiceUnavailableError, TypeError, ValueError):
                 LOGGER.warning(
-                    "Omitting malformed source-native F/T sample; expected six "
-                    "finite values"
+                    "Omitting unavailable or malformed source-native F/T sample; "
+                    "expected six finite values"
                 )
             else:
                 observation["external_wrench_wrist"] = robotenv_pb2.Value(

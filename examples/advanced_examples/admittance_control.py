@@ -146,7 +146,7 @@ def preprocess_wrench(
 
     # This per-arm reorder/sign convention maps the canonical sensor wrench into
     # this example controller's task coordinates. It is not a sensor-frame
-    # conversion; ArmWrenchSensor itself returns the upstream world-axis values.
+    # conversion; ArmWrenchSensor itself returns source-native sensor-axis values.
     # Reorder and threshold forces
     force_reorder = [-1, 0, 2] if arm == "left" else [1, 0, 2]
     force = np.array([np.sign(i) * wrench[abs(i)] for i in force_reorder])
