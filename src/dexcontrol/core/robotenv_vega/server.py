@@ -30,6 +30,9 @@ from core.vega.robot import (  # noqa: E402
     JointLimitExceededError,
     VegaRobot,
 )
+from core.robotenv_vega.wrench_contract import (  # noqa: E402
+    sensor_frame_wrench_to_wrist,
+)
 from proto import robotenv_pb2, robotenv_pb2_grpc  # noqa: E402
 
 
@@ -65,6 +68,8 @@ _RESET_MIDDLE_JOINTS = {
 class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     """RobotEnv service implementation for one Vega arm."""
 
+    _WRENCH_WARNING_INTERVAL_SECONDS = 10.0
+
     def __init__(
         self,
         robot_model: str = "vega_1",
@@ -74,6 +79,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         control_hz: int = 20,
         use_velocity_feedforward: bool = False,
         base_frame_rotation: Optional[list[float]] = None,
+        external_wrench_sensor_to_wrist_yaw_degrees: float | None = None,
         ik_solver_type: str = "pink",
         robotiq_comport: str = "/dev/ttyUSB0",
         ema_alpha: float = 0.0,
@@ -112,6 +118,27 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self.control_hz = int(control_hz)
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
         self.base_frame_rotation = base_frame_rotation
+        self.external_wrench_sensor_to_wrist_yaw_degrees = (
+            None
+            if external_wrench_sensor_to_wrist_yaw_degrees is None
+            else float(external_wrench_sensor_to_wrist_yaw_degrees)
+        )
+        if (
+            self.external_wrench_sensor_to_wrist_yaw_degrees is not None
+            and not np.isfinite(self.external_wrench_sensor_to_wrist_yaw_degrees)
+        ):
+            raise ValueError(
+                "external_wrench_sensor_to_wrist_yaw_degrees must be finite"
+            )
+        if self.external_wrench_sensor_to_wrist_yaw_degrees is None:
+            LOGGER.warning(
+                "external_wrench_wrist disabled: sensor-to-wrist yaw is unset"
+            )
+        else:
+            LOGGER.info(
+                "external_wrench_wrist enabled: sensor-to-wrist yaw=%.6f degrees",
+                self.external_wrench_sensor_to_wrist_yaw_degrees,
+            )
         self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(
             self.control_hz, rot_sensitivity=rot_sensitivity,
         )
@@ -365,12 +392,25 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description="End-effector pose [x, y, z, roll, pitch, yaw]",
             )
         )
-        spec.fields["wrench_state"].CopyFrom(
+        spec.fields["external_wrench_wrist"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="float64",
                 shape=[6],
                 required=False,
-                description="Wrench state [fx, fy, fz, tx, ty, tz]",
+                description=(
+                    "External wrench after the configured sensor-to-company-wrist "
+                    "yaw rotation, expressed in wrist axes at the sensor origin "
+                    "[fx, fy, fz, tx, ty, tz] (N, N, N, Nm, Nm, Nm); "
+                    "wrench_on_robot sign; no bias or gravity compensation"
+                ),
+            )
+        )
+        spec.fields["external_wrench_wrist_reference_point"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="string",
+                shape=[],
+                required=False,
+                description="Physical reference point of external_wrench_wrist",
             )
         )
         spec.fields["prev_controller_latency_ms"].CopyFrom(
@@ -425,6 +465,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "robot_model": self.robot_model,
                 "control_hz": str(self.control_hz),
                 "arm_side": self.arm_side,
+                "external_wrench_sensor_to_wrist_yaw_degrees": (
+                    "unset"
+                    if self.external_wrench_sensor_to_wrist_yaw_degrees is None
+                    else str(self.external_wrench_sensor_to_wrist_yaw_degrees)
+                ),
             },
         )
 
@@ -727,9 +772,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             "cartesian_position": robotenv_pb2.Value(
                 float_array=robotenv_pb2.FloatArray(values=cartesian_position.tolist())
             ),
-            "wrench_state": robotenv_pb2.Value(
-                float_array=robotenv_pb2.FloatArray(values=np.asarray(state_dict["wrench_state"]).tolist())
-            ),
             "prev_controller_latency_ms": robotenv_pb2.Value(
                 float_value=float(state_dict.get("prev_controller_latency_ms", 0.0))
             ),
@@ -743,6 +785,39 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 int_value=int(timestamp_us)
             ),
         }
+        yaw_degrees = self.external_wrench_sensor_to_wrist_yaw_degrees
+        wrench_sensor = getattr(getattr(self._robot, "arm", None), "wrench_sensor", None)
+        if wrench_sensor is not None and yaw_degrees is not None:
+            try:
+                sensor_wrench = wrench_sensor.get_wrench_state()
+                wrist_wrench = sensor_frame_wrench_to_wrist(
+                    sensor_wrench,
+                    sensor_to_wrist_yaw_degrees=yaw_degrees,
+                )
+            except Exception as exc:
+                now = time.monotonic()
+                last_warning = getattr(
+                    self, "_last_wrench_warning_monotonic", float("-inf")
+                )
+                if now - last_warning >= self._WRENCH_WARNING_INTERVAL_SECONDS:
+                    LOGGER.warning(
+                        "Omitting unavailable or malformed source-native F/T "
+                        "sample; expected six finite values (%s: %s)",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    self._last_wrench_warning_monotonic = now
+            else:
+                observation["external_wrench_wrist"] = robotenv_pb2.Value(
+                    float_array=robotenv_pb2.FloatArray(
+                        values=wrist_wrench.tolist()
+                    )
+                )
+                observation["external_wrench_wrist_reference_point"] = (
+                    robotenv_pb2.Value(
+                        string_value="physical F/T sensor measurement origin"
+                    )
+                )
         return observation, int(timestamp_us)
 
     @staticmethod
@@ -937,6 +1012,7 @@ def serve(
     control_hz: int = 20,
     use_velocity_feedforward: bool = False,
     base_frame_rotation: Optional[list[float]] = None,
+    external_wrench_sensor_to_wrist_yaw_degrees: float | None = None,
     ik_solver_type: str = "pink",
     robotiq_comport: str = "/dev/ttyUSB0",
     ema_alpha: float = 0.0,
@@ -992,6 +1068,9 @@ def serve(
         control_hz=control_hz,
         use_velocity_feedforward=use_velocity_feedforward,
         base_frame_rotation=base_frame_rotation,
+        external_wrench_sensor_to_wrist_yaw_degrees=(
+            external_wrench_sensor_to_wrist_yaw_degrees
+        ),
         ik_solver_type=ik_solver_type,
         robotiq_comport=robotiq_comport,
         ema_alpha=ema_alpha,
@@ -1097,6 +1176,16 @@ def main() -> None:
         default=None,
         metavar=("ROLL", "PITCH", "YAW"),
         help="Custom base-frame rotation in degrees",
+    )
+    parser.add_argument(
+        "--external-wrench-sensor-to-wrist-yaw-degrees",
+        type=float,
+        default=None,
+        help=(
+            "Active +Z yaw from Vega's source-native F/T sensor axes to the "
+            "company wrist convention. Required to publish external_wrench_wrist; "
+            "leave unset until the per-arm value is measured."
+        ),
     )
     parser.add_argument(
         "--ik-solver",
@@ -1268,6 +1357,9 @@ def main() -> None:
         control_hz=args.control_hz,
         use_velocity_feedforward=args.use_velocity_feedforward,
         base_frame_rotation=args.base_frame_rotation,
+        external_wrench_sensor_to_wrist_yaw_degrees=(
+            args.external_wrench_sensor_to_wrist_yaw_degrees
+        ),
         ik_solver_type=args.ik_solver,
         robotiq_comport=gripper_addr,
         ema_alpha=args.ema_alpha,
