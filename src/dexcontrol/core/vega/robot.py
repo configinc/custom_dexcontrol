@@ -785,20 +785,6 @@ class VegaRobot:
         else:  # cartesian_delta
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
 
-        # Mirror of update_command's [IKDelta] log for the interpolated path
-        # (the one actually used in production, --interpolation-method linear).
-        # Answers "who moved the joint": a large per-joint delta with
-        # cart_in≈0 means the IK produced motion from a zero command
-        # (solver/posture behavior), not the teleop input.
-        ik_delta = target_joint_pos - current_joint_pos
-        if np.max(np.abs(ik_delta)) > 0.005:
-            _logger.info(
-                "[IKDelta] space=%s delta=%s cart_in=%s",
-                action_space,
-                np.round(ik_delta, 4).tolist(),
-                np.round(arm_action[:6], 4).tolist() if not action_space.startswith("joint") else "n/a",
-            )
-
         timestamp = _time.perf_counter()
         with self._interp_lock:
             self._interpolator.add_point(timestamp, target_joint_pos)
