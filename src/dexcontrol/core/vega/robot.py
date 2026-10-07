@@ -17,6 +17,7 @@ _logger = logging.getLogger("robotenv_vega")
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from dexcontrol.core.cartesian_pose import add_poses
 from dexcontrol.utils.trajectory_interpolator import TrajectoryInterpolator
 from dexcontrol.utils.filters import MultiChannelFilter
 
@@ -1449,10 +1450,10 @@ class VegaRobot:
                 tcd[6:] = gp
                 action_dict["target_cartesian_delta"] = tcd.tolist()
 
-            # Compute target cartesian position (using simple pose addition)
-            target_cart = current_cart_pos.copy()
-            target_cart[:3] += cartesian_delta[:3]  # xyz
-            target_cart[3:6] += cartesian_delta[3:6]  # rpy
+            # Store the absolute Cartesian command using the same SE(3)
+            # convention as the inference-side pose_diff: translation adds,
+            # while the RPY delta is left-composed as a rotation.
+            target_cart = add_poses(cartesian_delta, current_cart_pos)
             action_dict["cartesian_position"] = target_cart.tolist()
 
             # Use IK to get joint positions
