@@ -962,6 +962,15 @@ class VegaRobot:
             "prev_command_successful": bool(self._prev_command_successful),
             "prev_gripper_command_successful": bool(self._prev_gripper_command_successful),
         }
+        for field_name, component_name in (
+            ("torso_joint_positions", "torso"),
+            ("head_joint_positions", "head"),
+        ):
+            component = getattr(getattr(self, "robot", None), component_name, None)
+            if component is not None:
+                values = np.asarray(component.get_joint_pos(), dtype=np.float64)
+                if values.shape == (3,) and np.isfinite(values).all():
+                    state_dict[field_name] = values
         return state_dict, timestamp_dict
 
     def validate_joint_limits(self, target_joint_pos: np.ndarray) -> None:

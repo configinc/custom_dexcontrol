@@ -438,6 +438,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description="Physical reference point of external_wrench_sensor_raw",
             )
         )
+        spec.fields["torso_joint_positions"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64", shape=[3], required=False,
+                description="Measured torso_j1..torso_j3 positions in radians",
+            )
+        )
+        spec.fields["head_joint_positions"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64", shape=[3], required=False,
+                description="Measured head_j1..head_j3 positions in radians",
+            )
+        )
         spec.fields["prev_controller_latency_ms"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="float64",
@@ -911,7 +923,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 int_value=int(timestamp_us)
             ),
         }
-        yaw_degrees = self.external_wrench_sensor_to_wrist_yaw_degrees
+        yaw_degrees = getattr(
+            self, "external_wrench_sensor_to_wrist_yaw_degrees", None
+        )
         wrench_sensor = getattr(getattr(self._robot, "arm", None), "wrench_sensor", None)
         if wrench_sensor is not None:
             try:
@@ -959,6 +973,13 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     observation["external_wrench_wrist_reference_point"] = (
                         robotenv_pb2.Value(string_value=reference_point)
                     )
+        for field_name in ("torso_joint_positions", "head_joint_positions"):
+            if field_name in state_dict:
+                observation[field_name] = robotenv_pb2.Value(
+                    float_array=robotenv_pb2.FloatArray(
+                        values=np.asarray(state_dict[field_name], dtype=np.float64).tolist()
+                    )
+                )
         return observation, int(timestamp_us)
 
     @staticmethod
