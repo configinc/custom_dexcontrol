@@ -399,6 +399,35 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description="Wrench state [fx, fy, fz, tx, ty, tz]",
             )
         )
+        spec.fields["external_wrench_sensor_frame"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64",
+                shape=[6],
+                required=False,
+                description=(
+                    "Raw physical F/T sensor wrench in source-native sensor axes "
+                    "[fx, fy, fz, tx, ty, tz] (N, N, N, Nm, Nm, Nm)"
+                ),
+            )
+        )
+        spec.fields["external_wrench_sensor_frame_reference_point"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="string", shape=[], required=False,
+                description="Physical reference point of external_wrench_sensor_frame",
+            )
+        )
+        spec.fields["torso_joint_positions"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64", shape=[3], required=False,
+                description="Measured torso_j1..torso_j3 positions in radians",
+            )
+        )
+        spec.fields["head_joint_positions"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64", shape=[3], required=False,
+                description="Measured head_j1..head_j3 positions in radians",
+            )
+        )
         spec.fields["prev_controller_latency_ms"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="float64",
@@ -819,6 +848,25 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             observation["hand_tactile"] = robotenv_pb2.Value(
                 float_array=robotenv_pb2.FloatArray(
                     values=[float(v) for v in state_dict["hand_tactile"]]
+                )
+            )
+        for field_name in (
+            "external_wrench_sensor_frame",
+            "torso_joint_positions",
+            "head_joint_positions",
+        ):
+            if field_name in state_dict:
+                observation[field_name] = robotenv_pb2.Value(
+                    float_array=robotenv_pb2.FloatArray(
+                        values=np.asarray(state_dict[field_name], dtype=np.float64).tolist()
+                    )
+                )
+        if "external_wrench_sensor_frame_reference_point" in state_dict:
+            observation["external_wrench_sensor_frame_reference_point"] = (
+                robotenv_pb2.Value(
+                    string_value=state_dict[
+                        "external_wrench_sensor_frame_reference_point"
+                    ]
                 )
             )
         return observation, int(timestamp_us)

@@ -1102,9 +1102,13 @@ class VegaRobot:
                 if _force is not None:
                     hand_tactile = np.asarray(_force, dtype=np.float64).tolist()
 
+        wrench_sensor = getattr(self.arm, "wrench_sensor", None)
         wrench_state = np.zeros(6, dtype=np.float64)
-        if getattr(self.arm, "wrench_sensor", None) is not None:
-            wrench_state = np.asarray(self.arm.wrench_sensor.get_wrench_state(), dtype=np.float64)
+        external_wrench_sensor_frame = None
+        if wrench_sensor is not None:
+            wrench_state = np.asarray(wrench_sensor.get_wrench_state(), dtype=np.float64)
+            if wrench_state.shape == (6,) and np.isfinite(wrench_state).all():
+                external_wrench_sensor_frame = wrench_state.copy()
 
         cartesian_position = self._get_cartesian_pose(joint_positions=joint_positions)
 
@@ -1133,6 +1137,20 @@ class VegaRobot:
         # add this key.
         if hand_tactile is not None:
             state_dict["hand_tactile"] = hand_tactile
+        if external_wrench_sensor_frame is not None:
+            state_dict["external_wrench_sensor_frame"] = external_wrench_sensor_frame
+            state_dict["external_wrench_sensor_frame_reference_point"] = (
+                "physical F/T sensor measurement origin"
+            )
+        for field_name, component_name in (
+            ("torso_joint_positions", "torso"),
+            ("head_joint_positions", "head"),
+        ):
+            component = getattr(self.robot, component_name, None)
+            if component is not None:
+                values = np.asarray(component.get_joint_pos(), dtype=np.float64)
+                if values.shape == (3,) and np.isfinite(values).all():
+                    state_dict[field_name] = values
         return state_dict, timestamp_dict
 
     def validate_joint_limits(self, target_joint_pos: np.ndarray) -> None:
