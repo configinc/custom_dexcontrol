@@ -200,6 +200,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         # Serialize all robot commands — prevents concurrent Reset/Step from
         # sending conflicting position commands to the same arm.
         self._cmd_lock = threading.Lock()
+        self._command_epoch_lock = threading.Lock()
+        self._command_epoch = 0
+        self._reset_in_progress = threading.Event()
         # Set by a new Reset to cancel any in-progress _move_incremental loop.
         self._cancel_move = threading.Event()
 
@@ -477,6 +480,13 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         mode = request.mode or "home"
         LOGGER.info("Reset requested: mode=%s arm=%s", mode, self.arm_side)
 
+        # Establish reset ownership before waiting for the command lock.  Any
+        # Step that was already queued with the prior epoch must not run after
+        # this reset completes.
+        self._reset_in_progress.set()
+        with self._command_epoch_lock:
+            self._command_epoch += 1
+
         # Cancel any in-progress _move_incremental from a previous Reset.
         self._cancel_move.set()
 
@@ -520,8 +530,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 # Restart control loop if it was running before reset.
                 if was_running:
                     self._start_control_loop()
+                self._reset_in_progress.clear()
 
     def Step(self, request, context):
+        with self._command_epoch_lock:
+            command_epoch = self._command_epoch
         action_space = request.action_space
         action_space_for_robot = action_space
         action = np.asarray(request.action, dtype=np.float64)
@@ -583,21 +596,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 np.round(np.asarray(pre_action_state["cartesian_position"], dtype=np.float64), 4).tolist(),
             )
 
-            if self._robot.interpolation_enabled and self._control_loop_hz > 0:
-                # Interpolation mode: buffer command; control loop dispatches.
-                self._robot.add_command_point(
-                    action,
-                    action_space=action_space_for_robot,
-                    gripper_action_space=gripper_action_space,
-                )
-            else:
-                # Legacy synchronous path.
-                self._robot.update_command(
-                    action,
-                    action_space=action_space_for_robot,
-                    gripper_action_space=gripper_action_space,
-                    blocking=False,
-                )
+            self._dispatch_step_command(
+                action,
+                action_space=action_space_for_robot,
+                gripper_action_space=gripper_action_space,
+                command_epoch=command_epoch,
+            )
             t_after_cmd = time.time()
 
             # Build comprehensive action_info using the original request action_space
@@ -645,6 +649,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 message=str(exc),
                 timestamp_us=timestamp_us,
             )
+
         except IKFailedError as exc:
             observation, timestamp_us = self._safe_observation()
             return robotenv_pb2.StepResponse(
@@ -670,6 +675,34 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 message=str(exc),
                 timestamp_us=timestamp_us,
             )
+
+    def _dispatch_step_command(
+        self,
+        action: np.ndarray,
+        *,
+        action_space: str,
+        gripper_action_space: str,
+        command_epoch: int,
+    ) -> None:
+        """Serialize physical Step dispatch with Reset and reject stale work."""
+        with self._cmd_lock:
+            with self._command_epoch_lock:
+                reset_superseded_command = command_epoch != self._command_epoch
+            if self._reset_in_progress.is_set() or reset_superseded_command:
+                raise RuntimeError("Step was superseded by robot reset")
+            if self._robot.interpolation_enabled and self._control_loop_hz > 0:
+                self._robot.add_command_point(
+                    action,
+                    action_space=action_space,
+                    gripper_action_space=gripper_action_space,
+                )
+            else:
+                self._robot.update_command(
+                    action,
+                    action_space=action_space,
+                    gripper_action_space=gripper_action_space,
+                    blocking=False,
+                )
 
     def HealthCheck(self, request, context):
         del request, context
