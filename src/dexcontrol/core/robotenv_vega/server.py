@@ -203,9 +203,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._command_epoch_lock = threading.Lock()
         self._command_epoch = 0
         self._reset_in_progress = threading.Event()
-        # Set by a new Reset to cancel any in-progress _move_incremental loop.
-        self._cancel_move = threading.Event()
-
+        self._reset_state_lock = threading.Lock()
+        self._active_reset_count = 0
+        self._active_reset_cancel = None
+        self._reset_restart_control_loop = False
         LOGGER.info(
             "Initialized VegaRobotEnvService model=%s arm=%s gripper=%s frame=%s hz=%s",
             robot_model,
@@ -277,7 +278,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         while not self._control_loop_stop.is_set():
             t0 = time.perf_counter()
             try:
-                self._robot.execute_interpolated_tick()
+                if not self._reset_in_progress.is_set():
+                    self._robot.execute_interpolated_tick()
             except Exception as exc:
                 LOGGER.error("Control loop tick error: %s", exc)
             elapsed = time.perf_counter() - t0
@@ -483,41 +485,58 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
         def cancel_reset_motion() -> None:
             rpc_cancelled.set()
-            self._cancel_move.set()
 
         if hasattr(context, "add_callback") and not context.add_callback(cancel_reset_motion):
             cancel_reset_motion()
 
-        # Establish reset ownership before waiting for the command lock.  Any
-        # Step that was already queued with the prior epoch must not run after
-        # this reset completes.
-        self._reset_in_progress.set()
+        # Establish reset ownership before waiting for the command lock. A new
+        # reset cancels the previous reset's local motion loop, while the
+        # shared in-progress event stays set until every superseded handler has
+        # unwound.
+        with self._reset_state_lock:
+            if self._active_reset_cancel is not None:
+                self._active_reset_cancel.set()
+            self._active_reset_cancel = rpc_cancelled
+            self._active_reset_count += 1
+            self._reset_in_progress.set()
         with self._command_epoch_lock:
             self._command_epoch += 1
 
-        # Cancel any in-progress _move_incremental from a previous Reset.
-        self._cancel_move.set()
-
         was_running = False
         try:
-            # Pause the control loop during reset to prevent conflicting commands.
-            was_running = self._control_loop_thread is not None and self._control_loop_thread.is_alive()
-            if was_running:
-                self._stop_control_loop()
-
             with self._cmd_lock:
                 if rpc_cancelled.is_set():
                     raise RuntimeError("Reset RPC was cancelled before robot motion started")
-                self._cancel_move.clear()
+                calibration_cancellable = bool(
+                    request.params.get("calibration_cancellable", robotenv_pb2.Value()).int_value
+                )
+                # Pause the control loop while this reset owns robot commands.
+                was_running = self._control_loop_thread is not None and self._control_loop_thread.is_alive()
+                if was_running:
+                    with self._reset_state_lock:
+                        self._reset_restart_control_loop = True
+                    self._stop_control_loop()
                 if mode == "home":
                     target_joints = self.reset_joints
-                    self._execute_reset_sequence(target_joints)
+                    self._execute_reset_sequence(
+                        target_joints,
+                        cancelled=rpc_cancelled,
+                        interruptible_gripper=calibration_cancellable,
+                    )
                 elif mode == "target":
                     target_joints = self._extract_target_joints(request)
-                    self._execute_reset_sequence(target_joints)
+                    self._execute_reset_sequence(
+                        target_joints,
+                        cancelled=rpc_cancelled,
+                        interruptible_gripper=calibration_cancellable,
+                    )
                 elif mode == "random":
                     target_joints = self._sample_random_target()
-                    self._execute_reset_sequence(target_joints)
+                    self._execute_reset_sequence(
+                        target_joints,
+                        cancelled=rpc_cancelled,
+                        interruptible_gripper=calibration_cancellable,
+                    )
                 elif mode == "current":
                     pass
                 else:
@@ -541,12 +560,22 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 context.set_details(f"Reset failed: {exc}")
             return robotenv_pb2.ResetResponse()
         finally:
-            # Restart control loop if it was running before reset.
-            if was_running:
+            restart_control_loop = False
+            with self._reset_state_lock:
+                self._active_reset_count -= 1
+                if self._active_reset_cancel is rpc_cancelled:
+                    self._active_reset_cancel = None
+                if self._active_reset_count == 0:
+                    self._reset_in_progress.clear()
+                    restart_control_loop = self._reset_restart_control_loop
+                    self._reset_restart_control_loop = False
+            if restart_control_loop:
                 self._start_control_loop()
-            self._reset_in_progress.clear()
 
     def Step(self, request, context):
+        rpc_cancelled = threading.Event()
+        if hasattr(context, "add_callback") and not context.add_callback(rpc_cancelled.set):
+            rpc_cancelled.set()
         with self._command_epoch_lock:
             command_epoch = self._command_epoch
         action_space = request.action_space
@@ -615,6 +644,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 action_space=action_space_for_robot,
                 gripper_action_space=gripper_action_space,
                 command_epoch=command_epoch,
+                rpc_cancelled=rpc_cancelled,
             )
             t_after_cmd = time.time()
 
@@ -697,12 +727,17 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         action_space: str,
         gripper_action_space: str,
         command_epoch: int,
+        rpc_cancelled: threading.Event | None = None,
     ) -> None:
         """Serialize physical Step dispatch with Reset and reject stale work."""
         with self._cmd_lock:
             with self._command_epoch_lock:
                 reset_superseded_command = command_epoch != self._command_epoch
-            if self._reset_in_progress.is_set() or reset_superseded_command:
+            if (
+                self._reset_in_progress.is_set()
+                or reset_superseded_command
+                or (rpc_cancelled is not None and rpc_cancelled.is_set())
+            ):
                 raise RuntimeError("Step was superseded by robot reset")
             if self._robot.interpolation_enabled and self._control_loop_hz > 0:
                 self._robot.add_command_point(
@@ -901,23 +936,37 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     _RESET_MAX_STEP_RAD = 0.2
     _RESET_SETTLE_S = 0.5
 
-    def _execute_reset_sequence(self, target_joints: np.ndarray) -> None:
+    def _execute_reset_sequence(
+        self,
+        target_joints: np.ndarray,
+        *,
+        cancelled: threading.Event | None = None,
+        interruptible_gripper: bool = False,
+    ) -> None:
         t0 = time.time()
+        if cancelled is not None and cancelled.is_set():
+            return
         LOGGER.info("Reset[%s]: starting gripper open", self.arm_side)
-        self._robot.update_gripper(0.0, velocity=False, blocking=True)
+        self._robot.update_gripper(
+            0.0,
+            velocity=False,
+            blocking=not interruptible_gripper,
+        )
+        if cancelled is not None and cancelled.is_set():
+            return
         LOGGER.info("Reset[%s]: gripper done (%.2fs), starting reset motion", self.arm_side, time.time() - t0)
         self._robot.reset_filter_state()
 
         # Move to middle waypoint to avoid collisions.
         middle_f64 = np.asarray(self.reset_middle_joints, dtype=np.float64)
         LOGGER.info("Reset[%s]: moving to middle waypoint", self.arm_side)
-        self._move_incremental(middle_f64)
+        self._move_incremental(middle_f64, cancelled=cancelled)
         LOGGER.info("Reset[%s]: middle waypoint reached (%.2fs)", self.arm_side, time.time() - t0)
 
         # Then move to the final target (home/init position).
         target_f64 = np.asarray(target_joints, dtype=np.float64)
         LOGGER.info("Reset[%s]: moving to target", self.arm_side)
-        self._move_incremental(target_f64)
+        self._move_incremental(target_f64, cancelled=cancelled)
         LOGGER.info("Reset[%s]: target reached (%.2fs), syncing motion manager", self.arm_side, time.time() - t0)
 
         self._robot.reset_filter_state()
@@ -933,6 +982,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         target: np.ndarray,
         tolerance: float | None = None,
         timeout: float | None = None,
+        cancelled: threading.Event | None = None,
     ) -> None:
         """Move to target in incremental steps respecting motor delta limit."""
         tol = tolerance if tolerance is not None else self._RESET_TOLERANCE_RAD
@@ -947,7 +997,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         _tick = 0  # [BUG PROBE]
 
         while time.time() < deadline:
-            if self._cancel_move.is_set():
+            if cancelled is not None and cancelled.is_set():
                 LOGGER.info("_move_incremental cancelled by new request")
                 return
 
