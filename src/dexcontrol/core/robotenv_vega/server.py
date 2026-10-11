@@ -418,6 +418,26 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description="Physical reference point of external_wrench_wrist",
             )
         )
+        spec.fields["external_wrench_sensor_raw"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64",
+                shape=[6],
+                required=False,
+                description=(
+                    "Source-native uncalibrated F/T sample expressed in sensor axes "
+                    "at the physical sensor origin [fx, fy, fz, tx, ty, tz] "
+                    "(N, N, N, Nm, Nm, Nm); wrench_on_robot sign"
+                ),
+            )
+        )
+        spec.fields["external_wrench_sensor_raw_reference_point"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="string",
+                shape=[],
+                required=False,
+                description="Physical reference point of external_wrench_sensor_raw",
+            )
+        )
         spec.fields["prev_controller_latency_ms"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="float64",
@@ -588,6 +608,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             gripper_action_space = "velocity" if "velocity" in action_space else "position"
 
         try:
+            if reset_active_at_entry:
+                raise RuntimeError("Step was admitted while robot reset was active")
             # -- gripper debug --
             if self._robot.hand is not None:
                 _cur_grip_joint = self._robot.get_cached_gripper_joint_pos()
@@ -874,13 +896,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         }
         yaw_degrees = self.external_wrench_sensor_to_wrist_yaw_degrees
         wrench_sensor = getattr(getattr(self._robot, "arm", None), "wrench_sensor", None)
-        if wrench_sensor is not None and yaw_degrees is not None:
+        if wrench_sensor is not None:
             try:
-                sensor_wrench = wrench_sensor.get_wrench_state()
-                wrist_wrench = sensor_frame_wrench_to_wrist(
-                    sensor_wrench,
-                    sensor_to_wrist_yaw_degrees=yaw_degrees,
+                sensor_wrench = np.asarray(
+                    wrench_sensor.get_wrench_state(),
+                    dtype=np.float64,
                 )
+                if sensor_wrench.shape != (6,) or not np.all(np.isfinite(sensor_wrench)):
+                    raise ValueError("sensor wrench must contain six finite values")
             except Exception as exc:
                 now = time.monotonic()
                 last_warning = getattr(
@@ -895,16 +918,30 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     )
                     self._last_wrench_warning_monotonic = now
             else:
-                observation["external_wrench_wrist"] = robotenv_pb2.Value(
+                reference_point = "physical F/T sensor measurement origin"
+                observation["external_wrench_sensor_raw"] = robotenv_pb2.Value(
                     float_array=robotenv_pb2.FloatArray(
-                        values=wrist_wrench.tolist()
+                        values=sensor_wrench.tolist()
                     )
                 )
-                observation["external_wrench_wrist_reference_point"] = (
+                observation["external_wrench_sensor_raw_reference_point"] = (
                     robotenv_pb2.Value(
-                        string_value="physical F/T sensor measurement origin"
+                        string_value=reference_point
                     )
                 )
+                if yaw_degrees is not None:
+                    wrist_wrench = sensor_frame_wrench_to_wrist(
+                        sensor_wrench,
+                        sensor_to_wrist_yaw_degrees=yaw_degrees,
+                    )
+                    observation["external_wrench_wrist"] = robotenv_pb2.Value(
+                        float_array=robotenv_pb2.FloatArray(
+                            values=wrist_wrench.tolist()
+                        )
+                    )
+                    observation["external_wrench_wrist_reference_point"] = (
+                        robotenv_pb2.Value(string_value=reference_point)
+                    )
         return observation, int(timestamp_us)
 
     @staticmethod

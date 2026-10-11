@@ -30,14 +30,17 @@ def _service() -> VegaRobotEnvService:
     return service
 
 
-def test_observation_contract_uses_external_wrench_wrist_only() -> None:
+def test_observation_contract_exposes_raw_sensor_and_optional_wrist_wrench() -> None:
     spec = _service().GetObservationSpec(None, None)
 
     assert "external_wrench_wrist" in spec.fields
+    assert "external_wrench_sensor_raw" in spec.fields
     assert "external_wrench_world" not in spec.fields
     assert "wrench_state" not in spec.fields
     assert list(spec.fields["external_wrench_wrist"].shape) == [6]
     assert spec.fields["external_wrench_wrist_reference_point"].dtype == "string"
+    assert list(spec.fields["external_wrench_sensor_raw"].shape) == [6]
+    assert spec.fields["external_wrench_sensor_raw_reference_point"].dtype == "string"
 
 
 def test_sensor_boundary_preserves_source_wrench_order_and_sign(monkeypatch) -> None:
@@ -89,6 +92,15 @@ def test_observation_publishes_configured_external_wrist_wrench() -> None:
     assert timestamp_us == 123
     assert "wrench_state" not in observation
     np.testing.assert_allclose(
+        observation["external_wrench_sensor_raw"].float_array.values,
+        source,
+        atol=1e-12,
+    )
+    assert (
+        observation["external_wrench_sensor_raw_reference_point"].string_value
+        == "physical F/T sensor measurement origin"
+    )
+    np.testing.assert_allclose(
         observation["external_wrench_wrist"].float_array.values,
         [0.0, 1.0, 3.0, 0.0, 2.0, 4.0],
         atol=1e-12,
@@ -126,7 +138,7 @@ def test_robot_state_does_not_read_or_leak_source_wrench() -> None:
     assert "external_wrench_sensor_frame" not in state
 
 
-def test_unconfigured_yaw_omits_canonical_wrist_wrench() -> None:
+def test_unconfigured_yaw_preserves_raw_sensor_and_omits_wrist_wrench() -> None:
     state = {
         "joint_positions": np.zeros(7),
         "joint_velocities": np.zeros(7),
@@ -138,11 +150,7 @@ def test_unconfigured_yaw_omits_canonical_wrist_wrench() -> None:
     service._robot = SimpleNamespace(
         get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
         arm=SimpleNamespace(
-            wrench_sensor=SimpleNamespace(
-                get_wrench_state=lambda: (_ for _ in ()).throw(
-                    AssertionError("unset yaw must not read optional F/T sensor")
-                )
-            )
+            wrench_sensor=SimpleNamespace(get_wrench_state=lambda: np.arange(6.0))
         ),
     )
 
@@ -150,6 +158,14 @@ def test_unconfigured_yaw_omits_canonical_wrist_wrench() -> None:
 
     assert "external_wrench_wrist" not in observation
     assert "external_wrench_wrist_reference_point" not in observation
+    np.testing.assert_array_equal(
+        observation["external_wrench_sensor_raw"].float_array.values,
+        np.arange(6.0),
+    )
+    assert (
+        observation["external_wrench_sensor_raw_reference_point"].string_value
+        == "physical F/T sensor measurement origin"
+    )
 
 
 def test_malformed_source_wrench_omits_optional_wrist_wrench() -> None:
@@ -173,6 +189,8 @@ def test_malformed_source_wrench_omits_optional_wrist_wrench() -> None:
 
     assert "external_wrench_wrist" not in observation
     assert "external_wrench_wrist_reference_point" not in observation
+    assert "external_wrench_sensor_raw" not in observation
+    assert "external_wrench_sensor_raw_reference_point" not in observation
 
 
 def test_silent_sensor_omits_wrench_without_breaking_observation() -> None:
@@ -201,6 +219,7 @@ def test_silent_sensor_omits_wrench_without_breaking_observation() -> None:
     assert timestamp_us == 123
     assert "joint_positions" in observation
     assert "external_wrench_wrist" not in observation
+    assert "external_wrench_sensor_raw" not in observation
 
 
 def test_sensor_payload_missing_wrench_omits_only_optional_signal() -> None:
@@ -227,6 +246,7 @@ def test_sensor_payload_missing_wrench_omits_only_optional_signal() -> None:
     assert timestamp_us == 123
     assert "joint_positions" in observation
     assert "external_wrench_wrist" not in observation
+    assert "external_wrench_sensor_raw" not in observation
 
 
 def test_unexpected_sensor_failure_omits_only_optional_signal() -> None:
@@ -255,6 +275,7 @@ def test_unexpected_sensor_failure_omits_only_optional_signal() -> None:
     assert timestamp_us == 123
     assert "joint_positions" in observation
     assert "external_wrench_wrist" not in observation
+    assert "external_wrench_sensor_raw" not in observation
 
 
 def test_unavailable_sensor_warning_is_rate_limited(caplog) -> None:
@@ -315,3 +336,5 @@ def test_sensor_absence_omits_optional_external_wrench() -> None:
     observation, _ = service._create_observation()
     assert "external_wrench_wrist" not in observation
     assert "external_wrench_wrist_reference_point" not in observation
+    assert "external_wrench_sensor_raw" not in observation
+    assert "external_wrench_sensor_raw_reference_point" not in observation

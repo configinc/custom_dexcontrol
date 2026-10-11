@@ -149,6 +149,27 @@ def test_uncancelled_step_admitted_during_reset_cannot_run_after_reset():
     assert service._robot.commands == []
 
 
+def test_step_admitted_during_reset_fails_before_reading_robot_state():
+    service = _service()
+    service._reset_in_progress.set()
+    service._robot.hand = None
+    service._robot.get_robot_state = lambda: (_ for _ in ()).throw(
+        AssertionError("reset-active Step must fail before touching robot state")
+    )
+    request = SimpleNamespace(
+        action_space="cartesian_delta",
+        action=np.zeros(7),
+        gripper_action_space="position",
+    )
+    context = SimpleNamespace(add_callback=lambda _callback: True)
+
+    response = service.Step(request, context)
+
+    assert response.status == "ERROR"
+    assert "reset was active" in response.message
+    assert service._robot.commands == []
+
+
 def test_cancelled_reset_rpc_aborts_before_motion_after_lock_wait():
     class Context:
         def __init__(self):
