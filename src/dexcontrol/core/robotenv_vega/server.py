@@ -479,6 +479,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     def Reset(self, request, context):
         mode = request.mode or "home"
         LOGGER.info("Reset requested: mode=%s arm=%s", mode, self.arm_side)
+        rpc_cancelled = threading.Event()
+
+        def cancel_reset_motion() -> None:
+            rpc_cancelled.set()
+            self._cancel_move.set()
+
+        if hasattr(context, "add_callback") and not context.add_callback(cancel_reset_motion):
+            cancel_reset_motion()
 
         # Establish reset ownership before waiting for the command lock.  Any
         # Step that was already queued with the prior epoch must not run after
@@ -490,14 +498,17 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         # Cancel any in-progress _move_incremental from a previous Reset.
         self._cancel_move.set()
 
-        # Pause the control loop during reset to prevent conflicting commands.
-        was_running = self._control_loop_thread is not None and self._control_loop_thread.is_alive()
-        if was_running:
-            self._stop_control_loop()
+        was_running = False
+        try:
+            # Pause the control loop during reset to prevent conflicting commands.
+            was_running = self._control_loop_thread is not None and self._control_loop_thread.is_alive()
+            if was_running:
+                self._stop_control_loop()
 
-        with self._cmd_lock:
-            self._cancel_move.clear()
-            try:
+            with self._cmd_lock:
+                if rpc_cancelled.is_set():
+                    raise RuntimeError("Reset RPC was cancelled before robot motion started")
+                self._cancel_move.clear()
                 if mode == "home":
                     target_joints = self.reset_joints
                     self._execute_reset_sequence(target_joints)
@@ -513,6 +524,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                     context.set_details(f"Unknown reset mode: {mode}")
                     return robotenv_pb2.ResetResponse()
+                if rpc_cancelled.is_set():
+                    raise RuntimeError("Reset RPC was cancelled during robot motion")
 
                 observation, timestamp_us = self._create_observation()
                 return robotenv_pb2.ResetResponse(
@@ -521,16 +534,17 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     message=f"Reset to {mode}",
                     timestamp_us=timestamp_us,
                 )
-            except Exception as exc:
-                LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
+        except Exception as exc:
+            LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
+            if not rpc_cancelled.is_set():
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(f"Reset failed: {exc}")
-                return robotenv_pb2.ResetResponse()
-            finally:
-                # Restart control loop if it was running before reset.
-                if was_running:
-                    self._start_control_loop()
-                self._reset_in_progress.clear()
+            return robotenv_pb2.ResetResponse()
+        finally:
+            # Restart control loop if it was running before reset.
+            if was_running:
+                self._start_control_loop()
+            self._reset_in_progress.clear()
 
     def Step(self, request, context):
         with self._command_epoch_lock:
