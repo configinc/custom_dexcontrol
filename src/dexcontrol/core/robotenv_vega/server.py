@@ -569,12 +569,22 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     raise RuntimeError("Reset was cancelled during robot motion")
 
                 observation, timestamp_us = self._create_observation()
-                return robotenv_pb2.ResetResponse(
-                    observation=observation,
-                    status="SUCCESS",
-                    message=f"Reset to {mode}",
-                    timestamp_us=timestamp_us,
-                )
+                # Linearize success against registration of a newer Reset.
+                # A newer owner either sets our cancellation event before
+                # acquiring the command lock or cannot register until after
+                # this response has been committed as the current owner.
+                with self._reset_state_lock:
+                    if (
+                        motion_cancelled.is_set()
+                        or self._active_reset_cancel is not motion_cancelled
+                    ):
+                        raise RuntimeError("Reset was superseded before its response was committed")
+                    return robotenv_pb2.ResetResponse(
+                        observation=observation,
+                        status="SUCCESS",
+                        message=f"Reset to {mode}",
+                        timestamp_us=timestamp_us,
+                    )
         except Exception as exc:
             LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
             if rpc_cancelled.is_set():

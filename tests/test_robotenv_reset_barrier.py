@@ -337,3 +337,70 @@ def test_superseded_reset_returns_aborted_instead_of_empty_success():
     assert responses["first"].status == ""
     assert second_context.code is None
     assert responses["second"].status == "SUCCESS"
+
+
+def test_reset_superseded_while_building_observation_cannot_return_success():
+    class Context:
+        def __init__(self):
+            self.code = None
+            self.details = None
+
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    observation_entered = threading.Event()
+    release_first_observation = threading.Event()
+    observation_calls = 0
+    observation_lock = threading.Lock()
+
+    def observation():
+        nonlocal observation_calls
+        with observation_lock:
+            observation_calls += 1
+            call = observation_calls
+        if call == 1:
+            observation_entered.set()
+            assert release_first_observation.wait(timeout=1.0)
+        return {}, call
+
+    service._create_observation = observation
+    first_context = Context()
+    second_context = Context()
+    responses = {}
+    first = threading.Thread(
+        target=lambda: responses.setdefault(
+            "first",
+            service.Reset(SimpleNamespace(mode="current", params={}), first_context),
+        )
+    )
+    second = threading.Thread(
+        target=lambda: responses.setdefault(
+            "second",
+            service.Reset(SimpleNamespace(mode="current", params={}), second_context),
+        )
+    )
+
+    first.start()
+    assert observation_entered.wait(timeout=1.0)
+    second.start()
+    for _ in range(100):
+        if service._active_reset_count == 2:
+            break
+        threading.Event().wait(0.01)
+    assert service._active_reset_count == 2
+    release_first_observation.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert first_context.code == grpc.StatusCode.ABORTED
+    assert "superseded" in first_context.details
+    assert responses["first"].status == ""
+    assert second_context.code is None
+    assert responses["second"].status == "SUCCESS"
