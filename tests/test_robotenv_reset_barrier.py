@@ -119,6 +119,36 @@ def test_cancelled_step_is_rejected_even_if_it_captures_post_reset_epoch():
     assert service._robot.commands == []
 
 
+def test_uncancelled_step_admitted_during_reset_cannot_run_after_reset():
+    service = _service()
+    service._command_epoch = 1
+    service._reset_in_progress.set()
+    service._cmd_lock.acquire()
+    outcome = SimpleNamespace(error=None)
+
+    def dispatch():
+        try:
+            service._dispatch_step_command(
+                np.ones(7),
+                action_space="cartesian_delta",
+                gripper_action_space="position",
+                command_epoch=1,
+                reset_active_at_entry=True,
+            )
+        except Exception as exc:
+            outcome.error = exc
+
+    worker = threading.Thread(target=dispatch)
+    worker.start()
+    service._reset_in_progress.clear()
+    service._cmd_lock.release()
+    worker.join(timeout=1.0)
+
+    assert worker.is_alive() is False
+    assert isinstance(outcome.error, RuntimeError)
+    assert service._robot.commands == []
+
+
 def test_cancelled_reset_rpc_aborts_before_motion_after_lock_wait():
     class Context:
         def __init__(self):

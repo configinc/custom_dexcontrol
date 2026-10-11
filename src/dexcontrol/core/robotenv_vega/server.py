@@ -499,8 +499,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self._active_reset_cancel = rpc_cancelled
             self._active_reset_count += 1
             self._reset_in_progress.set()
-        with self._command_epoch_lock:
-            self._command_epoch += 1
+            with self._command_epoch_lock:
+                self._command_epoch += 1
 
         was_running = False
         try:
@@ -576,8 +576,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         rpc_cancelled = threading.Event()
         if hasattr(context, "add_callback") and not context.add_callback(rpc_cancelled.set):
             rpc_cancelled.set()
-        with self._command_epoch_lock:
-            command_epoch = self._command_epoch
+        with self._reset_state_lock:
+            reset_active_at_entry = self._reset_in_progress.is_set()
+            with self._command_epoch_lock:
+                command_epoch = self._command_epoch
         action_space = request.action_space
         action_space_for_robot = action_space
         action = np.asarray(request.action, dtype=np.float64)
@@ -645,6 +647,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 gripper_action_space=gripper_action_space,
                 command_epoch=command_epoch,
                 rpc_cancelled=rpc_cancelled,
+                reset_active_at_entry=reset_active_at_entry,
             )
             t_after_cmd = time.time()
 
@@ -728,6 +731,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         gripper_action_space: str,
         command_epoch: int,
         rpc_cancelled: threading.Event | None = None,
+        reset_active_at_entry: bool = False,
     ) -> None:
         """Serialize physical Step dispatch with Reset and reject stale work."""
         with self._cmd_lock:
@@ -736,6 +740,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             if (
                 self._reset_in_progress.is_set()
                 or reset_superseded_command
+                or reset_active_at_entry
                 or (rpc_cancelled is not None and rpc_cancelled.is_set())
             ):
                 raise RuntimeError("Step was superseded by robot reset")
