@@ -502,9 +502,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         mode = request.mode or "home"
         LOGGER.info("Reset requested: mode=%s arm=%s", mode, self.arm_side)
         rpc_cancelled = threading.Event()
+        motion_cancelled = threading.Event()
 
         def cancel_reset_motion() -> None:
             rpc_cancelled.set()
+            motion_cancelled.set()
 
         if hasattr(context, "add_callback") and not context.add_callback(cancel_reset_motion):
             cancel_reset_motion()
@@ -516,7 +518,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         with self._reset_state_lock:
             if self._active_reset_cancel is not None:
                 self._active_reset_cancel.set()
-            self._active_reset_cancel = rpc_cancelled
+            self._active_reset_cancel = motion_cancelled
             self._active_reset_count += 1
             self._reset_in_progress.set()
             with self._command_epoch_lock:
@@ -525,8 +527,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         was_running = False
         try:
             with self._cmd_lock:
-                if rpc_cancelled.is_set():
-                    raise RuntimeError("Reset RPC was cancelled before robot motion started")
+                if motion_cancelled.is_set():
+                    raise RuntimeError("Reset was cancelled before robot motion started")
                 calibration_cancellable = bool(
                     request.params.get("calibration_cancellable", robotenv_pb2.Value()).int_value
                 )
@@ -540,21 +542,21 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     target_joints = self.reset_joints
                     self._execute_reset_sequence(
                         target_joints,
-                        cancelled=rpc_cancelled,
+                        cancelled=motion_cancelled,
                         interruptible_gripper=calibration_cancellable,
                     )
                 elif mode == "target":
                     target_joints = self._extract_target_joints(request)
                     self._execute_reset_sequence(
                         target_joints,
-                        cancelled=rpc_cancelled,
+                        cancelled=motion_cancelled,
                         interruptible_gripper=calibration_cancellable,
                     )
                 elif mode == "random":
                     target_joints = self._sample_random_target()
                     self._execute_reset_sequence(
                         target_joints,
-                        cancelled=rpc_cancelled,
+                        cancelled=motion_cancelled,
                         interruptible_gripper=calibration_cancellable,
                     )
                 elif mode == "current":
@@ -563,8 +565,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                     context.set_details(f"Unknown reset mode: {mode}")
                     return robotenv_pb2.ResetResponse()
-                if rpc_cancelled.is_set():
-                    raise RuntimeError("Reset RPC was cancelled during robot motion")
+                if motion_cancelled.is_set():
+                    raise RuntimeError("Reset was cancelled during robot motion")
 
                 observation, timestamp_us = self._create_observation()
                 return robotenv_pb2.ResetResponse(
@@ -575,7 +577,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 )
         except Exception as exc:
             LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
-            if not rpc_cancelled.is_set():
+            if rpc_cancelled.is_set():
+                pass
+            elif motion_cancelled.is_set():
+                context.set_code(grpc.StatusCode.ABORTED)
+                context.set_details("Reset was superseded by a newer reset request")
+            else:
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(f"Reset failed: {exc}")
             return robotenv_pb2.ResetResponse()
@@ -583,7 +590,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             restart_control_loop = False
             with self._reset_state_lock:
                 self._active_reset_count -= 1
-                if self._active_reset_cancel is rpc_cancelled:
+                if self._active_reset_cancel is motion_cancelled:
                     self._active_reset_cancel = None
                 if self._active_reset_count == 0:
                     self._reset_in_progress.clear()

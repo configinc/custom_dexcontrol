@@ -4,6 +4,7 @@ from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
+import grpc
 
 # Keep this server test independent of the optional DualSense/hidapi stack.
 _base_arm_teleop = ModuleType("base_arm_teleop")
@@ -279,3 +280,60 @@ def test_overlapping_resets_keep_loop_paused_until_newest_reset_finishes():
     assert len(stop_calls) == 1
     assert len(start_calls) == 1
     assert service._reset_in_progress.is_set() is False
+
+
+def test_superseded_reset_returns_aborted_instead_of_empty_success():
+    class Context:
+        def __init__(self):
+            self.callback = None
+            self.code = None
+            self.details = None
+
+        def add_callback(self, callback):
+            self.callback = callback
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    service._create_observation = lambda: ({}, 1)
+    first_context = Context()
+    second_context = Context()
+    service._cmd_lock.acquire()
+    responses = {}
+
+    first = threading.Thread(
+        target=lambda: responses.setdefault(
+            "first",
+            service.Reset(SimpleNamespace(mode="current", params={}), first_context),
+        )
+    )
+    second = threading.Thread(
+        target=lambda: responses.setdefault(
+            "second",
+            service.Reset(SimpleNamespace(mode="current", params={}), second_context),
+        )
+    )
+    first.start()
+    for _ in range(100):
+        if service._active_reset_count == 1:
+            break
+        threading.Event().wait(0.01)
+    second.start()
+    for _ in range(100):
+        if service._active_reset_count == 2:
+            break
+        threading.Event().wait(0.01)
+    service._cmd_lock.release()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert first_context.code == grpc.StatusCode.ABORTED
+    assert "superseded" in first_context.details
+    assert responses["first"].status == ""
+    assert second_context.code is None
+    assert responses["second"].status == "SUCCESS"
