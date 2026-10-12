@@ -23,7 +23,7 @@ def _service() -> VegaRobotEnvService:
     service = VegaRobotEnvService.__new__(VegaRobotEnvService)
     service.robot_model = "vega_1"
     service.arm_side = "left"
-    service.gripper_type = "default"
+    service.gripper_type = "robotiq"
     service.frame_type = "vega_mobile_base"
     service.control_hz = 20
     service.R_robot_to_world = None
@@ -51,6 +51,10 @@ def test_observation_contract_exposes_only_raw_sensor_wrench() -> None:
     assert "wrench_state" not in spec.fields
     assert list(spec.fields["external_wrench_sensor_raw"].shape) == [6]
     assert spec.fields["external_wrench_sensor_raw_reference_point"].dtype == "string"
+    assert list(spec.fields["external_wrench_wrist_from_sensor_rotation"].shape) == [9]
+    assert list(spec.fields["external_wrench_world_from_sensor_rotation"].shape) == [9]
+    assert spec.metadata["force_signal_provider_kind"] == "wrist_force_torque"
+    assert spec.metadata["force_signal_provider_schema_version"] == "2"
 
 
 def test_sensor_boundary_preserves_source_wrench_order_and_sign(monkeypatch) -> None:
@@ -112,6 +116,21 @@ def test_observation_keeps_configured_rotation_out_of_canonical_fields() -> None
     )
     assert "external_wrench_wrist" not in observation
     assert "external_wrench_wrist_reference_point" not in observation
+    wrist_from_sensor = np.asarray(
+        observation["external_wrench_wrist_from_sensor_rotation"].float_array.values
+    ).reshape(3, 3)
+    world_from_sensor = np.asarray(
+        observation["external_wrench_world_from_sensor_rotation"].float_array.values
+    ).reshape(3, 3)
+    expected = np.array(
+        [
+            [np.cos(np.deg2rad(165.0)), np.sin(np.deg2rad(165.0)), 0.0],
+            [-np.sin(np.deg2rad(165.0)), np.cos(np.deg2rad(165.0)), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    np.testing.assert_allclose(wrist_from_sensor, expected, atol=1e-12)
+    np.testing.assert_allclose(world_from_sensor, np.eye(3), atol=1e-12)
 
 
 def test_robot_state_does_not_read_or_leak_source_wrench() -> None:

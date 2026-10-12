@@ -32,6 +32,7 @@ from core.vega.robot import (  # noqa: E402
 )
 from core.robotenv_vega.wrench_contract import (  # noqa: E402
     sensor_frame_wrench_to_wrist,
+    vega_wrench_frame_rotations,
 )
 from proto import robotenv_pb2, robotenv_pb2_grpc  # noqa: E402
 
@@ -332,6 +333,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "gripper_type": self.gripper_type,
                 "frame_type": self.frame_type,
                 "control_hz": str(self.control_hz),
+                "force_signal_provider_kind": "wrist_force_torque",
+                "force_signal_provider_schema_version": "2",
+                "force_signal_stream_id": f"{self.robot_model}:{self.arm_side}:wrist_ft",
+                "external_wrench_world_frame_id": self.frame_type,
             },
         )
 
@@ -419,6 +424,21 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description="Physical reference point of external_wrench_sensor_raw",
             )
         )
+        for field_name, description in (
+            (
+                "external_wrench_wrist_from_sensor_rotation",
+                "3x3 row-major rotation from physical sensor axes to company wrist axes",
+            ),
+            (
+                "external_wrench_world_from_sensor_rotation",
+                "3x3 row-major rotation from physical sensor axes to configured world axes",
+            ),
+        ):
+            spec.fields[field_name].CopyFrom(
+                robotenv_pb2.FieldSpec(
+                    dtype="float64", shape=[9], required=False, description=description
+                )
+            )
         spec.fields["torso_joint_positions"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="float64", shape=[3], required=False,
@@ -483,6 +503,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "robot_model": self.robot_model,
                 "control_hz": str(self.control_hz),
                 "arm_side": self.arm_side,
+                "force_signal_provider_kind": "wrist_force_torque",
+                "force_signal_provider_schema_version": "2",
+                "force_signal_stream_id": f"{self.robot_model}:{self.arm_side}:wrist_ft",
+                "external_wrench_world_frame_id": self.frame_type,
                 "external_wrench_sensor_to_wrist_yaw_degrees": (
                     "unset"
                     if self.external_wrench_sensor_to_wrist_yaw_degrees is None
@@ -938,6 +962,27 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                         string_value=reference_point
                     )
                 )
+                try:
+                    wrist_from_sensor, world_from_sensor = vega_wrench_frame_rotations(
+                        cartesian_position, gripper_type=self.gripper_type
+                    )
+                except ValueError as exc:
+                    LOGGER.warning("Omitting unsupported wrench frame rotations: %s", exc)
+                else:
+                    observation["external_wrench_wrist_from_sensor_rotation"] = (
+                        robotenv_pb2.Value(
+                            float_array=robotenv_pb2.FloatArray(
+                                values=wrist_from_sensor.reshape(-1).tolist()
+                            )
+                        )
+                    )
+                    observation["external_wrench_world_from_sensor_rotation"] = (
+                        robotenv_pb2.Value(
+                            float_array=robotenv_pb2.FloatArray(
+                                values=world_from_sensor.reshape(-1).tolist()
+                            )
+                        )
+                    )
         for field_name in ("torso_joint_positions", "head_joint_positions"):
             if field_name in state_dict:
                 observation[field_name] = robotenv_pb2.Value(
