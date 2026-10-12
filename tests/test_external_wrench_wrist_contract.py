@@ -31,26 +31,24 @@ def _service() -> VegaRobotEnvService:
     return service
 
 
-def test_standard_tcp_aligned_mount_defaults_to_zero_wrist_yaw() -> None:
+def test_robot_server_does_not_default_a_canonical_wrist_transform() -> None:
     signature = inspect.signature(VegaRobotEnvService)
 
     assert (
         signature.parameters[
             "external_wrench_sensor_to_wrist_yaw_degrees"
         ].default
-        == 0.0
+        is None
     )
 
 
-def test_observation_contract_exposes_raw_sensor_and_optional_wrist_wrench() -> None:
+def test_observation_contract_exposes_only_raw_sensor_wrench() -> None:
     spec = _service().GetObservationSpec(None, None)
 
-    assert "external_wrench_wrist" in spec.fields
+    assert "external_wrench_wrist" not in spec.fields
     assert "external_wrench_sensor_raw" in spec.fields
     assert "external_wrench_world" not in spec.fields
     assert "wrench_state" not in spec.fields
-    assert list(spec.fields["external_wrench_wrist"].shape) == [6]
-    assert spec.fields["external_wrench_wrist_reference_point"].dtype == "string"
     assert list(spec.fields["external_wrench_sensor_raw"].shape) == [6]
     assert spec.fields["external_wrench_sensor_raw_reference_point"].dtype == "string"
 
@@ -81,7 +79,7 @@ def test_sensor_to_wrist_yaw_rotates_force_and_torque() -> None:
     )
 
 
-def test_observation_publishes_configured_external_wrist_wrench() -> None:
+def test_observation_keeps_configured_rotation_out_of_canonical_fields() -> None:
     source = np.array([1.0, 0.0, 3.0, 2.0, 0.0, 4.0])
     state = {
         "joint_positions": np.zeros(7),
@@ -112,15 +110,8 @@ def test_observation_publishes_configured_external_wrist_wrench() -> None:
         observation["external_wrench_sensor_raw_reference_point"].string_value
         == "physical F/T sensor measurement origin"
     )
-    np.testing.assert_allclose(
-        observation["external_wrench_wrist"].float_array.values,
-        [0.0, 1.0, 3.0, 0.0, 2.0, 4.0],
-        atol=1e-12,
-    )
-    assert (
-        observation["external_wrench_wrist_reference_point"].string_value
-        == "physical F/T sensor measurement origin"
-    )
+    assert "external_wrench_wrist" not in observation
+    assert "external_wrench_wrist_reference_point" not in observation
 
 
 def test_robot_state_does_not_read_or_leak_source_wrench() -> None:

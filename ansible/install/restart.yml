@@ -9,10 +9,6 @@
     # Gripper selection: "robotiq" (default, ttyUSB) or "sr_gripper" (EtherCAT).
     # Override with `-e gripper_type=sr_gripper` on the ansible-playbook CLI.
     gripper_type: "robotiq"
-    # Standard Vega sensor mounts are physically aligned to the TCP/wrist axes.
-    # Override per arm only for a non-standard physical installation.
-    left_external_wrench_sensor_to_wrist_yaw_degrees: 0.0
-    right_external_wrench_sensor_to_wrist_yaw_degrees: 0.0
 
   tasks:
     # ── Pre-flight checks ────────────────────────────────────────────────────
@@ -133,7 +129,6 @@
             --grpc-port 50061 \
             --gripper-type {{ gripper_type }} \
             {{ gripper_port_flag }} {{ left_gripper_port }} \
-            {{ ('--external-wrench-sensor-to-wrist-yaw-degrees ' ~ left_external_wrench_sensor_to_wrist_yaw_degrees) if left_external_wrench_sensor_to_wrist_yaw_degrees is not none else '' }} \
             --use-velocity-feedforward \
             --interpolation-method linear \
             --interpolation-history 3 \
@@ -152,7 +147,6 @@
             --grpc-port 50063 \
             --gripper-type {{ gripper_type }} \
             {{ gripper_port_flag }} {{ right_gripper_port }} \
-            {{ ('--external-wrench-sensor-to-wrist-yaw-degrees ' ~ right_external_wrench_sensor_to_wrist_yaw_degrees) if right_external_wrench_sensor_to_wrist_yaw_degrees is not none else '' }} \
             --use-velocity-feedforward \
             --interpolation-method linear \
             --interpolation-history 3 \
