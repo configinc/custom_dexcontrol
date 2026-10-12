@@ -34,8 +34,11 @@ The deployment slots are:
 - `left_external_wrench_sensor_to_wrist_yaw_degrees`
 - `right_external_wrench_sensor_to_wrist_yaw_degrees`
 
-Both default to `null`. While unset, the server deliberately omits
-`external_wrench_wrist`; it never relabels or zero-fills the raw sensor value.
+Both default to `0°` because the standardized Vega sensor installation is
+physically aligned with the TCP/company wrist axes. A non-standard installation
+must override the corresponding arm value. If the service is explicitly created
+with `None`, it omits `external_wrench_wrist`; it never relabels or zero-fills the
+raw sensor value.
 
 ## Calibration owner handoff
 

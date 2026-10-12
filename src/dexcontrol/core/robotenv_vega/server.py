@@ -79,7 +79,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         control_hz: int = 20,
         use_velocity_feedforward: bool = False,
         base_frame_rotation: Optional[list[float]] = None,
-        external_wrench_sensor_to_wrist_yaw_degrees: float | None = None,
+        external_wrench_sensor_to_wrist_yaw_degrees: float | None = 0.0,
         ik_solver_type: str = "pink",
         robotiq_comport: str = "/dev/ttyUSB0",
         ema_alpha: float = 0.0,
@@ -1189,7 +1189,7 @@ def serve(
     control_hz: int = 20,
     use_velocity_feedforward: bool = False,
     base_frame_rotation: Optional[list[float]] = None,
-    external_wrench_sensor_to_wrist_yaw_degrees: float | None = None,
+    external_wrench_sensor_to_wrist_yaw_degrees: float | None = 0.0,
     ik_solver_type: str = "pink",
     robotiq_comport: str = "/dev/ttyUSB0",
     ema_alpha: float = 0.0,
@@ -1357,11 +1357,11 @@ def main() -> None:
     parser.add_argument(
         "--external-wrench-sensor-to-wrist-yaw-degrees",
         type=float,
-        default=None,
+        default=0.0,
         help=(
             "Active +Z yaw from Vega's source-native F/T sensor axes to the "
-            "company wrist convention. Required to publish external_wrench_wrist; "
-            "leave unset until the per-arm value is measured."
+            "company wrist convention (default: 0 degrees for the standardized "
+            "TCP-aligned sensor mount)."
         ),
     )
     parser.add_argument(

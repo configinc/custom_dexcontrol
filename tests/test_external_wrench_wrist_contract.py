@@ -1,3 +1,4 @@
+import inspect
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -28,6 +29,17 @@ def _service() -> VegaRobotEnvService:
     service.R_robot_to_world = None
     service.external_wrench_sensor_to_wrist_yaw_degrees = None
     return service
+
+
+def test_standard_tcp_aligned_mount_defaults_to_zero_wrist_yaw() -> None:
+    signature = inspect.signature(VegaRobotEnvService)
+
+    assert (
+        signature.parameters[
+            "external_wrench_sensor_to_wrist_yaw_degrees"
+        ].default
+        == 0.0
+    )
 
 
 def test_observation_contract_exposes_raw_sensor_and_optional_wrist_wrench() -> None:
