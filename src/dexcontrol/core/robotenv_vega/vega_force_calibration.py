@@ -428,6 +428,7 @@ class VegaForceCalibrationManager:
         self._holds: list[WristFtCalibrationHold] = []
         self._candidate: WristFtCalibrationParameters | None = None
         self._pending_terminal: tuple[str, str | None] | None = None
+        self._runtime_install_pending_run_id: str | None = None
         self._owns_robot = False
         self._restore_runtime_state()
 
@@ -557,8 +558,12 @@ class VegaForceCalibrationManager:
                     run_id, force_recalibrate=force_recalibrate
                 )
                 if status.state == "SUCCEEDED":
-                    self._install_committed_result(run_id)
-                    self._release_if_owned()
+                    try:
+                        current_result = self.lifecycle.get_result("")
+                        if current_result.get("available"):
+                            self._install_committed_result(run_id)
+                    finally:
+                        self._release_if_owned()
                 elif (
                     self._pending_terminal is not None
                     and self._pending_terminal[0] == run_id
@@ -799,6 +804,14 @@ class VegaForceCalibrationManager:
         result = self.lifecycle.get_result(run_id)
         if not result.get("available"):
             raise RuntimeError("committed calibration result is unavailable")
+        try:
+            self._install_result_snapshot(result)
+        except BaseException:
+            self._runtime_install_pending_run_id = run_id
+            raise
+        self._runtime_install_pending_run_id = None
+
+    def _install_result_snapshot(self, result: Mapping[str, Any]) -> None:
         parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
         self.adapter.install_prepared(self.adapter.prepare_install(parameters))
 
@@ -840,7 +853,12 @@ class VegaForceCalibrationManager:
                 if repaired is None:
                     raise
                 try:
-                    self.adapter.install_prepared(prepared)
+                    try:
+                        self.adapter.install_prepared(prepared)
+                    except BaseException:
+                        self._runtime_install_pending_run_id = run_id
+                        raise
+                    self._runtime_install_pending_run_id = None
                 finally:
                     self._release_if_owned()
                 status = repaired
@@ -853,7 +871,10 @@ class VegaForceCalibrationManager:
             status = self.expire_deadline()
             if run_id and run_id != status.run_id:
                 raise LifecycleError("NOT_FOUND", "unknown calibration run_id")
-            if status.state == "SUCCEEDED" and self._owns_robot:
+            if status.state == "SUCCEEDED" and (
+                self._owns_robot
+                or self._runtime_install_pending_run_id == status.run_id
+            ):
                 self._install_committed_result_and_release(status.run_id)
             elif status.state in {"CANCELLED", "FAILED"}:
                 self._release_if_owned()
@@ -864,7 +885,10 @@ class VegaForceCalibrationManager:
     def result(self, run_id: str = "") -> dict[str, Any]:
         with self._lock:
             status = self.lifecycle.status()
-            if status.state == "SUCCEEDED" and self._owns_robot:
+            if status.state == "SUCCEEDED" and (
+                self._owns_robot
+                or self._runtime_install_pending_run_id == status.run_id
+            ):
                 self._install_committed_result_and_release(status.run_id)
             elif status.state in {"CANCELLED", "FAILED"}:
                 self._release_if_owned()
