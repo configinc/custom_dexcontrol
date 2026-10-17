@@ -17,6 +17,7 @@ operations.
 """
 
 import time
+import threading
 from typing import Any, Literal
 
 import numpy as np
@@ -67,6 +68,7 @@ class RobotQueryInterface:
         # down once every owner releases it. Balanced in _release_shared_node().
         self._node_released = False
         self._node_owner_released = False
+        self._node_release_lock = threading.Lock()
         self._node = acquire_shared_node()
         try:
             self._hand_querier = self._node.create_service_client(
@@ -151,23 +153,31 @@ class RobotQueryInterface:
         ``close()`` does not double-release and tear the Node out from under
         other live owners.
         """
-        if getattr(self, "_node_released", False):
-            return bool(getattr(self, "_node_session_cleanup_required", False))
-        from dexcontrol.core.shared_node import shutdown_shared_node
-        release_owner = not getattr(self, "_node_owner_released", False)
-        try:
-            session_cleanup_required = shutdown_shared_node(
-                release_owner=release_owner
-            )
-        finally:
-            # The shared-node transaction decrements ownership before a
-            # possible last-owner transport failure.  Record that fact so a
-            # retry never decrements twice.
-            if release_owner:
-                self._node_owner_released = True
-        self._node_session_cleanup_required = session_cleanup_required
-        self._node_released = True
-        return session_cleanup_required
+        lock = getattr(self, "_node_release_lock", None)
+        if lock is None:
+            # Compatibility for old pickles/tests created without __init__.
+            lock = threading.Lock()
+            self._node_release_lock = lock
+        with lock:
+            if getattr(self, "_node_released", False):
+                return bool(
+                    getattr(self, "_node_session_cleanup_required", False)
+                )
+            from dexcontrol.core.shared_node import shutdown_shared_node
+            release_owner = not getattr(self, "_node_owner_released", False)
+            try:
+                session_cleanup_required = shutdown_shared_node(
+                    release_owner=release_owner
+                )
+            finally:
+                # The shared-node transaction decrements ownership before a
+                # possible last-owner transport failure. Record that fact so
+                # a retry never decrements twice.
+                if release_owner:
+                    self._node_owner_released = True
+            self._node_session_cleanup_required = session_cleanup_required
+            self._node_released = True
+            return session_cleanup_required
 
     def _close_shared_resources(self) -> None:
         """Release this owner's atomic Node/session transaction."""

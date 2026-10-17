@@ -127,7 +127,7 @@ def _retry_constructor_cleanup_until_safe(
         try:
             shutdown_fn()
             return
-        except Exception:
+        except BaseException:
             logger.exception(
                 "Wuji constructor rollback cleanup is not yet safe; retrying"
             )
@@ -438,7 +438,7 @@ class WujiHandAdapter:
                 self._tactile_enabled = _TACTILE_ENV_VALUES[_tactile_env]
             else:
                 self._tactile_enabled = TACTILE_BY_MODEL.get(self.model, False)
-        except Exception:
+        except BaseException:
             # The constructor has not reached its normal strict-shutdown state
             # yet, but the physical hand is already connected.
             _cleanup_connected_hand_until_safe(self._hand, self._manager)
@@ -492,7 +492,7 @@ class WujiHandAdapter:
             # Tactile opted in → it must actually flow before we report ready.
             if self._tactile_enabled:
                 self._wait_first_tactile_frame()
-        except Exception:
+        except BaseException:
             # Stop the worker BEFORE tearing channels down. Once the worker is
             # running (the tactile first-frame wait is the one failure that can
             # happen after that), teardown nulls the very SDK handles it polls
@@ -661,8 +661,8 @@ class WujiHandAdapter:
                         # Connection succeeded, so a verification failure must
                         # release the candidate before probing another one or
                         # propagating the startup failure.
-                        _retry_constructor_cleanup_until_safe(
-                            self._manager.disconnect_all
+                        _cleanup_connected_hand_until_safe(
+                            hand, self._manager
                         )
                         logger.warning(
                             "Wuji hand sn={} could not report handedness while "

@@ -8,6 +8,7 @@ import dexcontrol.core.shared_node as shared_node_module
 import dexcontrol.core.robot_query_interface as query_module
 from dexcontrol.core.robot_query_interface import RobotQueryInterface
 from dexcontrol.robot import Robot
+from dexcontrol.sensors.manager import Sensors
 
 
 class _Component:
@@ -225,3 +226,124 @@ def test_robot_close_then_shutdown_cleans_global_session_once(monkeypatch):
     robot.shutdown()
 
     assert calls == ["session"]
+
+
+def test_concurrent_close_of_one_owner_does_not_release_peer(monkeypatch):
+    class Node:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    node = Node()
+    monkeypatch.setattr(shared_node_module, "_shared_node", node)
+    monkeypatch.setattr(shared_node_module, "_owner_count", 2)
+    monkeypatch.setattr(shared_node_module, "_shutdown_pending", False)
+    monkeypatch.setattr(shared_node_module, "_node_shutdown_completed", False)
+    owner = RobotQueryInterface.__new__(RobotQueryInterface)
+    owner._node_released = False
+    owner._node_owner_released = False
+    owner._node_release_lock = threading.Lock()
+
+    threads = [threading.Thread(target=owner.close) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1.0)
+
+    assert shared_node_module._owner_count == 1
+    assert node.shutdown_calls == 0
+
+
+def test_partial_component_creation_is_immediately_owned_for_rollback(monkeypatch):
+    class Config:
+        enabled = True
+
+    first = _Component()
+
+    class ComponentClass:
+        def __new__(cls, *, name, robot_info):
+            del robot_info
+            if name == "second":
+                raise RuntimeError("second failed")
+            return first
+
+    robot = Robot.__new__(Robot)
+    robot._shutdown_called = True
+    robot._components = []
+    robot._configs = SimpleNamespace(
+        components={"first": Config(), "second": Config()}
+    )
+    robot._robot_info = object()
+    robot._hand_types = {}
+    robot.query_hand_type = lambda: {}
+    monkeypatch.setattr(robot_module, "get_component_config_map", lambda: {Config: ComponentClass})
+    monkeypatch.setattr(robot_module, "runtime_override_robot_config", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="second failed"):
+        robot._initialize_robot_components()
+
+    assert robot._components == [first]
+
+
+def test_sensor_constructor_retries_partial_cleanup_before_raising(monkeypatch):
+    calls = []
+
+    class Sensor:
+        def __init__(self):
+            self.attempts = 0
+
+        def shutdown(self):
+            self.attempts += 1
+            calls.append("shutdown")
+            if self.attempts == 1:
+                raise RuntimeError("sensor busy")
+
+    sensor = Sensor()
+
+    def create(self, _config, name):
+        if name == "second":
+            raise RuntimeError("second failed")
+        return sensor
+
+    monkeypatch.setattr(Sensors, "_create_sensor", create)
+    monkeypatch.setattr("dexcontrol.sensors.manager.time.sleep", lambda _delay: None)
+
+    with pytest.raises(RuntimeError, match="second failed"):
+        Sensors({"first": object(), "second": object()})
+
+    assert calls == ["shutdown", "shutdown"]
+
+
+def test_concurrent_robot_shutdown_runs_component_teardown_once():
+    class Component:
+        def __init__(self):
+            self.stop_calls = 0
+            self.shutdown_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    component = Component()
+    robot = Robot.__new__(Robot)
+    robot._shutdown_called = False
+    robot._shutdown_lock = threading.RLock()
+    robot._components = [component]
+    robot.sensors = None
+    robot._node_released = True
+    robot._node_owner_released = True
+    robot._node_session_cleanup_required = False
+    robot._node_release_lock = threading.Lock()
+
+    threads = [threading.Thread(target=robot.shutdown) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1.0)
+
+    assert component.stop_calls == 1
+    assert component.shutdown_calls == 1

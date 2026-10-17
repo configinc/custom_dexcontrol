@@ -239,6 +239,9 @@ def test_wuji_connect_releases_candidate_when_handedness_probe_fails(monkeypatch
         def handedness_name(self):
             raise RuntimeError("probe failed")
 
+        def disable(self):
+            return None
+
     disconnects = []
     adapter = WujiHandAdapter.__new__(WujiHandAdapter)
     adapter._handedness = "left"

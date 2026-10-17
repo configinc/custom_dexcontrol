@@ -266,7 +266,7 @@ class VegaRobot:
                 ik_solver_type=self._ik_solver_type,
                 custom_local_ik_config=custom_ik_cfg,
             )
-        except Exception:
+        except BaseException:
             self._retry_failed_constructor_cleanup(self.robot, custom_hand)
             raise
         try:
@@ -287,7 +287,7 @@ class VegaRobot:
                 vel_ratio=vel_ratio,
                 vel_damp_thresh=vel_damp_thresh,
             )
-        except Exception:
+        except BaseException:
             self._retry_failed_constructor_cleanup(self.robot, custom_hand)
             raise
 

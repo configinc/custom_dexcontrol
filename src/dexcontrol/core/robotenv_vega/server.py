@@ -10,6 +10,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 from concurrent import futures
 from contextlib import nullcontext
 from pathlib import Path
@@ -202,6 +203,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(
             self.control_hz, rot_sensitivity=rot_sensitivity,
         )
+        prepared_base_rotation = None
+        if base_frame_rotation is not None:
+            values = np.asarray(base_frame_rotation, dtype=np.float64)
+            if values.shape != (3,) or not np.all(np.isfinite(values)):
+                raise ValueError(
+                    "base_frame_rotation must contain exactly three finite XYZ angles"
+                )
+            prepared_base_rotation = R.from_euler(
+                "XYZ", values, degrees=True
+            ).as_matrix()
+        if not np.isfinite(float(control_loop_hz)):
+            raise ValueError("control_loop_hz must be finite")
 
         self._robot = VegaRobot(
             robot_model=robot_model,
@@ -246,10 +259,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self.reset_middle_joints = _RESET_MIDDLE_JOINTS[arm_side].copy()
         self.safe_transit_pose = self._robot.safe_transit_pose.copy()
 
-        if base_frame_rotation is not None:
-            rot = R.from_euler("XYZ", base_frame_rotation, degrees=True).as_matrix()
-            self.R_world_to_robot = rot.T
-            self.R_robot_to_world = rot
+        if prepared_base_rotation is not None:
+            self.R_world_to_robot = prepared_base_rotation.T
+            self.R_robot_to_world = prepared_base_rotation
         else:
             self.R_world_to_robot = None
             self.R_robot_to_world = None
@@ -332,6 +344,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         try:
             # Fetch and cache robot firmware version once at startup.
             self._firmware_version = self._fetch_firmware_version()
+            firmware_cache_identity = self._firmware_version
+            if not firmware_cache_identity:
+                # An unreadable firmware identity is not evidence that the
+                # physical/software stack is unchanged. A per-boot token makes
+                # such a cache deliberately non-reusable after restart.
+                firmware_cache_identity = f"unverified:{uuid.uuid4()}"
 
             plan_path = (
                 Path(__file__).resolve().parent
@@ -354,7 +372,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     "arm_side": self.arm_side,
                     "gripper_type": self.gripper_type,
                     "frame_type": self.frame_type,
-                    "firmware_version": self._firmware_version,
+                    "firmware_version": firmware_cache_identity,
+                    "robot_name": str(
+                        getattr(self._robot.robot, "robot_name", "")
+                    ),
                     "sensor_to_wrist_yaw_degrees": 165.0,
                     "gripper_mass_kg": float(force_calibration_gripper_mass_kg),
                     "gripper_com_sensor_m": [
@@ -1903,7 +1924,11 @@ def serve(
     ))
     logging.getLogger().addHandler(_file_handler)
 
-    service = VegaRobotEnvService(
+    managed_signals = {signal.SIGINT, signal.SIGTERM}
+    previous_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, managed_signals)
+    signals_unblocked = False
+    try:
+        service = VegaRobotEnvService(
         robot_model=robot_model,
         arm_side=arm_side,
         gripper_type=gripper_type,
@@ -1941,38 +1966,60 @@ def serve(
         force_calibration_gripper_mass_kg=force_calibration_gripper_mass_kg,
         force_calibration_gripper_com_m=force_calibration_gripper_com_m,
         force_calibration_storage_directory=force_calibration_storage_directory,
-    )
+        )
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        raise
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    robotenv_pb2_grpc.add_RobotEnvServicer_to_server(service, server)
+    server = None
+    service_shutdown_completed = False
+    try:
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+        robotenv_pb2_grpc.add_RobotEnvServicer_to_server(service, server)
 
-    server_address = f"0.0.0.0:{grpc_port}"
-    server.add_insecure_port(server_address)
+        server_address = f"0.0.0.0:{grpc_port}"
+        bound_port = server.add_insecure_port(server_address)
+        if not bound_port:
+            raise RuntimeError(f"failed to bind Vega RobotEnv server at {server_address}")
 
-    server.start()
-    LOGGER.info(
-        "Vega RobotEnv server started on %s (arm=%s, model=%s)",
-        server_address,
-        arm_side,
-        robot_model,
-    )
+        server.start()
+        LOGGER.info(
+            "Vega RobotEnv server started on %s (arm=%s, model=%s)",
+            server_address,
+            arm_side,
+            robot_model,
+        )
 
-    shutdown_signal_lock = threading.Lock()
+        shutdown_signal_lock = threading.Lock()
 
-    def shutdown_handler(signum, frame):
-        del signum, frame
-        if not shutdown_signal_lock.acquire(blocking=False):
-            LOGGER.warning("Vega shutdown already in progress; ignoring repeated signal")
-            return
-        LOGGER.info("Shutting down Vega RobotEnv server")
-        # Stop new transport admission before draining in-flight robot work.
-        server.stop(grace=0)
-        _shutdown_service_until_safe(service)
-        sys.exit(0)
+        def shutdown_handler(signum, frame):
+            nonlocal service_shutdown_completed
+            del signum, frame
+            if not shutdown_signal_lock.acquire(blocking=False):
+                LOGGER.warning(
+                    "Vega shutdown already in progress; ignoring repeated signal"
+                )
+                return
+            LOGGER.info("Shutting down Vega RobotEnv server")
+            server.stop(grace=0)
+            _shutdown_service_until_safe(service)
+            service_shutdown_completed = True
+            raise SystemExit(0)
 
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    server.wait_for_termination()
+        signal.signal(signal.SIGINT, shutdown_handler)
+        signal.signal(signal.SIGTERM, shutdown_handler)
+        # Signals that arrived during construction are delivered only after
+        # the safe handler and full cleanup ownership are installed.
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        signals_unblocked = True
+        server.wait_for_termination()
+    finally:
+        if not signals_unblocked:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        if server is not None:
+            server.stop(grace=0)
+        if not service_shutdown_completed:
+            _shutdown_service_until_safe(service)
 
 
 def main() -> None:

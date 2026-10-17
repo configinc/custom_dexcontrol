@@ -23,6 +23,7 @@ control.
 import os
 import signal
 import sys
+import threading
 import time
 import weakref
 from pathlib import Path
@@ -174,6 +175,7 @@ class Robot(RobotQueryInterface):
             ConfigurationError: If the communication config is not set or the file is unreadable.
         """
         self._shutdown_called: bool = False
+        self._shutdown_lock = threading.RLock()
         self._components: list[RobotComponent] = []
 
         self._robot_info: RobotInfo = RobotInfo(configs=configs)
@@ -394,10 +396,15 @@ class Robot(RobotQueryInterface):
                 continue
 
             component_class = component_mapping[config_cls]
-            component_instances[component_name] = component_class(
+            component_instance = component_class(
                 name=component_name,
                 robot_info=self._robot_info,
             )
+            component_instances[component_name] = component_instance
+            # Publish ownership immediately. If a later component constructor
+            # fails, Robot.__init__ rollback can still stop/shut down every
+            # already-created subscriber/transport.
+            self._components.append(component_instance)
 
         # Phase 2: Wait for all components to receive first state update
         for component_name, component_instance in component_instances.items():
@@ -478,7 +485,8 @@ class Robot(RobotQueryInterface):
                 if component := getattr(self, name, None):
                     if component.wait_for_active(timeout=timeout_sec):
                         actives.append(True)
-                        self._components.append(component)
+                        if component not in self._components:
+                            self._components.append(component)
                     else:
                         actives.append(False)
         finally:
@@ -810,7 +818,20 @@ class Robot(RobotQueryInterface):
 
         return status
 
+    def close(self) -> None:
+        """Close a Robot through the full component-first shutdown path."""
+        self.shutdown()
+
     def shutdown(self) -> None:
+        """Serialize idempotent physical teardown for concurrent callers."""
+        lock = getattr(self, "_shutdown_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._shutdown_lock = lock
+        with lock:
+            self._shutdown_once()
+
+    def _shutdown_once(self) -> None:
         """Cleans up and closes all component connections.
 
         This method ensures proper cleanup of all components and communication
