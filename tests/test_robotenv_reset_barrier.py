@@ -357,7 +357,7 @@ def test_current_reset_discards_buffered_commands():
     )
 
     assert response.status == "SUCCESS"
-    assert service._robot.command_state_resets == 1
+    assert service._robot.command_state_resets == 2
 
 
 def test_cancel_after_async_gripper_open_drains_reset_era_command():
@@ -544,6 +544,30 @@ def test_failed_recovery_reset_keeps_interlock_latched():
     assert context.code == grpc.StatusCode.INTERNAL
 
 
+def test_partial_reset_failure_latches_recovery_from_healthy_state():
+    class Context:
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    service.reset_joints = np.zeros(7)
+    service._execute_reset_sequence = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(RuntimeError("partial arm reset failure"))
+    )
+    context = Context()
+
+    service.Reset(SimpleNamespace(mode="home", params={}), context)
+
+    assert service._command_recovery_required.is_set()
+    assert "Reset did not complete safely" in service._command_recovery_error
+
+
 def test_successful_current_reset_commits_recovery_clear():
     class Context:
         def add_callback(self, _callback):
@@ -588,6 +612,29 @@ def test_control_loop_dispatch_failure_latches_recovery_and_stops_dispatch():
     assert "arm transport failed" in service._command_recovery_error
 
 
+def test_interpolated_step_rejects_sticky_adapter_failure_before_buffering():
+    service = _service()
+    service._control_loop_hz = 200
+    service._robot.interpolation_enabled = True
+    service._robot.hand_command_path_healthy = lambda: False
+    service._robot._prev_gripper_command_successful = True
+    service._robot.add_command_point = lambda *_args, **_kwargs: pytest.fail(
+        "failed hand path must not buffer arm command"
+    )
+
+    with pytest.raises(
+        server_module.CommunicationFailedError, match="hand dispatch failed"
+    ):
+        service._dispatch_step_command(
+            np.zeros(8),
+            action_space="joint_position",
+            gripper_action_space="position",
+            command_epoch=0,
+        )
+
+    assert service._command_recovery_required.is_set()
+
+
 def test_health_check_reports_command_recovery_interlock():
     service = _service()
     service._robot.get_robot_state = lambda: ({}, {})
@@ -599,6 +646,21 @@ def test_health_check_reports_command_recovery_interlock():
 
     assert response.status == "UNHEALTHY"
     assert "command recovery required" in response.message
+
+
+def test_health_check_latches_idle_adapter_dispatch_failure_without_state_read():
+    service = _service()
+    service._load_version_info = lambda: {"tag": "test"}
+    service._robot.hand_command_path_healthy = lambda: False
+    service._robot.get_robot_state = lambda: pytest.fail(
+        "known adapter failure must fail before transport read"
+    )
+
+    response = service.HealthCheck(None, SimpleNamespace())
+
+    assert response.status == "UNHEALTHY"
+    assert service._command_recovery_required.is_set()
+    assert "hand dispatch failed" in response.message
 
 
 def test_cancelled_reset_clears_buffered_commands_before_return():

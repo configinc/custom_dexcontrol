@@ -1552,7 +1552,10 @@ class VegaRobot:
             "cartesian_position": cartesian_position,
             "prev_controller_latency_ms": float(self._prev_controller_latency_ms),
             "prev_command_successful": bool(self._prev_command_successful),
-            "prev_gripper_command_successful": bool(self._prev_gripper_command_successful),
+            "prev_gripper_command_successful": bool(
+                self._prev_gripper_command_successful
+                and self.hand_command_path_healthy()
+            ),
         }
         for field_name, component_name in (
             ("torso_joint_positions", "torso"),

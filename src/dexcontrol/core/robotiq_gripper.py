@@ -165,9 +165,15 @@ class RobotiqGripper:
                 with self._gripper_io_lock:
                     status_ok = self._gripper.getStatus()
                 if status_ok:
+                    measured = float(self._gripper.get_pos())
+                    if not np.isfinite(measured) or not 0.0 <= measured <= _STROKE_M:
+                        raise RuntimeError("Robotiq state readback is invalid")
                     with self._state_lock:
-                        self._cached_pos = self._gripper.get_pos()
+                        self._cached_pos = measured
+                else:
+                    self._command_failed.set()
             except Exception as e:
+                self._command_failed.set()
                 logger.warning("Robotiq worker state refresh error: {}", e)
 
     def _enqueue_command(self, pos_m: float, vel: float = 0.05, force: float = 95) -> None:

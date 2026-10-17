@@ -1283,6 +1283,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 if motion_cancelled.is_set():
                     raise RuntimeError("Reset was cancelled during robot motion")
 
+                # Prove every asynchronous hand command issued by the reset
+                # has drained, obtain a fresh measured hold, and clear adapter
+                # sticky failures before the Reset success can be committed.
+                self._reset_robot_command_state()
+
                 observation, timestamp_us = self._create_observation()
                 # Linearize success against registration of a newer Reset.
                 # A newer owner either sets our cancellation event before
@@ -1304,6 +1309,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     )
         except Exception as exc:
             LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
+            with self._reset_state_lock:
+                superseded_by_newer_reset = bool(
+                    motion_cancelled.is_set()
+                    and self._active_reset_cancel is not motion_cancelled
+                )
+            if not superseded_by_newer_reset:
+                self._command_recovery_error = f"Reset did not complete safely: {exc}"
+                self._command_recovery_required.set()
             # A cancellable reset may have queued a nonblocking hand-open
             # command before cancellation arrived. Reacquire the command
             # boundary and drain reset-era arm/hand work before returning or
@@ -1549,6 +1562,17 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 raise RuntimeError(
                     "Step was superseded by reset, force calibration, or shutdown"
                 )
+            hand_health = getattr(
+                self._robot, "hand_command_path_healthy", lambda: True
+            )
+            if not getattr(
+                self._robot, "_prev_gripper_command_successful", True
+            ) or not hand_health():
+                self._command_recovery_error = (
+                    "previous asynchronous hand dispatch failed"
+                )
+                self._command_recovery_required.set()
+                raise CommunicationFailedError(self._command_recovery_error)
             if self._robot.interpolation_enabled and self._control_loop_hz > 0:
                 if self._control_loop_thread is None or not self._control_loop_thread.is_alive():
                     self._start_control_loop()
@@ -1562,17 +1586,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     gripper_action_space=gripper_action_space,
                 )
             else:
-                hand_health = getattr(
-                    self._robot, "hand_command_path_healthy", lambda: True
-                )
-                if not getattr(
-                    self._robot, "_prev_gripper_command_successful", True
-                ) or not hand_health():
-                    self._command_recovery_error = (
-                        "previous asynchronous hand dispatch failed"
-                    )
-                    self._command_recovery_required.set()
-                    raise CommunicationFailedError(self._command_recovery_error)
                 try:
                     self._robot.update_command(
                         action,
@@ -1591,6 +1604,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         try:
             version_info = self._load_version_info()
             version_str = version_info.get("tag", "1.0.0-vega")
+            hand_health = getattr(
+                self._robot, "hand_command_path_healthy", lambda: True
+            )
+            if not hand_health():
+                self._command_recovery_error = "asynchronous hand dispatch failed"
+                self._command_recovery_required.set()
             if self._command_recovery_required.is_set():
                 return robotenv_pb2.HealthCheckResponse(
                     status="UNHEALTHY",

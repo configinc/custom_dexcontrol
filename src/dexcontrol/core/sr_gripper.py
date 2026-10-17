@@ -310,9 +310,15 @@ class SrGripperAdapter:
                 with self._gripper_io_lock:
                     status_ok = self._gripper.getStatus()
                 if status_ok:
+                    measured = float(self._gripper.get_pos())
+                    if not np.isfinite(measured) or not 0.0 <= measured <= _STROKE_M:
+                        raise RuntimeError("SR gripper state readback is invalid")
                     with self._state_lock:
-                        self._cached_pos = float(self._gripper.get_pos())
+                        self._cached_pos = measured
+                else:
+                    self._command_failed.set()
             except Exception as e:
+                self._command_failed.set()
                 logger.warning("SR worker state refresh error: {}", e)
 
     # ------------------------------------------------------------------
@@ -376,6 +382,7 @@ class SrGripperAdapter:
         except Exception as e:
             self._command_failed.set()
             logger.warning("SR set_joint_pos send error: {}", e)
+            raise
         # No optimistic _cached_pos update — the worker fights it with
         # the real 1 kHz PDO measurement otherwise, producing visible jumps.
         if wait_time > 0.0:

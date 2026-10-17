@@ -448,6 +448,25 @@ def test_robotiq_worker_latches_false_send_result():
     assert adapter.command_path_healthy is False
 
 
+def test_robotiq_worker_latches_failed_state_readback():
+    adapter = RobotiqGripper.__new__(RobotiqGripper)
+    adapter._stop_event = threading.Event()
+    adapter._command_queue = Queue(maxsize=1)
+    adapter._command_failed = threading.Event()
+    adapter._gripper_io_lock = threading.Lock()
+    adapter._state_lock = threading.Lock()
+    adapter._cached_pos = 0.04
+
+    def failed_status():
+        adapter._stop_event.set()
+        return False
+
+    adapter._gripper = SimpleNamespace(getStatus=failed_status)
+    adapter._worker_loop()
+
+    assert adapter.command_path_healthy is False
+
+
 def test_sr_set_joint_pos_latches_commit_failure():
     adapter = SrGripperAdapter.__new__(SrGripperAdapter)
     adapter._state_lock = threading.Lock()
@@ -458,7 +477,27 @@ def test_sr_set_joint_pos_latches_commit_failure():
         OSError("ethercat failed")
     )
 
-    adapter.set_joint_pos(np.array([0.04]))
+    with pytest.raises(OSError, match="ethercat failed"):
+        adapter.set_joint_pos(np.array([0.04]))
+
+    assert adapter.command_path_healthy is False
+
+
+def test_sr_worker_latches_failed_state_readback():
+    adapter = SrGripperAdapter.__new__(SrGripperAdapter)
+    adapter._stop_event = threading.Event()
+    adapter._command_failed = threading.Event()
+    adapter._gripper_io_lock = threading.Lock()
+    adapter._state_lock = threading.Lock()
+    adapter._cached_pos = 0.03
+    adapter._last_sent_packet = b""
+
+    def failed_status():
+        adapter._stop_event.set()
+        return False
+
+    adapter._gripper = SimpleNamespace(getStatus=failed_status)
+    adapter._worker_loop()
 
     assert adapter.command_path_healthy is False
 

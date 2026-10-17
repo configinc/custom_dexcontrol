@@ -1507,7 +1507,10 @@ class WujiHandAdapter:
     @property
     def command_path_healthy(self) -> bool:
         failed = getattr(self, "_command_failed", None)
-        return failed is None or not failed.is_set()
+        return bool(
+            getattr(self, "_connected", False)
+            and (failed is None or not failed.is_set())
+        )
 
     def get_predefined_pose(self, name: str) -> np.ndarray:
         """Return a predefined pose by name ('open' or 'close')."""
