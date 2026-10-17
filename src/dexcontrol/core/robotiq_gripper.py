@@ -249,11 +249,18 @@ class RobotiqGripper:
             self._worker.join(timeout=2.0)
             if self._worker.is_alive():
                 raise RuntimeError("Robotiq worker did not stop within 2 seconds")
-        with self._state_lock:
-            measured = float(self._cached_pos)
         with self._gripper_io_lock:
+            if not self._gripper.getStatus():
+                raise RuntimeError("Robotiq measured hold readback failed")
+            measured = float(self._gripper.get_pos())
+            if not np.isfinite(measured) or not 0.0 <= measured <= _STROKE_M:
+                raise RuntimeError("Robotiq measured hold is invalid")
             self._gripper.goto(pos=measured, vel=0.05, force=95)
-            self._gripper.sendCommand()
+            sent = self._gripper.sendCommand()
+            if sent is False:
+                raise RuntimeError("Robotiq measured hold transmission failed")
+        with self._state_lock:
+            self._cached_pos = measured
         self._command_queue = Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._worker = threading.Thread(

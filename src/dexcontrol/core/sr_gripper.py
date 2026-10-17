@@ -254,9 +254,10 @@ class SrGripperAdapter:
             return
         with self._gripper_io_lock:
             ok = self._gripper.client.sendCommand(packet)
-        if ok:
-            self._last_sent_packet = packet
-            self._last_send_t = now
+        if not ok:
+            raise RuntimeError("SR gripper target transmission failed")
+        self._last_sent_packet = packet
+        self._last_send_t = now
 
     def _resend_active(self) -> None:
         """Re-stream the last-sent packet, gated by the force-resend window.
@@ -398,8 +399,14 @@ class SrGripperAdapter:
             worker.join(timeout=2.0)
             if worker.is_alive():
                 raise RuntimeError("SR gripper worker did not stop within 2 seconds")
+        with self._gripper_io_lock:
+            if not self._gripper.getStatus():
+                raise RuntimeError("SR gripper measured hold readback failed")
+            measured = float(self._gripper.get_pos())
+        if not np.isfinite(measured) or not 0.0 <= measured <= _STROKE_M:
+            raise RuntimeError("SR gripper measured hold is invalid")
         with self._state_lock:
-            measured = float(self._cached_pos)
+            self._cached_pos = measured
         self._last_sent_packet = b""
         self._last_send_t = 0.0
         self._last_slew_target = measured

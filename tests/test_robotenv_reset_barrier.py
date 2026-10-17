@@ -140,6 +140,7 @@ def _service():
     service._control_loop_thread = None
     service._force_calibration_owner_lock = threading.Lock()
     service._force_calibration_owns_robot = threading.Event()
+    service._command_recovery_required = threading.Event()
     return service
 
 
@@ -305,6 +306,16 @@ def test_service_rejects_invalid_ema_alpha_before_robot_creation(
         ("max_jerk", float("inf")),
         ("vel_damp_thresh", float("nan")),
         ("rot_sensitivity", float("inf")),
+        ("vel_ratio", 1e308),
+        ("max_delta_scale", 3.01),
+        ("max_delta_scale", 0.0),
+        ("max_jerk", 0.251),
+        ("rot_sensitivity", 2.01),
+        ("head_init_pos", [float("nan"), 0.0, 0.0]),
+        ("wuji_effort_limit", float("inf")),
+        ("wuji_effort_limit", 1.71),
+        ("interpolation_history", 1),
+        ("filter_order", 0),
     ],
 )
 def test_service_rejects_invalid_velocity_config_before_robot_creation(
@@ -480,6 +491,26 @@ def test_force_calibration_claim_drain_failure_restores_prior_loop_state():
     assert calls == ["stop", "start"]
     assert service._force_calibration_owns_robot.is_set() is False
     assert service._force_calibration_restart_control_loop is False
+    assert service._command_recovery_required.is_set()
+
+
+def test_command_recovery_interlock_clears_only_after_successful_retry():
+    service = _service()
+    attempts = []
+
+    def reset():
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise RuntimeError("hardware busy")
+
+    service._robot.reset_command_state = reset
+
+    with pytest.raises(RuntimeError, match="hardware busy"):
+        service._reset_robot_command_state()
+    assert service._command_recovery_required.is_set()
+
+    service._reset_robot_command_state()
+    assert service._command_recovery_required.is_set() is False
 
 
 def test_cancelled_reset_clears_buffered_commands_before_return():

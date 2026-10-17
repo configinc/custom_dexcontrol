@@ -523,48 +523,19 @@ class VegaRobot:
         # intended.
         restart_worker = worker is not None
         if restart_worker:
-            while True:
-                try:
-                    self._stop_gripper_worker()
-                    break
-                except Exception as exc:
-                    # A command already inside vendor I/O must finish before
-                    # ownership can change. Keep the stop event asserted and
-                    # retain the handle/queue for the same-resource retry.
-                    _logger.error(
-                        "Vega gripper command boundary is not yet drained; "
-                        "retrying: %s",
-                        exc,
-                    )
-                    _time.sleep(0.05)
+            self._stop_gripper_worker()
         else:
             self._clear_gripper_command_queue()
         hand_reset = getattr(getattr(self, "hand", None), "reset_command_state", None)
         if callable(hand_reset):
-            while True:
-                try:
-                    hand_reset()
-                    break
-                except Exception as exc:
-                    _logger.error(
-                        "Hand-adapter command boundary is not yet drained; "
-                        "retrying: %s",
-                        exc,
-                    )
-                    _time.sleep(0.05)
+            hand_reset()
+        if getattr(self, "hand", None) is not None and not self._refresh_gripper_state():
+            raise RuntimeError(
+                "fresh hand state is unavailable after command-boundary hold"
+            )
         self.reset_filter_state()
         if restart_worker:
-            while True:
-                try:
-                    self._start_gripper_worker()
-                    break
-                except Exception as exc:
-                    _logger.error(
-                        "Vega gripper worker restart failed at command boundary; "
-                        "retrying: %s",
-                        exc,
-                    )
-                    _time.sleep(0.05)
+            self._start_gripper_worker()
 
     def launch_robot(self) -> None:
         """Validate robot readiness and default control mode."""
@@ -1335,7 +1306,12 @@ class VegaRobot:
             pos_err = np.abs(target_joint_pos - current)
             damp_thresh = self._vel_damp_thresh
             damp_scale = np.clip(pos_err / damp_thresh, 0.0, 1.0)
-            target_joint_vel = target_joint_vel * damp_scale * self._vel_ratio
+            with np.errstate(over="ignore", invalid="ignore"):
+                target_joint_vel = target_joint_vel * damp_scale * self._vel_ratio
+            if not np.isfinite(target_joint_vel).all():
+                raise ValueError(
+                    "Refusing to send non-finite joint velocity to hardware"
+                )
             self._prev_joint_vel = target_joint_vel.copy()
             if self._vel_log_file is not None:
                 self._vel_log_file.write(

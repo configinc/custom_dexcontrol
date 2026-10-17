@@ -347,7 +347,7 @@ def test_reset_command_state_restarts_retained_worker_after_timeout_recovery():
     assert calls == ["finalize", "clear", "restart"]
 
 
-def test_reset_command_state_retries_transient_worker_drain(monkeypatch):
+def test_reset_command_state_surfaces_transient_drain_and_is_retryable():
     robot = VegaRobot.__new__(VegaRobot)
     robot._gripper_worker = type(
         "Worker", (), {"is_alive": lambda self: True}
@@ -362,11 +362,38 @@ def test_reset_command_state_retries_transient_worker_drain(monkeypatch):
     robot._stop_gripper_worker = stop
     robot.reset_filter_state = lambda: None
     robot._start_gripper_worker = lambda: None
-    monkeypatch.setattr(robot_module._time, "sleep", lambda _seconds: None)
-
+    with pytest.raises(RuntimeError, match="still executing"):
+        robot.reset_command_state()
     robot.reset_command_state()
 
     assert len(attempts) == 2
+
+
+def test_reset_command_state_reseeds_outer_gripper_cache_from_hold():
+    hand = type(
+        "Hand",
+        (),
+        {
+            "reset_command_state": lambda self: None,
+            "get_joint_pos": lambda self: np.array([0.085]),
+        },
+    )()
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.hand = hand
+    robot._gripper_worker = None
+    robot._gripper_command_queue = None
+    robot._gripper_io_lock = threading.Lock()
+    robot._gripper_state_lock = threading.Lock()
+    robot._gripper_open_pos = np.array([0.085])
+    robot._gripper_close_pos = np.array([0.0])
+    robot._gripper_joint_pos = np.array([0.0])
+    robot._gripper_position = 1.0
+    robot.reset_filter_state = lambda: None
+
+    robot.reset_command_state()
+
+    assert robot._gripper_joint_pos == pytest.approx([0.085])
+    assert robot._gripper_position == pytest.approx(0.0)
 
 
 def test_interpolated_hand_velocity_rejects_nonfinite_before_storage():
@@ -522,6 +549,40 @@ def test_feedforward_deadman_bypasses_velocity_ema():
 
     assert sent[-1] == pytest.approx(np.zeros(7))
     assert robot._prev_joint_vel == pytest.approx(np.zeros(7))
+
+
+def test_hardware_dispatch_rejects_overflowed_joint_velocity():
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.arm_side = "left"
+    robot.arm = type(
+        "Arm",
+        (),
+        {"joint_pos_limit": None, "get_joint_pos": lambda self: np.zeros(7)},
+    )()
+    robot.control_hz = 20
+    robot._last_cmd_joint_pos = None
+    robot._max_delta_scale = 3.0
+    robot._MOTOR_MAX_JERK_RAD = 0.0
+    robot._prev_cmd_delta = None
+    robot._HW_CORRECTION_OUTLIER_THRESH = 0.5
+    robot._HW_CORRECTION_ALPHA = 0.7
+    robot.use_velocity_feedforward = True
+    robot._prev_joint_vel = None
+    robot._vel_smoothing_alpha = 1.0
+    robot._interpolation_vel_smoothing_alpha = 1.0
+    robot._vel_damp_thresh = 0.05
+    robot._vel_ratio = 1e308
+    robot._vel_log_file = None
+    robot.validate_joint_limits = lambda target: None
+    robot._agent_debug_log = lambda **kwargs: None
+    robot.sync_motion_manager_with_arm = lambda target: None
+
+    with pytest.raises(ValueError, match="non-finite joint velocity"):
+        robot.update_joints(
+            np.full(7, 0.05),
+            execution_hz=200,
+            feedforward_velocity=np.full(7, 10.0),
+        )
 
 
 def test_wuji_velocity_uses_measured_anchor_without_host_clipping():

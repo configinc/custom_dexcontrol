@@ -1442,9 +1442,19 @@ class WujiHandAdapter:
             self._worker.join(timeout=2.0)
             if self._worker.is_alive():
                 raise RuntimeError("Wuji hand worker did not stop within 2 seconds")
+        if not self._connected:
+            raise RuntimeError("Wuji hand is disconnected; measured hold unavailable")
+        self._refresh_state()
         with self._state_lock:
             measured = self._cached_pos.copy()
+            all_joints_observed = bool(self._state_seen_mask.all())
         measured_is_finite = bool(np.isfinite(measured).all())
+        if (
+            not all_joints_observed
+            or not measured_is_finite
+            or time.monotonic() - self._last_state_time > self._STALE_S
+        ):
+            raise RuntimeError("Wuji fresh finite measured hold is unavailable")
         self._latest_target = measured if measured_is_finite else None
         self._cmd_pos = measured.copy() if measured_is_finite else None
         self._last_send_time = None
