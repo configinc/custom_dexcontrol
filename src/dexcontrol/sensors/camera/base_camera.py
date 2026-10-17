@@ -166,7 +166,16 @@ class StreamSubscriber(SubscriptionPolicyMixin):
             else:
                 self._policy_manager = None
         except BaseException:
-            self.shutdown()
+            while True:
+                try:
+                    self.shutdown()
+                    break
+                except BaseException as cleanup_exc:
+                    logger.error(
+                        "Stream constructor cleanup is not yet safe; retrying: {}",
+                        cleanup_exc,
+                    )
+                    time.sleep(0.1)
             raise
         self._subcomponents: dict[str, object] = {}
 

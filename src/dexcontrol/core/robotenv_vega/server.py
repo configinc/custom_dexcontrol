@@ -1902,28 +1902,6 @@ def serve(
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
-    hand_type = kwargs.pop("hand_type", None)
-    if kwargs:
-        unexpected = ", ".join(sorted(kwargs.keys()))
-        raise TypeError(f"Unexpected keyword arguments: {unexpected}")
-    if hand_type is not None and gripper_type == "default":
-        gripper_type = hand_type
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-    _log_path = os.path.expanduser("~/custom_dexcontrol/src/dexcontrol/logs/robotenv_vega.log")
-    os.makedirs(os.path.dirname(_log_path), exist_ok=True)
-    from core.robotenv_vega.circular_file_handler import CircularFileHandler
-    _file_handler = CircularFileHandler(_log_path)
-    _file_handler.setLevel(logging.getLogger().level)
-    _file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)-8s %(name)s [%(filename)s:%(lineno)d]: %(message)s"
-    ))
-    logging.getLogger().addHandler(_file_handler)
-
     managed_signals = {signal.SIGINT, signal.SIGTERM}
     previous_signal_handlers = {
         signum: signal.getsignal(signum) for signum in managed_signals
@@ -1941,6 +1919,44 @@ def serve(
         signal.signal(signum, defer_shutdown_signal)
     previous_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, managed_signals)
     signals_unblocked = False
+    _file_handler = None
+    try:
+        hand_type = kwargs.pop("hand_type", None)
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs.keys()))
+            raise TypeError(f"Unexpected keyword arguments: {unexpected}")
+        if hand_type is not None and gripper_type == "default":
+            gripper_type = hand_type
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+
+        _log_path = os.path.expanduser(
+            "~/custom_dexcontrol/src/dexcontrol/logs/robotenv_vega.log"
+        )
+        os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+        from core.robotenv_vega.circular_file_handler import CircularFileHandler
+
+        _file_handler = CircularFileHandler(_log_path)
+        _file_handler.setLevel(logging.getLogger().level)
+        _file_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)-8s %(name)s "
+                "[%(filename)s:%(lineno)d]: %(message)s"
+            )
+        )
+        logging.getLogger().addHandler(_file_handler)
+    except BaseException:
+        for signum, previous_handler in previous_signal_handlers.items():
+            signal.signal(signum, previous_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        if _file_handler is not None:
+            logging.getLogger().removeHandler(_file_handler)
+            _file_handler.close()
+        raise
+
     try:
         service = VegaRobotEnvService(
         robot_model=robot_model,
@@ -1985,8 +2001,9 @@ def serve(
         for signum, previous_handler in previous_signal_handlers.items():
             signal.signal(signum, previous_handler)
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
-        logging.getLogger().removeHandler(_file_handler)
-        _file_handler.close()
+        if _file_handler is not None:
+            logging.getLogger().removeHandler(_file_handler)
+            _file_handler.close()
         raise
 
     server = None
@@ -2054,8 +2071,9 @@ def serve(
                     signal.pthread_sigmask(
                         signal.SIG_SETMASK, previous_signal_mask
                     )
-                logging.getLogger().removeHandler(_file_handler)
-                _file_handler.close()
+                if _file_handler is not None:
+                    logging.getLogger().removeHandler(_file_handler)
+                    _file_handler.close()
 
 
 def main() -> None:

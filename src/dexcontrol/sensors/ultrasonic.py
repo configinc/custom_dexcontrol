@@ -56,7 +56,10 @@ class UltrasonicSensor(SubscriptionPolicyMixin):
 
     def shutdown(self) -> None:
         """Shutdown the ultrasonic sensor."""
-        self._subscriber.shutdown()
+        subscriber = getattr(self, "_subscriber", None)
+        if subscriber is not None:
+            subscriber.shutdown()
+            self._subscriber = None
 
     def is_active(self) -> bool:
         """Check if the ultrasonic sensor is actively receiving data.

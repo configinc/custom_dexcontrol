@@ -155,6 +155,7 @@ class RobotComponent(SubscriptionPolicyMixin):
         """
         if hasattr(self, "_subscriber") and self._subscriber:
             self._subscriber.shutdown()
+            self._subscriber = None
 
     def get_timestamp_ns(self) -> int:
         """Get the timestamp (in nanoseconds) of the most recent state update.
@@ -261,6 +262,7 @@ class RobotJointComponent(RobotComponent):
         try:
             if hasattr(self, "_publisher") and self._publisher:
                 self._publisher.shutdown()
+                self._publisher = None
         except Exception as e:
             errors.append(f"publisher: {e}")
         if errors:

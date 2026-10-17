@@ -189,19 +189,25 @@ class Chassis(SubscriptionPolicyMixin):
 
         # Initialize temperature sensors for steer and drive
         if config.steer_temperature_sub_topic:
-            self.steer_temperature_sensor = TemperatureSensor(
-                f"{name}_steer_temperature", config.steer_temperature_sub_topic
-            )
+            self.steer_temperature_sensor = TemperatureSensor.__new__(TemperatureSensor)
             self._subcomponents["steer_temperature_sensor"] = (
                 self.steer_temperature_sensor
             )
+            TemperatureSensor.__init__(
+                self.steer_temperature_sensor,
+                f"{name}_steer_temperature",
+                config.steer_temperature_sub_topic,
+            )
 
         if config.drive_temperature_sub_topic:
-            self.drive_temperature_sensor = TemperatureSensor(
-                f"{name}_drive_temperature", config.drive_temperature_sub_topic
-            )
+            self.drive_temperature_sensor = TemperatureSensor.__new__(TemperatureSensor)
             self._subcomponents["drive_temperature_sensor"] = (
                 self.drive_temperature_sensor
+            )
+            TemperatureSensor.__init__(
+                self.drive_temperature_sensor,
+                f"{name}_drive_temperature",
+                config.drive_temperature_sub_topic,
             )
 
         self.max_lin_vel = robot_info.get_component_parameter(
@@ -265,12 +271,6 @@ class Chassis(SubscriptionPolicyMixin):
     def shutdown(self) -> None:
         """Release every child acquired so far, including partial construction."""
         errors: list[str] = []
-        try:
-            if getattr(self, "_initialization_complete", False):
-                self.stop()
-        except Exception as exc:  # best effort before mandatory resource release
-            errors.append(f"stop failed: {exc}")
-
         children = (
             getattr(self, "drive_temperature_sensor", None),
             getattr(self, "steer_temperature_sensor", None),

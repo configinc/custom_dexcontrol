@@ -10,6 +10,15 @@ from dexcontrol.core.robot_query_interface import RobotQueryInterface
 from dexcontrol.robot import Robot
 from dexcontrol.sensors.manager import Sensors
 from dexcontrol.core.chassis import Chassis
+from dexcontrol.core.arm import Arm
+from dexcontrol.core.hand import HandF5D6V2
+from dexcontrol.core.head import Head
+from dexcontrol.core.misc import Battery, EStop, Heartbeat
+from dexcontrol.core.torso import Torso
+from dexcontrol.sensors.imu.zed_imu import ZedIMUSensor
+from dexcontrol.sensors.lidar.lidar_3d import Lidar3DSensor
+from dexcontrol.sensors.lidar.rplidar import RPLidarSensor
+from dexcontrol.sensors.ultrasonic import UltrasonicSensor
 
 
 class _Component:
@@ -277,6 +286,7 @@ def test_partial_component_creation_is_immediately_owned_for_rollback(monkeypatc
     robot = Robot.__new__(Robot)
     robot._shutdown_called = True
     robot._components = []
+    robot._initialized_component_ids = set()
     robot._configs = SimpleNamespace(
         components={"first": Config(), "second": Config()}
     )
@@ -308,6 +318,7 @@ def test_partial_component_shutdown_runs_even_when_graceful_stop_fails():
     robot._shutdown_called = False
     robot._shutdown_lock = threading.RLock()
     robot._components = [component]
+    robot._initialized_component_ids = set()
     robot.sensors = None
     robot._node_released = True
     robot._node_owner_released = True
@@ -318,6 +329,39 @@ def test_partial_component_shutdown_runs_even_when_graceful_stop_fails():
         robot.shutdown()
 
     assert component.shutdown_calls == 1
+
+
+def test_initialized_component_stop_failure_does_not_release_transport():
+    class MovingComponent:
+        def __init__(self):
+            self.stop_calls = 0
+            self.shutdown_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+            raise RuntimeError("motion stop failed")
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    component = MovingComponent()
+    robot = Robot.__new__(Robot)
+    robot._shutdown_called = False
+    robot._shutdown_lock = threading.RLock()
+    robot._components = [component]
+    robot._initialized_component_ids = {id(component)}
+    robot.sensors = None
+    robot._node_released = True
+    robot._node_owner_released = True
+    robot._node_session_cleanup_required = False
+    robot._node_release_lock = threading.Lock()
+
+    with pytest.raises(RuntimeError, match="motion stop failed"):
+        robot.shutdown()
+
+    assert component.stop_calls == 1
+    assert component.shutdown_calls == 0
+    assert robot._shutdown_called is False
 
 
 def test_partial_chassis_releases_first_child_when_second_child_init_failed():
@@ -340,6 +384,14 @@ def test_partial_chassis_releases_first_child_when_second_child_init_failed():
     chassis.shutdown()
 
     assert steer.shutdown_calls == 1
+
+
+@pytest.mark.parametrize(
+    "component_class",
+    [Arm, Head, Torso, HandF5D6V2, Battery, EStop, Heartbeat],
+)
+def test_mapped_component_shutdown_is_safe_before_base_init(component_class):
+    component_class.__new__(component_class).shutdown()
 
 
 def test_sensor_constructor_retries_partial_cleanup_before_raising(monkeypatch):
@@ -424,6 +476,14 @@ def test_sensor_init_failure_cleans_the_partially_constructed_sensor(monkeypatch
 
     assert Sensor.instance.shutdown_calls == 1
     assert Sensor.instance.resource is None
+
+
+@pytest.mark.parametrize(
+    "sensor_class",
+    [UltrasonicSensor, Lidar3DSensor, RPLidarSensor, ZedIMUSensor],
+)
+def test_sensor_shutdown_is_safe_before_subscriber_creation(sensor_class):
+    sensor_class.__new__(sensor_class).shutdown()
 
 
 def test_concurrent_robot_shutdown_runs_component_teardown_once():

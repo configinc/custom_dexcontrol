@@ -177,6 +177,7 @@ class Robot(RobotQueryInterface):
         self._shutdown_called: bool = False
         self._shutdown_lock = threading.RLock()
         self._components: list[RobotComponent] = []
+        self._initialized_component_ids: set[int] = set()
 
         self._robot_info: RobotInfo = RobotInfo(configs=configs)
         self._robot_name = self._robot_info.robot_name
@@ -407,6 +408,7 @@ class Robot(RobotQueryInterface):
                 name=component_name,
                 robot_info=self._robot_info,
             )
+            self._initialized_component_ids.add(id(component_instance))
             component_instances[component_name] = component_instance
 
         # Phase 2: Wait for all components to receive first state update
@@ -849,6 +851,11 @@ class Robot(RobotQueryInterface):
         errors = []
         stopped_ids = getattr(self, "_shutdown_stopped_component_ids", set())
         shutdown_ids = getattr(self, "_shutdown_component_ids", set())
+        initialized_ids = getattr(
+            self,
+            "_initialized_component_ids",
+            {id(component) for component in self._components if component is not None},
+        )
         self._shutdown_stopped_component_ids = stopped_ids
         self._shutdown_component_ids = shutdown_ids
 
@@ -904,6 +911,10 @@ class Robot(RobotQueryInterface):
             component_id = id(component)
             if (
                 component is not None
+                and (
+                    component_id in stopped_ids
+                    or component_id not in initialized_ids
+                )
                 and component_id not in shutdown_ids
             ):
                 try:
@@ -914,7 +925,8 @@ class Robot(RobotQueryInterface):
                     # release the resources that do exist.
                     component.shutdown()
                     shutdown_ids.add(component_id)
-                    stopped_ids.add(component_id)
+                    if component_id not in initialized_ids:
+                        stopped_ids.add(component_id)
                 except Exception as e:  # pylint: disable=broad-except
                     logger.error(
                         f"Error shutting down component {component.__class__.__name__}: {e}"

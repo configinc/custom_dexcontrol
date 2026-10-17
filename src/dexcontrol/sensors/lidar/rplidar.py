@@ -58,7 +58,10 @@ class RPLidarSensor(SubscriptionPolicyMixin):
 
     def shutdown(self) -> None:
         """Shutdown the LIDAR sensor."""
-        self._subscriber.shutdown()
+        subscriber = getattr(self, "_subscriber", None)
+        if subscriber is not None:
+            subscriber.shutdown()
+            self._subscriber = None
 
     def is_active(self) -> bool:
         """Check if the LIDAR sensor is actively receiving data.

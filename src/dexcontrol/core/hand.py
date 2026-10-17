@@ -299,16 +299,35 @@ class HandF5D6V2(Hand):
             name: Name of the hand component Node.
             robot_info: RobotInfo instance providing component config and joint names.
         """
+        self.touch_sensor: HandTouchSensor | None = None
         super().__init__(name, robot_info)
         config = robot_info.get_component_config(name)
         config = cast(F5D6HandV2Config, config)
-        self.touch_sensor: HandTouchSensor | None = None
         if config.touch_sensor_sub_topic:
-            self.touch_sensor = HandTouchSensor(
+            self.touch_sensor = HandTouchSensor.__new__(HandTouchSensor)
+            self._subcomponents["touch_sensor"] = self.touch_sensor
+            HandTouchSensor.__init__(
+                self.touch_sensor,
                 name=f"{name}_touch_sensor",
                 topic=config.touch_sensor_sub_topic,
             )
-            self._subcomponents["touch_sensor"] = self.touch_sensor
+
+    def shutdown(self) -> None:
+        """Release hand and optional touch-sensor transports."""
+        errors: list[str] = []
+        try:
+            super().shutdown()
+        except Exception as exc:
+            errors.append(f"hand transport: {exc}")
+        touch_sensor = getattr(self, "touch_sensor", None)
+        if touch_sensor is not None:
+            try:
+                touch_sensor.shutdown()
+                self.touch_sensor = None
+            except Exception as exc:
+                errors.append(f"touch sensor: {exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
     def get_finger_tip_force(self) -> Float[np.ndarray, "5"] | None:
         """Get the force at the finger tips.
