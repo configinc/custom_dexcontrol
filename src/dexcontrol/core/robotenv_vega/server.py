@@ -246,6 +246,36 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         if isinstance(ema_alpha, (bool, np.bool_)) or not np.isfinite(raw_ema_alpha):
             raise ValueError("ema_alpha must be finite")
         normalized_ema_alpha = float(np.clip(raw_ema_alpha, 0.0, 0.99))
+
+        def _finite_float(name: str, value: object) -> float:
+            try:
+                normalized = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{name} must be finite") from exc
+            if isinstance(value, (bool, np.bool_)) or not np.isfinite(normalized):
+                raise ValueError(f"{name} must be finite")
+            return normalized
+
+        normalized_filter_ema_alpha = float(
+            np.clip(_finite_float("filter_ema_alpha", filter_ema_alpha), 0.0, 1.0)
+        )
+        normalized_vel_smoothing_alpha = float(
+            np.clip(
+                _finite_float("vel_smoothing_alpha", vel_smoothing_alpha),
+                0.0,
+                1.0,
+            )
+        )
+        normalized_hw_correction_alpha = float(
+            np.clip(
+                _finite_float("hw_correction_alpha", hw_correction_alpha),
+                0.0,
+                1.0,
+            )
+        )
+        normalized_vel_ratio = _finite_float("vel_ratio", vel_ratio)
+        if normalized_vel_ratio < 0.0:
+            raise ValueError("vel_ratio must be non-negative")
         interpolation_tick_hz = (
             normalized_control_loop_hz
             if interpolation_method != "none" and normalized_control_loop_hz > 0
@@ -269,12 +299,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             filter_type=filter_type,
             filter_cutoff_freq=filter_cutoff_freq,
             filter_order=filter_order,
-            filter_ema_alpha=filter_ema_alpha,
-            vel_smoothing_alpha=vel_smoothing_alpha,
-            hw_correction_alpha=hw_correction_alpha,
+            filter_ema_alpha=normalized_filter_ema_alpha,
+            vel_smoothing_alpha=normalized_vel_smoothing_alpha,
+            hw_correction_alpha=normalized_hw_correction_alpha,
             max_delta_scale=max_delta_scale,
             max_jerk=max_jerk,
-            vel_ratio=vel_ratio,
+            vel_ratio=normalized_vel_ratio,
             vel_damp_thresh=vel_damp_thresh,
             head_init_pos=head_init_pos,
         )
@@ -531,12 +561,19 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                         self._force_calibration_restart_control_loop = False
                         self._force_calibration_owns_robot.clear()
                         raise
+                # Calibration takes over the same physical command path. No
+                # Step-era arm target or asynchronous gripper command may
+                # survive the ownership transition.
+                self._robot.reset_command_state()
                 return True
             finally:
                 self._cmd_lock.release()
 
     def _release_robot_from_force_calibration(self) -> None:
         with self._force_calibration_owner_lock:
+            # Calibration motion ends at a measured safe return. Discard all
+            # calibration-era buffers before normal Step dispatch can resume.
+            self._robot.reset_command_state()
             self._force_calibration_owns_robot.clear()
             if getattr(self, "_force_calibration_restart_control_loop", False):
                 self._force_calibration_restart_control_loop = False
@@ -1076,6 +1113,13 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     with self._reset_state_lock:
                         self._reset_restart_control_loop = True
                     self._stop_control_loop()
+                # Every Reset mode, including the read-current mode, is an
+                # episode command boundary. Drain the async gripper queue and
+                # discard interpolation/feedforward state before proceeding.
+                reset_command_state = getattr(
+                    self._robot, "reset_command_state", self._robot.reset_filter_state
+                )
+                reset_command_state()
                 if mode == "home":
                     target_joints = self.reset_joints
                     self._execute_reset_sequence(

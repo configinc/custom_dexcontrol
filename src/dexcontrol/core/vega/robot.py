@@ -507,6 +507,25 @@ class VegaRobot:
         self._latest_gripper_action = 0.0
         self._latest_gripper_action_space = "position"
 
+    def reset_command_state(self) -> None:
+        """Drain asynchronous hand work and discard every buffered command.
+
+        Reset/current is a command boundary, not merely a filter boundary.  A
+        scalar gripper command may already have left the interpolation loop and
+        be waiting in the one-element worker queue (or be executing).  Stop and
+        join that worker before clearing interpolation state, then create a
+        fresh queue so no pre-reset command can execute afterward.
+        """
+        worker = getattr(self, "_gripper_worker", None)
+        restart_worker = worker is not None and worker.is_alive()
+        if restart_worker:
+            self._stop_gripper_worker()
+        else:
+            self._clear_gripper_command_queue()
+        self.reset_filter_state()
+        if restart_worker:
+            self._start_gripper_worker()
+
     def launch_robot(self) -> None:
         """Validate robot readiness and default control mode."""
         self.arm.set_modes(["position"] * 7)
@@ -935,9 +954,21 @@ class VegaRobot:
                     resolved_hand_action = np.clip(
                         resolved_hand_action, limits[:, 0], limits[:, 1]
                     )
+            if not np.isfinite(resolved_hand_action).all():
+                raise ValueError("Resolved hand target contains non-finite values")
             # Publish arm and hand together only after all fallible preparation.
             timestamp = _time.perf_counter()
-            self._interpolator.add_point(timestamp, target_joint_pos)
+            previous_hand = self._latest_hand_action
+            if (
+                previous_hand is not None
+                and np.asarray(previous_hand).size != resolved_hand_action.size
+            ):
+                # Interpolator history must have one stable vector schema.
+                self._interpolator.clear()
+            combined_target = np.concatenate(
+                [target_joint_pos, resolved_hand_action]
+            )
+            self._interpolator.add_point(timestamp, combined_target)
             self._latest_target_joint_pos = target_joint_pos.copy()
             self._latest_command_monotonic = timestamp
             self._latest_arm_feedforward_velocity = (
@@ -966,21 +997,32 @@ class VegaRobot:
 
             now = _time.perf_counter()
             query_time = now - (1.0 / max(1, self.control_hz))
-            pos, vel = self._interpolator.interpolate(
+            combined_pos, combined_vel = self._interpolator.interpolate(
                 query_time,
                 compute_velocity=self.use_velocity_feedforward,
             )
 
-            if pos is None:
+            if combined_pos is None:
                 # Not enough data for interpolation — use latest raw target.
-                pos = self._latest_target_joint_pos.copy()
-                vel = None
+                latest_hand = self._latest_hand_action
+                if latest_hand is None:
+                    latest_hand = np.array(
+                        [self._latest_gripper_action], dtype=np.float64
+                    )
+                combined_pos = np.concatenate(
+                    [self._latest_target_joint_pos, latest_hand]
+                )
+                combined_vel = None
 
-            hand_action = self._latest_hand_action
+            combined_pos = np.asarray(combined_pos, dtype=np.float64).reshape(-1)
+            if combined_pos.size < 8:
+                raise RuntimeError("Interpolated command is missing its hand target")
+            pos = combined_pos[:7].copy()
+            hand_action = combined_pos[7:].copy()
             arm_feedforward_velocity = (
                 None
-                if vel is None
-                else np.asarray(vel, dtype=np.float64).copy()
+                if combined_vel is None
+                else np.asarray(combined_vel, dtype=np.float64).reshape(-1)[:7].copy()
             )
             latest_command_monotonic = self._latest_command_monotonic
             if (
@@ -996,11 +1038,11 @@ class VegaRobot:
                 arm_feedforward_velocity = np.zeros_like(
                     self._latest_target_joint_pos
                 )
-            if hand_action is None:
-                hand_action = np.array([self._latest_gripper_action], dtype=np.float64)
-            else:
-                hand_action = hand_action.copy()
             gripper_vel = self._latest_gripper_action_space == "velocity"
+            feedforward_deadman = (
+                latest_command_monotonic is None
+                or query_time >= latest_command_monotonic
+            )
 
         # Apply the output filter (Butterworth / EMA) after interpolation.
         if self._output_filter is not None:
@@ -1029,6 +1071,7 @@ class VegaRobot:
                 blocking=False,
                 execution_hz=self.interpolation_control_hz,
                 feedforward_velocity=arm_feedforward_velocity,
+                force_zero_feedforward=feedforward_deadman,
             )
             self._apply_hand_action(
                 hand_action,
@@ -1079,6 +1122,7 @@ class VegaRobot:
         blocking: bool = False,
         execution_hz: float | None = None,
         feedforward_velocity: np.ndarray | None = None,
+        force_zero_feedforward: bool = False,
     ) -> None:
         run_id = f"joint-diagnostics-{self.arm_side}"
         tick_hz = self.control_hz if execution_hz is None else execution_hz
@@ -1235,7 +1279,9 @@ class VegaRobot:
                     ),
                     0.0,
                 )
-            if self._prev_joint_vel is not None:
+            if force_zero_feedforward:
+                target_joint_vel = np.zeros_like(raw_vel)
+            elif self._prev_joint_vel is not None:
                 a = (
                     self._interpolation_vel_smoothing_alpha
                     if interpolation_tick

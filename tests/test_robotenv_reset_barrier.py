@@ -104,12 +104,19 @@ class _Robot:
     def __init__(self):
         self.commands = []
         self.closed = False
+        self.command_state_resets = 0
 
     def update_command(self, action, **kwargs):
         self.commands.append((np.asarray(action).copy(), kwargs))
 
     def close(self):
         self.closed = True
+
+    def reset_filter_state(self):
+        self.command_state_resets += 1
+
+    def reset_command_state(self):
+        self.command_state_resets += 1
 
 
 def _service():
@@ -285,6 +292,53 @@ def test_service_rejects_invalid_ema_alpha_before_robot_creation(
     assert robot_calls == []
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("filter_ema_alpha", float("nan")),
+        ("vel_smoothing_alpha", float("nan")),
+        ("hw_correction_alpha", float("inf")),
+        ("vel_ratio", float("inf")),
+        ("vel_ratio", -1.0),
+        ("vel_smoothing_alpha", np.bool_(True)),
+    ],
+)
+def test_service_rejects_invalid_velocity_config_before_robot_creation(
+    monkeypatch, name, value
+):
+    robot_calls = []
+    monkeypatch.setattr(
+        server_module, "VegaRobot", lambda **kwargs: robot_calls.append(kwargs)
+    )
+
+    with pytest.raises(ValueError, match=name):
+        VegaRobotEnvService(arm_side="left", **{name: value})
+
+    assert robot_calls == []
+
+
+def test_current_reset_discards_buffered_commands():
+    class Context:
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, _code):
+            pass
+
+        def set_details(self, _details):
+            pass
+
+    service = _service()
+    service._create_observation = lambda: ({}, 1)
+
+    response = service.Reset(
+        SimpleNamespace(mode="current", params={}), Context()
+    )
+
+    assert response.status == "SUCCESS"
+    assert service._robot.command_state_resets == 1
+
+
 def test_post_launch_smoothing_log_failure_stops_worker_and_closes_robot(
     monkeypatch
 ):
@@ -336,6 +390,18 @@ def test_force_calibration_claim_rolls_back_if_control_loop_does_not_stop():
 
     assert service._force_calibration_owns_robot.is_set() is False
     assert service._force_calibration_restart_control_loop is False
+
+
+def test_force_calibration_ownership_discards_commands_on_claim_and_release():
+    service = _service()
+    service._force_calibration_restart_control_loop = False
+
+    assert service._claim_robot_for_force_calibration() is True
+    assert service._robot.command_state_resets == 1
+
+    service._release_robot_from_force_calibration()
+    assert service._robot.command_state_resets == 2
+    assert service._force_calibration_owns_robot.is_set() is False
 
 
 def test_cancelled_reset_clears_buffered_commands_before_return():

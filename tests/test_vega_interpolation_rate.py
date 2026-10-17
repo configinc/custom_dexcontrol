@@ -58,7 +58,12 @@ def test_interpolated_tick_passes_execution_rate_to_arm_and_hand():
     robot._interpolator = type(
         "Interpolator",
         (),
-        {"interpolate": lambda self, now, compute_velocity: (np.ones(7), np.ones(7))},
+        {
+            "interpolate": lambda self, now, compute_velocity: (
+                np.ones(8),
+                np.ones(8),
+            )
+        },
     )()
     robot.use_velocity_feedforward = True
     robot._output_filter = None
@@ -312,6 +317,21 @@ def test_reset_filter_state_discards_persistent_hand_and_arm_targets():
     assert robot._latest_gripper_action_space == "position"
 
 
+def test_reset_command_state_drains_gripper_worker_before_clearing_targets():
+    robot = VegaRobot.__new__(VegaRobot)
+    calls = []
+    robot._gripper_worker = type(
+        "Worker", (), {"is_alive": lambda self: True}
+    )()
+    robot._stop_gripper_worker = lambda: calls.append("stop")
+    robot.reset_filter_state = lambda: calls.append("clear")
+    robot._start_gripper_worker = lambda: calls.append("start")
+
+    robot.reset_command_state()
+
+    assert calls == ["stop", "clear", "start"]
+
+
 def test_interpolated_hand_velocity_rejects_nonfinite_before_storage():
     robot = VegaRobot.__new__(VegaRobot)
     robot._interpolator = type(
@@ -337,6 +357,45 @@ def test_interpolated_hand_velocity_rejects_nonfinite_before_storage():
     assert robot._latest_arm_feedforward_velocity is None
 
 
+def test_nonfinite_measured_hand_anchor_rejects_entire_command():
+    points = []
+    hand = type(
+        "Hand",
+        (),
+        {
+            "model": "wuji_hand_v2",
+            "get_joint_pos": lambda self: np.full(3, np.nan),
+        },
+    )()
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.hand = hand
+    robot._interpolator = type(
+        "Interpolator",
+        (),
+        {"add_point": lambda self, timestamp, target: points.append(target)},
+    )()
+    robot._interp_lock = threading.Lock()
+    robot._gripper_io_lock = threading.Lock()
+    robot.control_hz = 20
+    robot._latest_target_joint_pos = None
+    robot._latest_arm_feedforward_velocity = None
+    robot._latest_command_monotonic = None
+    robot._latest_hand_action = None
+    robot._latest_gripper_action = 0.0
+    robot._latest_gripper_action_space = "position"
+    robot.get_robot_state = lambda: ({"joint_positions": np.zeros(7)}, {})
+    robot._hand_dof = lambda: 3
+
+    command = np.concatenate([np.ones(7), np.ones(3)])
+    with pytest.raises(ValueError, match="Resolved hand target"):
+        robot.add_command_point(
+            command, "joint_position", gripper_action_space="velocity"
+        )
+
+    assert points == []
+    assert robot._latest_target_joint_pos is None
+
+
 def test_delayed_interpolation_produces_motion_and_zeroes_feedforward_at_hold(
     monkeypatch,
 ):
@@ -360,22 +419,72 @@ def test_delayed_interpolation_produces_motion_and_zeroes_feedforward_at_hold(
     robot._hand_dof = lambda: 1
     robot.get_cached_gripper_position = lambda: 0.0
     dispatched = []
+    dispatched_hand = []
     robot.update_joints = lambda pos, **kwargs: dispatched.append(
         (np.asarray(pos), np.asarray(kwargs["feedforward_velocity"]))
     )
-    robot._apply_hand_action = lambda *args, **kwargs: None
+    robot._apply_hand_action = lambda action, *args, **kwargs: dispatched_hand.append(
+        np.asarray(action)
+    )
 
     zero = np.concatenate([np.zeros(7), [0.0]])
-    one = np.concatenate([np.ones(7), [0.0]])
+    one = np.concatenate([np.ones(7), [1.0]])
     robot.add_command_point(zero, "joint_position")
     robot.add_command_point(one, "joint_position")
     assert robot.execute_interpolated_tick()
     assert dispatched[-1][0] == pytest.approx(np.full(7, 0.5), abs=0.01)
     assert dispatched[-1][1] == pytest.approx(np.full(7, 20.0), rel=0.02)
+    assert dispatched_hand[-1] == pytest.approx([0.5], abs=0.01)
 
     assert robot.execute_interpolated_tick()
     assert dispatched[-1][0] == pytest.approx(np.ones(7))
     assert dispatched[-1][1] == pytest.approx(np.zeros(7))
+    assert dispatched_hand[-1] == pytest.approx([1.0])
+
+
+def test_feedforward_deadman_bypasses_velocity_ema():
+    sent = []
+    arm = type(
+        "Arm",
+        (),
+        {
+            "joint_pos_limit": None,
+            "get_joint_pos": lambda self: np.zeros(7),
+            "set_joint_pos_vel": lambda self, pos, vel, relative: sent.append(
+                np.asarray(vel)
+            ),
+        },
+    )()
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.arm_side = "left"
+    robot.arm = arm
+    robot.control_hz = 20
+    robot._last_cmd_joint_pos = None
+    robot._max_delta_scale = 1.0
+    robot._MOTOR_MAX_JERK_RAD = 0.0
+    robot._prev_cmd_delta = None
+    robot._HW_CORRECTION_OUTLIER_THRESH = 0.5
+    robot._HW_CORRECTION_ALPHA = 0.7
+    robot.use_velocity_feedforward = True
+    robot._prev_joint_vel = np.ones(7)
+    robot._vel_smoothing_alpha = 0.3
+    robot._interpolation_vel_smoothing_alpha = 0.03
+    robot._vel_damp_thresh = 1.0
+    robot._vel_ratio = 1.0
+    robot._vel_log_file = None
+    robot.validate_joint_limits = lambda target: None
+    robot._agent_debug_log = lambda **kwargs: None
+    robot.sync_motion_manager_with_arm = lambda target: None
+
+    robot.update_joints(
+        np.full(7, 0.05),
+        execution_hz=200,
+        feedforward_velocity=np.zeros(7),
+        force_zero_feedforward=True,
+    )
+
+    assert sent[-1] == pytest.approx(np.zeros(7))
+    assert robot._prev_joint_vel == pytest.approx(np.zeros(7))
 
 
 def test_wuji_velocity_uses_measured_anchor_without_host_clipping():
