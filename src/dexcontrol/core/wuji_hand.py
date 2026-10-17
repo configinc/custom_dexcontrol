@@ -965,6 +965,8 @@ class WujiHandAdapter:
             _now = time.monotonic()
             self._check_watchdog(_now)
             self._maybe_reconnect(_now)
+            if self._stop_event.is_set():
+                break
 
             # Republish the latest target (continuous stream keeps Hand 2 MIT
             # commands flowing and doubles as a keepalive). Skipped while the
@@ -1402,39 +1404,53 @@ class WujiHandAdapter:
                 sn = "unknown"
         return str(sn)
 
-    def _teardown_channels(self) -> None:
+    def _teardown_channels(self, *, strict: bool = False) -> None:
         """Best-effort close of every subscription/command channel."""
-        for sub in self._tactile_subs.values():
+        errors = []
+        failed_tactile = {}
+        for name, sub in list(self._tactile_subs.items()):
             try:
                 sub.close()
-            except Exception:
-                pass
-        self._tactile_subs.clear()
+            except Exception as exc:
+                errors.append(f"tactile subscription {name} close failed: {exc}")
+                failed_tactile[name] = sub
+        self._tactile_subs = failed_tactile if strict else {}
         if self._glove_frame_sub is not None:
             try:
                 self._glove_frame_sub.close()
-            except Exception:
-                pass
-            self._glove_frame_sub = None
+                self._glove_frame_sub = None
+            except Exception as exc:
+                errors.append(f"glove subscription close failed: {exc}")
+                if not strict:
+                    self._glove_frame_sub = None
         if self._state_sub is not None:
             try:
                 self._state_sub.close()
-            except Exception:
-                pass
-            self._state_sub = None
-        try:
-            if self._publisher is not None:
+                self._state_sub = None
+            except Exception as exc:
+                errors.append(f"state subscription close failed: {exc}")
+                if not strict:
+                    self._state_sub = None
+        if self._publisher is not None:
+            try:
                 self._publisher.close()
-        except Exception:
-            pass
-        self._publisher = None
-        try:
-            if self._rt_ctx is not None:
+                self._publisher = None
+            except Exception as exc:
+                errors.append(f"publisher close failed: {exc}")
+                if not strict:
+                    self._publisher = None
+        if self._rt_ctx is not None:
+            try:
                 self._rt_ctx.__exit__(None, None, None)
-        except Exception:
-            pass
-        self._rt_ctx = None
-        self._rt = None
+                self._rt_ctx = None
+                self._rt = None
+            except Exception as exc:
+                errors.append(f"runtime context close failed: {exc}")
+                if not strict:
+                    self._rt_ctx = None
+                    self._rt = None
+        if strict and errors:
+            raise RuntimeError("; ".join(errors))
 
     def shutdown(self) -> None:
         """Stop the worker, close channels, and disable the motors."""
@@ -1448,13 +1464,11 @@ class WujiHandAdapter:
             self._worker.join(timeout=2.0)
             if self._worker.is_alive():
                 raise RuntimeError("Wuji hand worker did not stop within 2 seconds")
-        self._teardown_channels()
-        try:
+        self._teardown_channels(strict=True)
+        if not getattr(self, "_shutdown_motors_disabled", False):
             self._hand.disable()
-        except Exception:
-            pass
-        try:
+            self._shutdown_motors_disabled = True
+        if not getattr(self, "_shutdown_manager_disconnected", False):
             self._manager.disconnect_all()
-        except Exception:
-            pass
+            self._shutdown_manager_disconnected = True
         logger.info("Wuji hand ({}) shut down.", self._handedness)

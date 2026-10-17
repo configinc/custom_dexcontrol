@@ -809,11 +809,21 @@ class Robot(RobotQueryInterface):
             return
 
         logger.info("Shutting down robot components...")
-        self._shutdown_called = True
+        errors = []
+        stopped_ids = getattr(self, "_shutdown_stopped_component_ids", set())
+        shutdown_ids = getattr(self, "_shutdown_component_ids", set())
+        self._shutdown_stopped_component_ids = stopped_ids
+        self._shutdown_component_ids = shutdown_ids
 
         # Stop idle monitor
-        if hasattr(self, "_idle_monitor"):
-            self._idle_monitor.stop()
+        if hasattr(self, "_idle_monitor") and not getattr(
+            self, "_shutdown_idle_monitor_completed", False
+        ):
+            try:
+                self._idle_monitor.stop()
+                self._shutdown_idle_monitor_completed = True
+            except Exception as exc:  # pylint: disable=broad-except
+                errors.append(f"idle monitor stop failed: {exc}")
 
         try:
             _active_robots.discard(self)
@@ -825,45 +835,73 @@ class Robot(RobotQueryInterface):
         # quiet; the component may still be holding torque at its last commanded
         # target, so it must be stopped regardless of pause state.
         for component in self._components:
-            if component is not None:
+            component_id = id(component)
+            if component is not None and component_id not in stopped_ids:
                 try:
                     if hasattr(component, "stop") and callable(component.stop):
                         component.stop()
+                    stopped_ids.add(component_id)
                 except Exception as e:  # pylint: disable=broad-except
                     logger.error(
                         f"Error stopping component {component.__class__.__name__}: {e}"
                     )
+                    errors.append(
+                        f"stop {component.__class__.__name__} failed: {e}"
+                    )
 
         # Phase 2: Release resources — shutdown ALL components and sensors.
-        try:
-            if hasattr(self, "sensors") and self.sensors is not None:
+        if (
+            not getattr(self, "_shutdown_sensors_completed", False)
+            and hasattr(self, "sensors")
+            and self.sensors is not None
+        ):
+            try:
                 self.sensors.shutdown()
+                self._shutdown_sensors_completed = True
                 time.sleep(0.2)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.error(f"Error shutting down sensors: {e}")
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error(f"Error shutting down sensors: {e}")
+                errors.append(f"sensor shutdown failed: {e}")
 
         for component in reversed(self._components):
-            if component is not None:
+            component_id = id(component)
+            if (
+                component is not None
+                and component_id in stopped_ids
+                and component_id not in shutdown_ids
+            ):
                 try:
                     component.shutdown()
+                    shutdown_ids.add(component_id)
                 except Exception as e:  # pylint: disable=broad-except
                     logger.error(
                         f"Error shutting down component {component.__class__.__name__}: {e}"
                     )
+                    errors.append(
+                        f"shutdown {component.__class__.__name__} failed: {e}"
+                    )
+
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
         # Brief delay to allow component shutdown to complete
         time.sleep(0.1)
 
         # Release this instance's hold on the shared node (only fully shut down
         # once the last owner releases it) and clean up the DexComm session.
-        try:
-            self._release_shared_node()
-        except Exception as e:
-            logger.debug(f"Shared node cleanup note: {e}")
-        try:
-            cleanup_session()
-        except Exception as e:
-            logger.debug(f"Session cleanup note: {e}")
+        if not getattr(self, "_shutdown_shared_node_completed", False):
+            try:
+                self._release_shared_node()
+                self._shutdown_shared_node_completed = True
+            except Exception as e:
+                raise RuntimeError(f"shared node cleanup failed: {e}") from e
+        if not getattr(self, "_shutdown_session_completed", False):
+            try:
+                cleanup_session()
+                self._shutdown_session_completed = True
+            except Exception as e:
+                raise RuntimeError(f"session cleanup failed: {e}") from e
+        self._shutdown_called = True
         logger.info("Robot shutdown complete")
 
     def is_shutdown(self) -> bool:

@@ -1926,14 +1926,13 @@ def serve(
         robot_model,
     )
 
-    shutdown_signal_active = threading.Event()
+    shutdown_signal_lock = threading.Lock()
 
     def shutdown_handler(signum, frame):
         del signum, frame
-        if shutdown_signal_active.is_set():
+        if not shutdown_signal_lock.acquire(blocking=False):
             LOGGER.warning("Vega shutdown already in progress; ignoring repeated signal")
             return
-        shutdown_signal_active.set()
         LOGGER.info("Shutting down Vega RobotEnv server")
         # Stop new transport admission before draining in-flight robot work.
         server.stop(grace=0)
