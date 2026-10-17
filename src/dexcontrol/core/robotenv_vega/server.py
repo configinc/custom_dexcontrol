@@ -243,9 +243,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             raw_ema_alpha = float(ema_alpha)
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("ema_alpha must be finite") from exc
-        if not np.isfinite(raw_ema_alpha):
+        if isinstance(ema_alpha, (bool, np.bool_)) or not np.isfinite(raw_ema_alpha):
             raise ValueError("ema_alpha must be finite")
         normalized_ema_alpha = float(np.clip(raw_ema_alpha, 0.0, 0.99))
+        interpolation_tick_hz = (
+            normalized_control_loop_hz
+            if interpolation_method != "none" and normalized_control_loop_hz > 0
+            else self.control_hz
+        )
 
         self._robot = VegaRobot(
             robot_model=robot_model,
@@ -260,6 +265,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             ema_alpha=normalized_ema_alpha,
             interpolation_method=interpolation_method,
             interpolation_history=interpolation_history,
+            interpolation_control_hz=interpolation_tick_hz,
             filter_type=filter_type,
             filter_cutoff_freq=filter_cutoff_freq,
             filter_order=filter_order,
@@ -278,103 +284,99 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self._retry_failed_construction_cleanup()
             raise
 
-        # --- Background control loop for interpolation-based upsampling ---
-        # When interpolation is active, gRPC Step() buffers commands at
-        # input rate and this thread dispatches them to hardware at
-        # control_loop_hz (typically 100 Hz).
-        self._control_loop_hz = normalized_control_loop_hz
-        self._control_loop_thread: Optional[threading.Thread] = None
-        self._control_loop_stop = threading.Event()
-        # Override home position with per-arm init joints.
-        self.reset_joints = _INIT_JOINTS[arm_side].copy()
-        self.reset_middle_joints = _RESET_MIDDLE_JOINTS[arm_side].copy()
-        self.safe_transit_pose = self._robot.safe_transit_pose.copy()
-
-        if prepared_base_rotation is not None:
-            self.R_world_to_robot = prepared_base_rotation.T
-            self.R_robot_to_world = prepared_base_rotation
-        else:
-            self.R_world_to_robot = None
-            self.R_robot_to_world = None
-
-        # Serialize all robot commands — prevents concurrent Reset/Step from
-        # sending conflicting position commands to the same arm.
-        self._cmd_lock = threading.Lock()
-        self._command_epoch_lock = threading.Lock()
-        self._force_calibration_owner_lock = threading.Lock()
-        self._force_calibration_owns_robot = threading.Event()
-        self._force_calibration_applier_lock = threading.Lock()
-        self._force_calibration_applier = None
-        self._command_epoch = 0
-        self._reset_in_progress = threading.Event()
-        self._reset_state_lock = threading.Lock()
-        self._active_reset_count = 0
-        self._active_reset_cancel = None
-        self._reset_restart_control_loop = False
-        self._shutdown_started = threading.Event()
-        self._shutdown_lock = threading.Lock()
-        self._shutdown_completed = False
-        self._transport_rpc_condition = threading.Condition()
-        self._active_transport_rpcs = 0
-        if self._robot.interpolation_enabled and self._control_loop_hz > 0:
-            try:
-                self._start_control_loop()
-            except BaseException:
-                self._retry_failed_construction_cleanup()
-                raise
-            LOGGER.info(
-                "Control loop thread started: %d Hz (input≈%d Hz → control=%d Hz)",
-                self._control_loop_hz,
-                self.control_hz,
-                self._control_loop_hz,
-            )
-        LOGGER.info(
-            "Initialized VegaRobotEnvService model=%s arm=%s gripper=%s frame=%s hz=%s",
-            robot_model,
-            arm_side,
-            gripper_type,
-            frame_type,
-            self.control_hz,
-        )
-        LOGGER.info(
-            "Joint command mode: %s",
-            "position+velocity feedforward" if self.use_velocity_feedforward else "position-only",
-        )
-        LOGGER.info(
-            "IK config: solver=%s damping(default=%.6f torso=%.1f arm_j2=%.1f arm_j3=%.1f)",
-            ik_solver_type,
-            ik_damping_default,
-            ik_damping_torso,
-            ik_damping_arm_j2,
-            ik_damping_arm_j3,
-        )
-        LOGGER.info(
-            "Cartesian velocity normalization enabled: max_lin_delta=%.6f max_rot_delta=%.6f",
-            self._max_lin_delta,
-            self._max_rot_delta,
-        )
-        if normalized_ema_alpha > 0:
-            _omega = normalized_ema_alpha / (
-                (1.0 / self.control_hz) * (1.0 - normalized_ema_alpha)
-            )
-            LOGGER.info(
-                "2nd-order smoothing: enabled (alpha=%.3f, omega=%.1f rad/s, critically damped)",
-                normalized_ema_alpha, _omega,
-            )
-        else:
-            LOGGER.info("Smoothing: disabled (alpha=0.0)")
-
-        # Startup is deliberately motionless.  A single arm may restart while
-        # its peer is still in a coordinated calibration pose; moving here
-        # would bypass the bilateral RCI barrier.  The coordinator performs an
-        # explicit paired Reset before teleoperation or recalibration.
-        LOGGER.info(
-            "Startup leaves arm at its measured pose; waiting for an explicit "
-            "coordinated Reset (arm=%s)",
-            arm_side,
-        )
-
         try:
+            # --- Background control loop for interpolation-based upsampling ---
+            # When interpolation is active, gRPC Step() buffers commands at
+            # input rate and this thread dispatches them to hardware at
+            # control_loop_hz (typically 100 Hz).
+            self._control_loop_hz = normalized_control_loop_hz
+            self._control_loop_thread: Optional[threading.Thread] = None
+            self._control_loop_stop = threading.Event()
+            # Override home position with per-arm init joints.
+            self.reset_joints = _INIT_JOINTS[arm_side].copy()
+            self.reset_middle_joints = _RESET_MIDDLE_JOINTS[arm_side].copy()
+            self.safe_transit_pose = self._robot.safe_transit_pose.copy()
+
+            if prepared_base_rotation is not None:
+                self.R_world_to_robot = prepared_base_rotation.T
+                self.R_robot_to_world = prepared_base_rotation
+            else:
+                self.R_world_to_robot = None
+                self.R_robot_to_world = None
+
+            # Serialize all robot commands — prevents concurrent Reset/Step from
+            # sending conflicting position commands to the same arm.
+            self._cmd_lock = threading.Lock()
+            self._command_epoch_lock = threading.Lock()
+            self._force_calibration_owner_lock = threading.Lock()
+            self._force_calibration_owns_robot = threading.Event()
+            self._force_calibration_applier_lock = threading.Lock()
+            self._force_calibration_applier = None
+            self._command_epoch = 0
+            self._reset_in_progress = threading.Event()
+            self._reset_state_lock = threading.Lock()
+            self._active_reset_count = 0
+            self._active_reset_cancel = None
+            self._reset_restart_control_loop = False
+            self._shutdown_started = threading.Event()
+            self._shutdown_lock = threading.Lock()
+            self._shutdown_completed = False
+            self._transport_rpc_condition = threading.Condition()
+            self._active_transport_rpcs = 0
+            if self._robot.interpolation_enabled and self._control_loop_hz > 0:
+                self._start_control_loop()
+                LOGGER.info(
+                    "Control loop thread started: %d Hz (input≈%d Hz → control=%d Hz)",
+                    self._control_loop_hz,
+                    self.control_hz,
+                    self._control_loop_hz,
+                )
+            LOGGER.info(
+                "Initialized VegaRobotEnvService model=%s arm=%s gripper=%s frame=%s hz=%s",
+                robot_model,
+                arm_side,
+                gripper_type,
+                frame_type,
+                self.control_hz,
+            )
+            LOGGER.info(
+                "Joint command mode: %s",
+                "position+velocity feedforward" if self.use_velocity_feedforward else "position-only",
+            )
+            LOGGER.info(
+                "IK config: solver=%s damping(default=%.6f torso=%.1f arm_j2=%.1f arm_j3=%.1f)",
+                ik_solver_type,
+                ik_damping_default,
+                ik_damping_torso,
+                ik_damping_arm_j2,
+                ik_damping_arm_j3,
+            )
+            LOGGER.info(
+                "Cartesian velocity normalization enabled: max_lin_delta=%.6f max_rot_delta=%.6f",
+                self._max_lin_delta,
+                self._max_rot_delta,
+            )
+            if normalized_ema_alpha > 0:
+                _omega = normalized_ema_alpha / (
+                    (1.0 / self.control_hz) * (1.0 - normalized_ema_alpha)
+                )
+                LOGGER.info(
+                    "2nd-order smoothing: enabled (alpha=%.3f, omega=%.1f rad/s, critically damped)",
+                    normalized_ema_alpha, _omega,
+                )
+            else:
+                LOGGER.info("Smoothing: disabled (alpha=0.0)")
+
+            # Startup is deliberately motionless.  A single arm may restart while
+            # its peer is still in a coordinated calibration pose; moving here
+            # would bypass the bilateral RCI barrier.  The coordinator performs an
+            # explicit paired Reset before teleoperation or recalibration.
+            LOGGER.info(
+                "Startup leaves arm at its measured pose; waiting for an explicit "
+                "coordinated Reset (arm=%s)",
+                arm_side,
+            )
+
             # Fetch and cache robot firmware version once at startup.
             self._firmware_version = self._fetch_firmware_version()
             firmware_cache_identity = self._firmware_version

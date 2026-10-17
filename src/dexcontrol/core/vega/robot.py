@@ -117,6 +117,18 @@ class CommunicationFailedError(RuntimeError):
     """Raised when arm/hand command transmission fails."""
 
 
+def _resample_smoothing_alpha(
+    alpha: float, source_hz: float, target_hz: float
+) -> float:
+    """Preserve a filter's wall-clock response when its tick rate changes."""
+    clipped = float(np.clip(alpha, 0.0, 0.99))
+    if clipped <= 0.0 or float(source_hz) == float(target_hz):
+        return clipped
+    omega = clipped * float(source_hz) / (1.0 - clipped)
+    target_dt = 1.0 / float(target_hz)
+    return float((omega * target_dt) / (1.0 + omega * target_dt))
+
+
 class VegaRobot:
     """Thin wrapper around dexcontrol Robot for single-arm control."""
 
@@ -164,6 +176,7 @@ class VegaRobot:
         ema_alpha: float = 0.0,
         interpolation_method: str = "none",
         interpolation_history: int = 4,
+        interpolation_control_hz: int | None = None,
         filter_type: str = "none",
         filter_cutoff_freq: float = 10.0,
         filter_order: int = 2,
@@ -214,6 +227,11 @@ class VegaRobot:
         self.robot_model = robot_model
         self.arm_side = arm_side
         self.control_hz = int(control_hz)
+        self.interpolation_control_hz = int(
+            interpolation_control_hz
+            if interpolation_control_hz is not None
+            else control_hz
+        )
         self.gripper_type = gripper_type
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
 
@@ -276,6 +294,7 @@ class VegaRobot:
                 ema_alpha=ema_alpha,
                 interpolation_method=interpolation_method,
                 interpolation_history=interpolation_history,
+                interpolation_control_hz=self.interpolation_control_hz,
                 filter_type=filter_type,
                 filter_cutoff_freq=filter_cutoff_freq,
                 filter_order=filter_order,
@@ -334,6 +353,11 @@ class VegaRobot:
             _logger.info("Velocity logging enabled: %s", vel_log_path)
 
         self._ema_alpha = float(np.clip(config["ema_alpha"], 0.0, 0.99))
+        self._interpolation_ema_alpha = _resample_smoothing_alpha(
+            self._ema_alpha,
+            float(control_hz),
+            float(config["interpolation_control_hz"]),
+        )
         self._filter_pos: np.ndarray | None = None
         self._filter_vel: np.ndarray | None = None
         self._interpolation_method = config["interpolation_method"]
@@ -357,7 +381,7 @@ class VegaRobot:
                 filter_cfg["default"]["alpha"] = config["filter_ema_alpha"]
             self._output_filter = MultiChannelFilter(
                 filter_config=filter_cfg,
-                control_rate=float(control_hz),
+                control_rate=float(config["interpolation_control_hz"]),
             )
         else:
             self._output_filter = None
@@ -862,13 +886,13 @@ class VegaRobot:
             pos = self._output_filter.apply(pos)
 
         # Apply existing EMA 2nd-order smoothing on top if enabled.
-        if self._ema_alpha > 0.0:
-            dt = 1.0 / max(1, self.control_hz)
+        if self._interpolation_ema_alpha > 0.0:
+            dt = 1.0 / max(1, self.interpolation_control_hz)
             if self._filter_pos is None:
                 self._filter_pos = pos.copy()
                 self._filter_vel = np.zeros_like(pos)
             else:
-                alpha = self._ema_alpha
+                alpha = self._interpolation_ema_alpha
                 omega = alpha / (dt * (1.0 - alpha))
                 exp_term = np.exp(-omega * dt)
                 err = self._filter_pos - pos

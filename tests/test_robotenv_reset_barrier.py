@@ -223,17 +223,26 @@ def test_service_rejects_invalid_control_loop_hz_before_robot_creation(
 def test_service_normalizes_control_loop_hz_before_robot_creation(
     monkeypatch, control_loop_hz
 ):
+    calls = []
+
     class StopConstruction(Exception):
         pass
 
     class Robot:
         def __init__(self, **kwargs):
+            calls.append(kwargs["interpolation_control_hz"])
             raise StopConstruction
 
     monkeypatch.setattr(server_module, "VegaRobot", Robot)
 
     with pytest.raises(StopConstruction):
-        VegaRobotEnvService(arm_side="left", control_loop_hz=control_loop_hz)
+        VegaRobotEnvService(
+            arm_side="left",
+            interpolation_method="linear",
+            control_loop_hz=control_loop_hz,
+        )
+
+    assert calls == [int(control_loop_hz) or 20]
 
 
 @pytest.mark.parametrize("ema_alpha", [1.0, "1.0", 2.0])
@@ -256,7 +265,10 @@ def test_service_normalizes_ema_alpha_before_robot_creation(monkeypatch, ema_alp
     assert calls == [0.99]
 
 
-@pytest.mark.parametrize("ema_alpha", [float("nan"), float("inf"), "bad"])
+@pytest.mark.parametrize(
+    "ema_alpha",
+    [float("nan"), float("inf"), "bad", True, np.bool_(True)],
+)
 def test_service_rejects_invalid_ema_alpha_before_robot_creation(
     monkeypatch, ema_alpha
 ):
@@ -271,6 +283,47 @@ def test_service_rejects_invalid_ema_alpha_before_robot_creation(
         VegaRobotEnvService(arm_side="left", ema_alpha=ema_alpha)
 
     assert robot_calls == []
+
+
+def test_post_launch_smoothing_log_failure_stops_worker_and_closes_robot(
+    monkeypatch
+):
+    robots = []
+
+    class Robot:
+        interpolation_enabled = False
+
+        def __init__(self, **kwargs):
+            self.ema_alpha = kwargs["ema_alpha"]
+            self.safe_transit_pose = np.zeros(7, dtype=np.float64)
+            self.robot = type("Base", (), {"robot_name": "fake"})()
+            self.launched = False
+            self.closed = False
+            robots.append(self)
+
+        def launch_robot(self):
+            self.launched = True
+
+        def close(self):
+            self.closed = True
+
+    original_info = server_module.LOGGER.info
+
+    def fail_at_smoothing_log(message, *args, **kwargs):
+        if str(message).startswith("2nd-order smoothing"):
+            raise OSError("injected post-launch logging failure")
+        return original_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(server_module, "VegaRobot", Robot)
+    monkeypatch.setattr(server_module.LOGGER, "info", fail_at_smoothing_log)
+
+    with pytest.raises(OSError, match="injected post-launch"):
+        VegaRobotEnvService(arm_side="left", ema_alpha=1.0)
+
+    assert len(robots) == 1
+    assert robots[0].ema_alpha == pytest.approx(0.99)
+    assert robots[0].launched
+    assert robots[0].closed
 
 
 def test_force_calibration_claim_rolls_back_if_control_loop_does_not_stop():
