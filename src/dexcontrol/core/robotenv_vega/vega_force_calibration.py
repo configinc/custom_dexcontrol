@@ -559,9 +559,7 @@ class VegaForceCalibrationManager:
                 )
                 if status.state == "SUCCEEDED":
                     try:
-                        current_result = self.lifecycle.get_result("")
-                        if current_result.get("available"):
-                            self._install_committed_result(run_id)
+                        self._install_current_result_if_available(run_id)
                     finally:
                         self._release_if_owned()
                 elif (
@@ -765,7 +763,7 @@ class VegaForceCalibrationManager:
                     and status.state in {"CANCELLED", "FAILED", "SUCCEEDED"}
                 ):
                     if status.state == "SUCCEEDED":
-                        self._install_committed_result_and_release(status.run_id)
+                        self._install_current_result_and_release(status.run_id)
                     else:
                         self._release_if_owned()
                     return status
@@ -788,7 +786,7 @@ class VegaForceCalibrationManager:
                         raise
             elif status.state in {"CANCELLED", "FAILED", "SUCCEEDED"}:
                 if status.state == "SUCCEEDED":
-                    self._install_committed_result_and_release(run_id)
+                    self._install_current_result_and_release(run_id)
                 else:
                     self._release_if_owned()
             return status
@@ -800,27 +798,28 @@ class VegaForceCalibrationManager:
                 return self.request_cancel(status.run_id)
             return status
 
-    def _install_committed_result(self, run_id: str) -> None:
-        result = self.lifecycle.get_result(run_id)
-        if not result.get("available"):
-            raise RuntimeError("committed calibration result is unavailable")
+    def _install_result_snapshot(self, result: Mapping[str, Any]) -> None:
+        parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
+        self.adapter.install_prepared(self.adapter.prepare_install(parameters))
+
+    def _install_current_result_if_available(self, run_id: str) -> bool:
+        result = self.lifecycle.get_result("")
+        if not result.get("available") or result.get("run_id") != run_id:
+            if self._runtime_install_pending_run_id == run_id:
+                self._runtime_install_pending_run_id = None
+            return False
         try:
             self._install_result_snapshot(result)
         except BaseException:
             self._runtime_install_pending_run_id = run_id
             raise
         self._runtime_install_pending_run_id = None
+        return True
 
-    def _install_result_snapshot(self, result: Mapping[str, Any]) -> None:
-        parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
-        self.adapter.install_prepared(self.adapter.prepare_install(parameters))
-
-    def _install_committed_result_and_release(self, run_id: str) -> None:
+    def _install_current_result_and_release(self, run_id: str) -> bool:
         try:
-            self._install_committed_result(run_id)
+            return self._install_current_result_if_available(run_id)
         finally:
-            # A terminal calibration run must never retain command ownership,
-            # even when publishing its already-durable result fails.
             self._release_if_owned()
 
     def commit(self, run_id: str, plan_sha256: str) -> CalibrationStatusSnapshot:
@@ -833,7 +832,7 @@ class VegaForceCalibrationManager:
                 raise LifecycleError("FAILED_PRECONDITION", "stale Commit request")
             if current.state == "SUCCEEDED":
                 status = self.lifecycle.commit(run_id, plan_sha256)
-                self._install_committed_result_and_release(run_id)
+                self._install_current_result_and_release(run_id)
                 return status
             record = self.lifecycle.get_staged_candidate(run_id)
             parameters = self._candidate
@@ -875,7 +874,7 @@ class VegaForceCalibrationManager:
                 self._owns_robot
                 or self._runtime_install_pending_run_id == status.run_id
             ):
-                self._install_committed_result_and_release(status.run_id)
+                self._install_current_result_and_release(status.run_id)
             elif status.state in {"CANCELLED", "FAILED"}:
                 self._release_if_owned()
             if self._pending_terminal is not None:
@@ -889,7 +888,7 @@ class VegaForceCalibrationManager:
                 self._owns_robot
                 or self._runtime_install_pending_run_id == status.run_id
             ):
-                self._install_committed_result_and_release(status.run_id)
+                self._install_current_result_and_release(status.run_id)
             elif status.state in {"CANCELLED", "FAILED"}:
                 self._release_if_owned()
             if self._pending_terminal is not None:

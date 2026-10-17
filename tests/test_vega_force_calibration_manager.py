@@ -497,7 +497,7 @@ def test_same_run_start_retry_does_not_install_expired_result(tmp_path: Path) ->
     manager.advance("run-1", 1, "stage-1")
     ready = _wait_state(manager, "READY_TO_APPLY")
     assert manager.commit("run-1", ready.plan_sha256).state == "SUCCEEDED"
-    expires_at = manager.result("run-1")["expires_at_timestamp_us"]
+    expires_at = manager.lifecycle.get_result("run-1")["expires_at_timestamp_us"]
     installed_before_retry = len(adapter.installed)
     now_us[0] = expires_at
 
@@ -506,6 +506,53 @@ def test_same_run_start_retry_does_not_install_expired_result(tmp_path: Path) ->
     assert retry.state == "SUCCEEDED"
     assert len(adapter.installed) == installed_before_retry
     assert manager.result("")["available"] is False
+
+
+def test_pending_runtime_install_is_discarded_at_expiry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    now_us = [1_700_000_000_000_000]
+    lifecycle = ForceCalibrationLifecycle(
+        plan=_plan(tmp_path),
+        server_identity={"robot": "vega", "arm": "left"},
+        storage_directory=tmp_path / "state",
+        calibration_kind="vega_wrist_ft_v1",
+        reference_point_id="sensor-origin",
+        now_us=lambda: now_us[0],
+    )
+    adapter = FakeAdapter()
+    claim = Claim()
+    manager = VegaForceCalibrationManager(
+        lifecycle=lifecycle,
+        adapter=adapter,
+        claim_robot=claim.acquire,
+        release_robot=claim.release,
+    )
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+    manager.advance("run-1", 1, "stage-1")
+    ready = _wait_state(manager, "READY_TO_APPLY")
+
+    def reject_install(_prepared):
+        raise RuntimeError("runtime install failed")
+
+    adapter.install_prepared = reject_install
+    with pytest.raises(RuntimeError, match="runtime install failed"):
+        manager.commit("run-1", ready.plan_sha256)
+    assert manager._runtime_install_pending_run_id == "run-1"
+    expires_at = manager.lifecycle.get_result("run-1")["expires_at_timestamp_us"]
+    now_us[0] = expires_at
+    monkeypatch.setattr(
+        manager_module, "wrist_ft_calibration_from_snapshot", lambda value: value
+    )
+    adapter.install_prepared = adapter.installed.append
+
+    assert manager.status().state == "SUCCEEDED"
+    assert manager._runtime_install_pending_run_id is None
+    assert adapter.installed == []
+    assert manager.commit("run-1", ready.plan_sha256).state == "SUCCEEDED"
+    assert adapter.installed == []
 
 
 def test_transient_partial_commit_is_repaired_with_matching_runtime(
