@@ -706,7 +706,7 @@ class WujiHandAdapter:
                                 dev.sn, reported, self._handedness,
                             )
                             return hand
-                        self._manager.disconnect_all()
+                        _cleanup_connected_hand_until_safe(hand, self._manager)
                         raise ConnectionError(
                             f"Wuji hand sn={dev.sn} reports handedness {reported!r} and "
                             f"{len(devices)} hands are attached, so the {self._handedness} "
@@ -718,7 +718,7 @@ class WujiHandAdapter:
                         "Wuji hand sn={} reports handedness {!r}, want {!r}; skipping.",
                         dev.sn, reported, self._handedness,
                     )
-                    self._manager.disconnect_all()
+                    _cleanup_connected_hand_until_safe(hand, self._manager)
             _stop = getattr(self, "_stop_event", None)
             if _stop is not None and _stop.is_set():
                 raise ConnectionError("Wuji hand connect aborted: shutting down")

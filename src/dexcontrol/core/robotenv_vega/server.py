@@ -228,7 +228,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             vel_damp_thresh=vel_damp_thresh,
             head_init_pos=head_init_pos,
         )
-        self._robot.launch_robot()
+        try:
+            self._robot.launch_robot()
+        except BaseException:
+            self._retry_failed_construction_cleanup()
+            raise
 
         # --- Background control loop for interpolation-based upsampling ---
         # When interpolation is active, gRPC Step() buffers commands at
@@ -270,7 +274,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._transport_rpc_condition = threading.Condition()
         self._active_transport_rpcs = 0
         if self._robot.interpolation_enabled and self._control_loop_hz > 0:
-            self._start_control_loop()
+            try:
+                self._start_control_loop()
+            except BaseException:
+                self._retry_failed_construction_cleanup()
+                raise
             LOGGER.info(
                 "Control loop thread started: %d Hz (input≈%d Hz → control=%d Hz)",
                 self._control_loop_hz,
@@ -321,55 +329,78 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             arm_side,
         )
 
-        # Fetch and cache robot firmware version once at startup.
-        self._firmware_version = self._fetch_firmware_version()
+        try:
+            # Fetch and cache robot firmware version once at startup.
+            self._firmware_version = self._fetch_firmware_version()
 
-        plan_path = (
-            Path(__file__).resolve().parent
-            / "force_calibration"
-            / "vega_bilateral_plan_v1.json"
-        )
-        calibration_storage = Path(
-            force_calibration_storage_directory
-            or Path.home()
-            / ".config"
-            / "dexcontrol"
-            / "force-calibration"
-            / arm_side
-        ).expanduser()
-        plan = BilateralCalibrationPlan.load(plan_path, arm_side)
-        lifecycle = ForceCalibrationLifecycle(
-            plan=plan,
-            server_identity={
-                "robot_model": self.robot_model,
-                "arm_side": self.arm_side,
-                "gripper_type": self.gripper_type,
-                "frame_type": self.frame_type,
-                "firmware_version": self._firmware_version,
-                "sensor_to_wrist_yaw_degrees": 165.0,
-                "gripper_mass_kg": float(force_calibration_gripper_mass_kg),
-                "gripper_com_sensor_m": [
-                    float(value) for value in force_calibration_gripper_com_m
-                ],
-            },
-            storage_directory=calibration_storage,
-            calibration_kind="vega_wrist_ft_v1",
-            reference_point_id="physical_ft_sensor_measurement_origin",
-            validate_parameters=lambda value: wrist_ft_calibration_from_snapshot(value),
-        )
-        adapter = VegaRobotCalibrationAdapter(
-            service=self,
-            gripper_mass_kg=force_calibration_gripper_mass_kg,
-            gripper_com_sensor_m=np.asarray(
-                force_calibration_gripper_com_m, dtype=np.float64
-            ),
-        )
-        self._force_calibration_manager = VegaForceCalibrationManager(
-            lifecycle=lifecycle,
-            adapter=adapter,
-            claim_robot=self._claim_robot_for_force_calibration,
-            release_robot=self._release_robot_from_force_calibration,
-        )
+            plan_path = (
+                Path(__file__).resolve().parent
+                / "force_calibration"
+                / "vega_bilateral_plan_v1.json"
+            )
+            calibration_storage = Path(
+                force_calibration_storage_directory
+                or Path.home()
+                / ".config"
+                / "dexcontrol"
+                / "force-calibration"
+                / arm_side
+            ).expanduser()
+            plan = BilateralCalibrationPlan.load(plan_path, arm_side)
+            lifecycle = ForceCalibrationLifecycle(
+                plan=plan,
+                server_identity={
+                    "robot_model": self.robot_model,
+                    "arm_side": self.arm_side,
+                    "gripper_type": self.gripper_type,
+                    "frame_type": self.frame_type,
+                    "firmware_version": self._firmware_version,
+                    "sensor_to_wrist_yaw_degrees": 165.0,
+                    "gripper_mass_kg": float(force_calibration_gripper_mass_kg),
+                    "gripper_com_sensor_m": [
+                        float(value) for value in force_calibration_gripper_com_m
+                    ],
+                },
+                storage_directory=calibration_storage,
+                calibration_kind="vega_wrist_ft_v1",
+                reference_point_id="physical_ft_sensor_measurement_origin",
+                validate_parameters=lambda value: wrist_ft_calibration_from_snapshot(value),
+            )
+            adapter = VegaRobotCalibrationAdapter(
+                service=self,
+                gripper_mass_kg=force_calibration_gripper_mass_kg,
+                gripper_com_sensor_m=np.asarray(
+                    force_calibration_gripper_com_m, dtype=np.float64
+                ),
+            )
+            self._force_calibration_manager = VegaForceCalibrationManager(
+                lifecycle=lifecycle,
+                adapter=adapter,
+                claim_robot=self._claim_robot_for_force_calibration,
+                release_robot=self._release_robot_from_force_calibration,
+            )
+        except BaseException:
+            self._retry_failed_construction_cleanup()
+            raise
+
+    def _retry_failed_construction_cleanup(self) -> None:
+        """Stop partial service workers and close hardware before init escapes."""
+        while True:
+            try:
+                thread = getattr(self, "_control_loop_thread", None)
+                if thread is not None:
+                    self._control_loop_stop.set()
+                    thread.join(timeout=2.0)
+                    if thread.is_alive():
+                        raise RuntimeError("control loop did not stop")
+                    self._control_loop_thread = None
+                self._robot.close()
+                return
+            except Exception:  # pylint: disable=broad-except
+                LOGGER.exception(
+                    "Vega service constructor cleanup is not yet safe; retrying"
+                )
+                time.sleep(0.1)
 
     # ------------------------------------------------------------------
     # Background control loop (for interpolation upsampling)

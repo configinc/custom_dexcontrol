@@ -32,7 +32,7 @@ import numpy as np
 from dexbot_utils import HandType, RobotInfo
 from dexbot_utils.cfg_modifier import runtime_override_robot_config
 from dexbot_utils.configs import BaseRobotConfig
-from dexcomm import RateLimiter, cleanup_session
+from dexcomm import RateLimiter
 from loguru import logger
 from rich.console import Console
 from rich.table import Table
@@ -183,23 +183,36 @@ class Robot(RobotQueryInterface):
         # Early validation - fail fast with clear errors
         self._validate_configuration()
 
-        super().__init__(configs=self._configs)
+        try:
+            super().__init__(configs=self._configs)
 
-        self._pv_components: list[str] = self._robot_info.get_pv_components()
-        self._hand_types: dict[str, HandType] = {}
+            self._pv_components: list[str] = self._robot_info.get_pv_components()
+            self._hand_types: dict[str, HandType] = {}
 
-        # Register for automatic shutdown on signals if enabled
-        if auto_shutdown:
-            _register_signal_handlers()
-            _active_robots.add(self)
+            # Register for automatic shutdown on signals if enabled
+            if auto_shutdown:
+                _register_signal_handlers()
+                _active_robots.add(self)
 
-        self._print_initialization_info()
-
-        # Initialize robot components with safe error handling
-        self._safe_initialize_components()
-
-        # Check version compatibility using new JSON interface
-        self._check_version_compatibility()
+            self._print_initialization_info()
+            self._safe_initialize_components()
+            self._check_version_compatibility()
+        except BaseException:
+            # Once the shared communication owner exists, a constructor that
+            # never returns has no external cleanup handle. Keep retrying the
+            # same phase-aware shutdown until every acquired resource is safe,
+            # then preserve the original construction failure.
+            if hasattr(self, "_node"):
+                while not self._shutdown_called:
+                    try:
+                        self.shutdown()
+                    except Exception as cleanup_exc:  # pylint: disable=broad-except
+                        logger.error(
+                            "Robot constructor cleanup is not yet safe; retrying: {}",
+                            cleanup_exc,
+                        )
+                        time.sleep(0.1)
+            raise
 
     @property
     def robot_model(self) -> str:
@@ -887,23 +900,14 @@ class Robot(RobotQueryInterface):
         # Brief delay to allow component shutdown to complete
         time.sleep(0.1)
 
-        # Release this instance's hold on the shared node (only fully shut down
-        # once the last owner releases it) and clean up the DexComm session.
+        # Release this instance's hold on the shared Node. The shared owner
+        # transaction performs final Node + global session teardown atomically.
         if not getattr(self, "_shutdown_shared_node_completed", False):
             try:
-                self._shutdown_session_cleanup_required = (
-                    self._release_shared_node()
-                )
+                self._release_shared_node()
                 self._shutdown_shared_node_completed = True
             except Exception as e:
                 raise RuntimeError(f"shared node cleanup failed: {e}") from e
-        if not getattr(self, "_shutdown_session_completed", False):
-            if getattr(self, "_shutdown_session_cleanup_required", False):
-                try:
-                    cleanup_session()
-                except Exception as e:
-                    raise RuntimeError(f"session cleanup failed: {e}") from e
-            self._shutdown_session_completed = True
         self._shutdown_called = True
         logger.info("Robot shutdown complete")
 

@@ -13,6 +13,8 @@ sys.modules.setdefault("base_arm_teleop", _base_arm_teleop)
 
 from dexcontrol.core.robotenv_vega.server import VegaRobot  # noqa: E402
 
+vega_robot_module = sys.modules[VegaRobot.__module__]
+
 
 class _BlockingHand:
     def __init__(self, shutdown_failures=0):
@@ -154,3 +156,38 @@ def test_failed_constructor_cleanup_retries_hand_before_base():
     VegaRobot._retry_failed_constructor_cleanup(robot, hand)
 
     assert calls == ["hand", "hand", "robot", "robot"]
+
+
+def test_constructor_failure_after_ik_closes_acquired_base_robot(monkeypatch):
+    class Arm:
+        pass
+
+    class BaseRobot:
+        def __init__(self, **_kwargs):
+            self.left_arm = Arm()
+            self.shutdown_calls = 0
+
+        def has_component(self, _name):
+            return False
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    base = BaseRobot()
+    monkeypatch.setattr(vega_robot_module, "get_robot_config", lambda _name: object())
+    monkeypatch.setattr(
+        vega_robot_module, "_RobotWithCustomHeadPose", lambda **_kwargs: base
+    )
+    monkeypatch.setattr(
+        vega_robot_module, "BaseIKController", lambda **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        VegaRobot,
+        "_finish_initialization",
+        lambda self, **_kwargs: (_ for _ in ()).throw(RuntimeError("late init")),
+    )
+
+    with pytest.raises(RuntimeError, match="late init"):
+        VegaRobot(arm_side="left", gripper_type="default")
+
+    assert base.shutdown_calls == 1

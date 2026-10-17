@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import threading
 
 import pytest
 
@@ -32,7 +33,9 @@ def test_robot_shutdown_retries_incomplete_component_before_shared_transport(mon
     shared_calls = []
     robot._release_shared_node = lambda: shared_calls.append("node") or True
     monkeypatch.setattr(
-        robot_module, "cleanup_session", lambda: shared_calls.append("session")
+        shared_node_module,
+        "cleanup_session",
+        lambda: shared_calls.append("session"),
     )
 
     with pytest.raises(RuntimeError, match="component busy"):
@@ -48,7 +51,7 @@ def test_robot_shutdown_retries_incomplete_component_before_shared_transport(mon
     assert robot.is_shutdown() is True
     assert component.stop_calls == 1
     assert component.shutdown_calls == 2
-    assert shared_calls == ["node", "session"]
+    assert shared_calls == ["node"]
 
 
 def test_robot_shutdown_retries_last_owner_node_without_double_decrement(monkeypatch):
@@ -65,7 +68,8 @@ def test_robot_shutdown_retries_last_owner_node_without_double_decrement(monkeyp
     monkeypatch.setattr(shared_node_module, "_shared_node", node)
     monkeypatch.setattr(shared_node_module, "_owner_count", 1)
     monkeypatch.setattr(shared_node_module, "_shutdown_pending", False)
-    monkeypatch.setattr(robot_module, "cleanup_session", lambda: None)
+    monkeypatch.setattr(shared_node_module, "_node_shutdown_completed", False)
+    monkeypatch.setattr(shared_node_module, "cleanup_session", lambda: None)
     robot = Robot.__new__(Robot)
     robot._shutdown_called = False
     robot._node_released = False
@@ -103,9 +107,12 @@ def test_non_final_owner_does_not_cleanup_process_global_session(monkeypatch):
     monkeypatch.setattr(shared_node_module, "_shared_node", node)
     monkeypatch.setattr(shared_node_module, "_owner_count", 2)
     monkeypatch.setattr(shared_node_module, "_shutdown_pending", False)
+    monkeypatch.setattr(shared_node_module, "_node_shutdown_completed", False)
     session_calls = []
     monkeypatch.setattr(
-        robot_module, "cleanup_session", lambda: session_calls.append("session")
+        shared_node_module,
+        "cleanup_session",
+        lambda: session_calls.append("session"),
     )
 
     robots = []
@@ -114,7 +121,6 @@ def test_non_final_owner_does_not_cleanup_process_global_session(monkeypatch):
         robot._shutdown_called = False
         robot._node_released = False
         robot._node_owner_released = False
-        robot._node_session_cleanup_required = False
         robot._components = []
         robot.sensors = None
         robots.append(robot)
@@ -142,7 +148,6 @@ def test_query_constructor_releases_owner_when_client_creation_fails(monkeypatch
         "shutdown_shared_node",
         lambda *, release_owner=True: release_calls.append(release_owner) or False,
     )
-    monkeypatch.setattr(query_module, "cleanup_session", lambda: None)
     config = SimpleNamespace(
         querables={
             "hand_info": "hand",
@@ -158,3 +163,65 @@ def test_query_constructor_releases_owner_when_client_creation_fails(monkeypatch
         RobotQueryInterface(config)
 
     assert release_calls == [True]
+
+
+def test_final_cleanup_blocks_new_owner_until_session_transaction_finishes(monkeypatch):
+    class Node:
+        def shutdown(self):
+            return None
+
+    old_node = Node()
+    cleanup_entered = threading.Event()
+    release_cleanup = threading.Event()
+    acquired = threading.Event()
+    monkeypatch.setattr(shared_node_module, "_shared_node", old_node)
+    monkeypatch.setattr(shared_node_module, "_owner_count", 1)
+    monkeypatch.setattr(shared_node_module, "_shutdown_pending", False)
+    monkeypatch.setattr(shared_node_module, "_node_shutdown_completed", False)
+    monkeypatch.setattr(shared_node_module, "Node", lambda **_kwargs: Node())
+
+    def cleanup():
+        cleanup_entered.set()
+        assert release_cleanup.wait(timeout=1.0)
+
+    monkeypatch.setattr(shared_node_module, "cleanup_session", cleanup)
+    closing = threading.Thread(target=shared_node_module.shutdown_shared_node)
+    closing.start()
+    assert cleanup_entered.wait(timeout=1.0)
+
+    acquiring = threading.Thread(
+        target=lambda: (shared_node_module.acquire_shared_node(), acquired.set())
+    )
+    acquiring.start()
+    assert acquired.wait(timeout=0.05) is False
+
+    release_cleanup.set()
+    closing.join(timeout=1.0)
+    acquiring.join(timeout=1.0)
+    assert acquired.is_set()
+
+
+def test_robot_close_then_shutdown_cleans_global_session_once(monkeypatch):
+    class Node:
+        def shutdown(self):
+            return None
+
+    calls = []
+    monkeypatch.setattr(shared_node_module, "_shared_node", Node())
+    monkeypatch.setattr(shared_node_module, "_owner_count", 1)
+    monkeypatch.setattr(shared_node_module, "_shutdown_pending", False)
+    monkeypatch.setattr(shared_node_module, "_node_shutdown_completed", False)
+    monkeypatch.setattr(
+        shared_node_module, "cleanup_session", lambda: calls.append("session")
+    )
+    robot = Robot.__new__(Robot)
+    robot._shutdown_called = False
+    robot._node_released = False
+    robot._node_owner_released = False
+    robot._components = []
+    robot.sensors = None
+
+    robot.close()
+    robot.shutdown()
+
+    assert calls == ["session"]

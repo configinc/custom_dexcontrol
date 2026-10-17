@@ -276,3 +276,34 @@ def test_wuji_pre_worker_cleanup_retries_only_incomplete_phase():
     )
 
     assert calls == ["disable", "disconnect", "disconnect"]
+
+
+def test_wuji_wrong_side_candidate_uses_retryable_cleanup(monkeypatch):
+    device_type = object()
+    monkeypatch.setattr(
+        wuji_module,
+        "DeviceType",
+        SimpleNamespace(WujiHand=device_type, WujiHand2=object()),
+    )
+    device = SimpleNamespace(device_type=device_type, sn="abc")
+    hand = SimpleNamespace(handedness_name=lambda: "right")
+    cleanup_calls = []
+    monkeypatch.setattr(
+        wuji_module,
+        "_cleanup_connected_hand_until_safe",
+        lambda connected, manager: cleanup_calls.append((connected, manager)),
+    )
+    manager = SimpleNamespace(
+        scan=lambda: [device],
+        connect=lambda **_kwargs: hand,
+        disconnect_all=lambda: None,
+    )
+    adapter = WujiHandAdapter.__new__(WujiHandAdapter)
+    adapter._handedness = "left"
+    adapter._manager = manager
+    adapter._stop_event = threading.Event()
+
+    with pytest.raises(ConnectionError, match="No Wuji hand found"):
+        adapter._connect(sn=None, init_timeout=0.0)
+
+    assert cleanup_calls == [(hand, manager)]

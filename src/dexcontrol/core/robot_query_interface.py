@@ -32,7 +32,6 @@ from dexcomm.codecs import (
     RobotComponentEnum,
     RobotComponentStatesCodec,
 )
-from dexcomm import cleanup_session
 from loguru import logger
 
 from dexcontrol.core.shared_node import acquire_shared_node
@@ -68,8 +67,6 @@ class RobotQueryInterface:
         # down once every owner releases it. Balanced in _release_shared_node().
         self._node_released = False
         self._node_owner_released = False
-        self._node_session_cleanup_required = False
-        self._session_cleanup_completed = False
         self._node = acquire_shared_node()
         try:
             self._hand_querier = self._node.create_service_client(
@@ -173,14 +170,8 @@ class RobotQueryInterface:
         return session_cleanup_required
 
     def _close_shared_resources(self) -> None:
-        """Release Node ownership and, for the final owner, its session."""
-        session_cleanup_required = self._release_shared_node()
-        if (
-            session_cleanup_required
-            and not getattr(self, "_session_cleanup_completed", False)
-        ):
-            cleanup_session()
-            self._session_cleanup_completed = True
+        """Release this owner's atomic Node/session transaction."""
+        self._release_shared_node()
 
     def close(self) -> None:
         """Release this instance's hold on the shared communication Node.

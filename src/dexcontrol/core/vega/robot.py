@@ -44,6 +44,7 @@ class _RobotWithCustomHeadPose(Robot):
 
     def __init__(self, *args, head_init_pos: np.ndarray | None = None, **kwargs):
         self._head_init_pos = head_init_pos
+        kwargs.setdefault("auto_shutdown", False)
         super().__init__(*args, **kwargs)
 
     def _set_default_state(self) -> None:
@@ -221,10 +222,10 @@ class VegaRobot:
             configs=configs,
             head_init_pos=np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None,
         )
-        self.arm = getattr(self.robot, f"{arm_side}_arm")
-        hand_component = f"{arm_side}_hand"
         custom_hand = None
         try:
+            self.arm = getattr(self.robot, f"{arm_side}_arm")
+            hand_component = f"{arm_side}_hand"
             if gripper_type == "robotiq":
                 from dexcontrol.core.robotiq_gripper import RobotiqGripper  # lazy import
                 self.hand = RobotiqGripper(comport=self._robotiq_comport)
@@ -268,14 +269,37 @@ class VegaRobot:
         except Exception:
             self._retry_failed_constructor_cleanup(self.robot, custom_hand)
             raise
-        self._arm_joint_names = [f"{arm_side[0].upper()}_arm_j{i + 1}" for i in range(7)]
+        try:
+            self._finish_initialization(
+                arm_side=arm_side,
+                control_hz=control_hz,
+                ema_alpha=ema_alpha,
+                interpolation_method=interpolation_method,
+                interpolation_history=interpolation_history,
+                filter_type=filter_type,
+                filter_cutoff_freq=filter_cutoff_freq,
+                filter_order=filter_order,
+                filter_ema_alpha=filter_ema_alpha,
+                vel_smoothing_alpha=vel_smoothing_alpha,
+                hw_correction_alpha=hw_correction_alpha,
+                max_delta_scale=max_delta_scale,
+                max_jerk=max_jerk,
+                vel_ratio=vel_ratio,
+                vel_damp_thresh=vel_damp_thresh,
+            )
+        except Exception:
+            self._retry_failed_constructor_cleanup(self.robot, custom_hand)
+            raise
 
-        # Use Vega unfold pose (L_shape) as default reset, same as fold_robot.py unfold.
+    def _finish_initialization(self, **config) -> None:
+        """Complete all fallible setup while constructor rollback owns hardware."""
+        arm_side = config["arm_side"]
+        control_hz = config["control_hz"]
+        self._arm_joint_names = [f"{arm_side[0].upper()}_arm_j{i + 1}" for i in range(7)]
         self.reset_joints = np.asarray(
             self.arm.get_predefined_pose("L_shape"), dtype=np.float64
         )
         self.safe_transit_pose = self.reset_joints.copy()
-
         self._gripper_open_pos, self._gripper_close_pos = self._init_gripper_reference()
         self._gripper_state_lock = threading.Lock()
         self._gripper_io_lock = threading.Lock()
@@ -291,99 +315,61 @@ class VegaRobot:
         self._prev_gripper_command_successful = True
         self._prev_controller_latency_ms = 0.0
         self._prev_joint_vel: np.ndarray | None = None
-        self._vel_smoothing_alpha = float(np.clip(vel_smoothing_alpha, 0.0, 1.0))
-        self._last_cmd_joint_pos: np.ndarray | None = None  # Track last sent command for delta clipping
-        self._prev_cmd_delta: np.ndarray | None = None  # Previous step delta for jerk limiting
-        self._HW_CORRECTION_ALPHA = float(np.clip(hw_correction_alpha, 0.0, 1.0))
-        self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
-        self._max_delta_scale = float(max(0.1, max_delta_scale))
-        self._MOTOR_MAX_JERK_RAD = float(max(0.0, max_jerk))
-        self._vel_ratio = float(max(0.0, vel_ratio))
-        self._vel_damp_thresh = float(max(0.001, vel_damp_thresh))
+        self._vel_smoothing_alpha = float(np.clip(config["vel_smoothing_alpha"], 0.0, 1.0))
+        self._last_cmd_joint_pos: np.ndarray | None = None
+        self._prev_cmd_delta: np.ndarray | None = None
+        self._HW_CORRECTION_ALPHA = float(np.clip(config["hw_correction_alpha"], 0.0, 1.0))
+        self._HW_CORRECTION_OUTLIER_THRESH = 0.5
+        self._max_delta_scale = float(max(0.1, config["max_delta_scale"]))
+        self._MOTOR_MAX_JERK_RAD = float(max(0.0, config["max_jerk"]))
+        self._vel_ratio = float(max(0.0, config["vel_ratio"]))
+        self._vel_damp_thresh = float(max(0.001, config["vel_damp_thresh"]))
 
-        # Velocity logging for diagnostics.
         vel_log_path = os.environ.get("VEL_LOG_PATH")
-        if vel_log_path:
-            self._vel_log_file = open(vel_log_path, "a")
-            header = f"timestamp,{','.join(f'j{i+1}_vel' for i in range(7))}\n"
-            self._vel_log_file.write(header)
+        self._vel_log_file = open(vel_log_path, "a") if vel_log_path else None
+        if self._vel_log_file is not None:
+            self._vel_log_file.write(
+                f"timestamp,{','.join(f'j{i+1}_vel' for i in range(7))}\n"
+            )
             _logger.info("Velocity logging enabled: %s", vel_log_path)
-        else:
-            self._vel_log_file = None
 
-        # Critically damped 2nd-order smoothing filter for joint commands.
-        # alpha controls responsiveness (0.0 = disabled, 0.3~0.8 = typical).
-        self._ema_alpha = float(np.clip(ema_alpha, 0.0, 0.99))
+        self._ema_alpha = float(np.clip(config["ema_alpha"], 0.0, 0.99))
         self._filter_pos: np.ndarray | None = None
         self._filter_vel: np.ndarray | None = None
-
-        # --- Trajectory interpolation (input-rate → control-rate upsampling) ---
-        # When interpolation_method != "none", incoming commands are buffered
-        # via add_command_point() and the control loop calls
-        # get_interpolated_command() at a higher rate for smooth output.
-        self._interpolation_method = interpolation_method
-        if interpolation_method != "none":
+        self._interpolation_method = config["interpolation_method"]
+        if self._interpolation_method != "none":
             self._interpolator = TrajectoryInterpolator(
-                method=interpolation_method,
-                history_size=interpolation_history,
-            )
-            _logger.info(
-                "Trajectory interpolation enabled: method=%s history=%d",
-                interpolation_method,
-                interpolation_history,
+                method=self._interpolation_method,
+                history_size=config["interpolation_history"],
             )
         else:
             self._interpolator = None
 
-        # --- Output filter (applied after interpolation / EMA) ---
+        filter_type = config["filter_type"]
         if filter_type != "none":
             filter_cfg = {"default": {"type": filter_type}}
             if filter_type == "butterworth":
-                filter_cfg["default"]["cutoff_freq"] = filter_cutoff_freq
-                filter_cfg["default"]["order"] = filter_order
+                filter_cfg["default"].update(
+                    cutoff_freq=config["filter_cutoff_freq"],
+                    order=config["filter_order"],
+                )
             elif filter_type == "ema":
-                filter_cfg["default"]["alpha"] = filter_ema_alpha
+                filter_cfg["default"]["alpha"] = config["filter_ema_alpha"]
             self._output_filter = MultiChannelFilter(
                 filter_config=filter_cfg,
                 control_rate=float(control_hz),
             )
-            _logger.info(
-                "Output filter enabled: type=%s (cutoff=%.1f order=%d ema_alpha=%.2f)",
-                filter_type,
-                filter_cutoff_freq,
-                filter_order,
-                filter_ema_alpha,
-            )
         else:
             self._output_filter = None
 
-        # Latest raw command stored by add_command_point for the control loop
         self._latest_target_joint_pos: np.ndarray | None = None
-        self._latest_gripper_action: float = 0.0
+        self._latest_gripper_action = 0.0
         self._latest_hand_action: np.ndarray | None = None
-        self._latest_gripper_action_space: str = "position"
+        self._latest_gripper_action_space = "position"
         self._interp_lock = threading.Lock()
-
         if self.hand is not None:
             self._refresh_gripper_state()
             self._start_gripper_worker()
-
-        # #region agent log
-        self._agent_debug_log(
-            run_id=f"joint-diagnostics-{self.arm_side}",
-            hypothesis_id="H10",
-            location="dexcontrol/core/vega/robot.py:__init__",
-            message="agent_debug_probe",
-            data={
-                "pid": int(os.getpid()),
-                "module_file": str(Path(__file__).resolve()),
-                "log_path": self._AGENT_DEBUG_LOG_PATH,
-                "arm_side": self.arm_side,
-                "control_hz": self.control_hz,
-                "ik_solver_type": self._ik_solver_type,
-            },
-        )
-        # #endregion
 
     _AGENT_DEBUG_LOG_PATH = "/home/dexmate/.cursor/debug-daf7f0.log"
     _AGENT_DEBUG_SESSION_ID = "daf7f0"
