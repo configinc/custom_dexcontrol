@@ -40,6 +40,7 @@ SENSOR_ROBOT_MAX_SKEW_SECONDS = 0.25
 RETURN_MAX_JOINT_ERROR_RAD = np.radians(5.0)
 RETURN_MAX_POSITION_ERROR_M = 0.01
 RETURN_MAX_ROTATION_ERROR_RAD = np.radians(5.0)
+TERMINAL_PERSIST_RETRY_SECONDS = 1.0
 
 
 class CalibrationCancelled(RuntimeError):
@@ -411,9 +412,11 @@ class VegaForceCalibrationManager:
         self._lock = threading.RLock()
         self._worker: threading.Thread | None = None
         self._deadline_timer: threading.Timer | None = None
+        self._terminal_retry_timer: threading.Timer | None = None
         self._cancelled = threading.Event()
         self._holds: list[WristFtCalibrationHold] = []
         self._candidate: WristFtCalibrationParameters | None = None
+        self._pending_terminal: tuple[str, str | None] | None = None
         self._owns_robot = False
         self._restore_runtime_state()
 
@@ -421,6 +424,54 @@ class VegaForceCalibrationManager:
         if self._deadline_timer is not None:
             self._deadline_timer.cancel()
             self._deadline_timer = None
+
+    def _schedule_terminal_retry_locked(self) -> None:
+        if self._terminal_retry_timer is not None or self._pending_terminal is None:
+            return
+        timer = threading.Timer(
+            TERMINAL_PERSIST_RETRY_SECONDS, self._retry_terminal_persistence
+        )
+        timer.daemon = True
+        self._terminal_retry_timer = timer
+        timer.start()
+
+    def _clear_terminal_retry_locked(self) -> None:
+        if self._terminal_retry_timer is not None:
+            self._terminal_retry_timer.cancel()
+            self._terminal_retry_timer = None
+
+    def _persist_pending_terminal_locked(self) -> bool:
+        if self._pending_terminal is None:
+            return True
+        run_id, failure_message = self._pending_terminal
+        try:
+            if failure_message is None:
+                self.lifecycle.finish_cancel(
+                    run_id, message="force calibration cancelled"
+                )
+            else:
+                self.lifecycle.fail(run_id, failure_message)
+        except LifecycleError:
+            self._pending_terminal = None
+            self._clear_terminal_retry_locked()
+            self._release_if_owned()
+            return True
+        except BaseException:
+            LOGGER.exception(
+                "Vega force calibration terminal state could not be persisted"
+            )
+            self._release_if_owned()
+            self._schedule_terminal_retry_locked()
+            return False
+        self._pending_terminal = None
+        self._clear_terminal_retry_locked()
+        self._release_if_owned()
+        return True
+
+    def _retry_terminal_persistence(self) -> None:
+        with self._lock:
+            self._terminal_retry_timer = None
+            self._persist_pending_terminal_locked()
 
     def _schedule_deadline_locked(self, status: CalibrationStatusSnapshot) -> None:
         self._cancel_deadline_locked()
@@ -478,9 +529,13 @@ class VegaForceCalibrationManager:
         with self._lock:
             current = self.lifecycle.status()
             if run_id == current.run_id:
-                return self.lifecycle.start(
+                status = self.lifecycle.start(
                     run_id, force_recalibrate=force_recalibrate
                 )
+                if status.state == "SUCCEEDED":
+                    self._install_committed_result(run_id)
+                    self._release_if_owned()
+                return status
             validator = getattr(self.adapter, "validate_start", None)
             if callable(validator):
                 validator()
@@ -497,6 +552,7 @@ class VegaForceCalibrationManager:
                 self._cancelled = threading.Event()
                 self._holds = []
                 self._candidate = None
+                self._pending_terminal = None
                 if status.state == "SUCCEEDED":
                     result = self.lifecycle.get_result("")
                     parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
@@ -580,22 +636,24 @@ class VegaForceCalibrationManager:
             except BaseException as return_exc:
                 exc = RuntimeError(f"{exc}; safe return failed: {return_exc}")
             with self._lock:
-                try:
-                    self.lifecycle.fail(run_id, str(exc) or type(exc).__name__)
-                except LifecycleError:
-                    pass
-                except BaseException:
-                    LOGGER.exception(
-                        "Vega force calibration failure state could not be persisted"
-                    )
-                finally:
-                    self._release_if_owned()
+                self._pending_terminal = (
+                    run_id,
+                    str(exc) or type(exc).__name__,
+                )
+                self._persist_pending_terminal_locked()
         finally:
             with self._lock:
                 if self._worker is threading.current_thread():
                     self._worker = None
 
     def _finish_cancel_safely(self, run_id: str) -> None:
+        with self._lock:
+            if (
+                self._pending_terminal is not None
+                and self._pending_terminal[0] == run_id
+            ):
+                self._persist_pending_terminal_locked()
+                return
         message = "force calibration cancelled"
         return_failed = False
         try:
@@ -604,14 +662,11 @@ class VegaForceCalibrationManager:
             message = f"force calibration cancelled; safe return failed: {exc}"
             return_failed = True
         with self._lock:
-            try:
-                if return_failed:
-                    self.lifecycle.fail(run_id, message)
-                else:
-                    self.lifecycle.finish_cancel(run_id, message=message)
-            except LifecycleError:
-                pass
-            self._release_if_owned()
+            self._pending_terminal = (
+                run_id,
+                message if return_failed else None,
+            )
+            self._persist_pending_terminal_locked()
 
     def request_cancel(self, run_id: str) -> CalibrationStatusSnapshot:
         with self._lock:
@@ -652,6 +707,7 @@ class VegaForceCalibrationManager:
             current = self.lifecycle.status()
             if current.state == "SUCCEEDED":
                 status = self.lifecycle.commit(run_id, plan_sha256)
+                self._install_committed_result(run_id)
                 self._release_if_owned()
                 return status
             record = self.lifecycle.get_staged_candidate(run_id)

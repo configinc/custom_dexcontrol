@@ -206,19 +206,22 @@ def test_commit_applies_candidate_and_releases_robot(tmp_path: Path) -> None:
     assert claim.releases == 1
 
 
-def test_commit_retry_is_idempotent(tmp_path: Path) -> None:
+def test_commit_retry_is_idempotent(tmp_path: Path, monkeypatch) -> None:
     manager, adapter, claim = _manager(tmp_path)
     manager.start("run-1", True)
     manager.advance("run-1", 0, "stage-0")
     _wait_state(manager, "READY_FOR_STAGE")
     manager.advance("run-1", 1, "stage-1")
     ready = _wait_state(manager, "READY_TO_APPLY")
+    monkeypatch.setattr(
+        manager_module, "wrist_ft_calibration_from_snapshot", lambda value: value
+    )
 
     first = manager.commit("run-1", ready.plan_sha256)
     retry = manager.commit("run-1", ready.plan_sha256)
 
     assert first.state == retry.state == "SUCCEEDED"
-    assert len(adapter.installed) == 1
+    assert len(adapter.installed) == 2
     assert claim.releases == 1
     with pytest.raises(LifecycleError, match="stale Commit request"):
         manager.commit("run-1", "wrong-plan")
@@ -298,6 +301,54 @@ def test_transient_partial_commit_is_repaired_with_matching_runtime(
     assert claim.owned is False
 
 
+def test_commit_retry_restores_runtime_after_post_commit_cleanup_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+    manager.advance("run-1", 1, "stage-1")
+    ready = _wait_state(manager, "READY_TO_APPLY")
+    runtime = {"value": None}
+
+    def install(prepared):
+        runtime["value"] = prepared
+
+    def commit_install(prepared, commit):
+        previous = runtime["value"]
+        install(prepared)
+        try:
+            return commit()
+        except BaseException:
+            install(previous)
+            raise
+
+    adapter.install_prepared = install
+    adapter.commit_install = commit_install
+    monkeypatch.setattr(
+        manager_module, "wrist_ft_calibration_from_snapshot", lambda value: value
+    )
+    original_unlink = lifecycle_module._durable_unlink
+
+    def fail_staged_unlink(path):
+        if path == manager.lifecycle.staged_candidate_path:
+            raise OSError("staged cleanup failed")
+        return original_unlink(path)
+
+    monkeypatch.setattr(lifecycle_module, "_durable_unlink", fail_staged_unlink)
+    with pytest.raises(OSError, match="staged cleanup failed"):
+        manager.commit("run-1", ready.plan_sha256)
+    assert manager.lifecycle.status().state == "SUCCEEDED"
+    assert runtime["value"] is None
+
+    retry = manager.commit("run-1", ready.plan_sha256)
+
+    assert retry.state == "SUCCEEDED"
+    assert runtime["value"] is not None
+    assert claim.owned is False
+
+
 def test_failure_record_write_error_does_not_leave_robot_claimed(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -311,18 +362,51 @@ def test_failure_record_write_error_does_not_leave_robot_claimed(
 
     original_write = lifecycle_module._atomic_write_json
 
+    failed = False
+
     def fail_terminal_write(path, value):
-        if path == manager.lifecycle.terminal_state_path:
+        nonlocal failed
+        if path == manager.lifecycle.terminal_state_path and not failed:
+            failed = True
             raise OSError("terminal write failed")
         return original_write(path, value)
 
     adapter.fit = fail_fit
+    monkeypatch.setattr(manager_module, "TERMINAL_PERSIST_RETRY_SECONDS", 0.01)
     monkeypatch.setattr(lifecycle_module, "_atomic_write_json", fail_terminal_write)
     manager.advance("run-1", 1, "stage-1")
 
     deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline and claim.owned:
+    while time.monotonic() < deadline and manager.lifecycle.status().state != "FAILED":
         time.sleep(0.005)
+    assert claim.owned is False
+    assert manager.lifecycle.status().state == "FAILED"
+
+
+def test_cancel_terminal_write_error_retries_without_second_safe_return(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    original_write = lifecycle_module._atomic_write_json
+    failed = False
+
+    def fail_terminal_write(path, value):
+        nonlocal failed
+        if path == manager.lifecycle.terminal_state_path and not failed:
+            failed = True
+            raise OSError("terminal write failed")
+        return original_write(path, value)
+
+    monkeypatch.setattr(manager_module, "TERMINAL_PERSIST_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(lifecycle_module, "_atomic_write_json", fail_terminal_write)
+    assert manager.request_cancel("run-1").state == "CANCELLING"
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and manager.lifecycle.status().state != "CANCELLED":
+        time.sleep(0.005)
+    assert manager.lifecycle.status().state == "CANCELLED"
+    assert adapter.safe_returns == 1
     assert claim.owned is False
 
 
