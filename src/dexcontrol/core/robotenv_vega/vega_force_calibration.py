@@ -524,12 +524,19 @@ class VegaForceCalibrationManager:
             self._owns_robot = self._claim_robot()
             if not self._owns_robot:
                 raise RuntimeError("recovered calibration candidate cannot claim robot")
-            record = self.lifecycle.get_staged_candidate(status.run_id)
-            self._candidate = wrist_ft_calibration_from_snapshot(record["parameters"])
-        result = self.lifecycle.get_result("")
-        if result.get("available"):
-            parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
-            self.adapter.install_prepared(self.adapter.prepare_install(parameters))
+        try:
+            if status.state == "READY_TO_APPLY":
+                record = self.lifecycle.get_staged_candidate(status.run_id)
+                self._candidate = wrist_ft_calibration_from_snapshot(
+                    record["parameters"]
+                )
+            result = self.lifecycle.get_result("")
+            if result.get("available"):
+                parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
+                self.adapter.install_prepared(self.adapter.prepare_install(parameters))
+        except BaseException:
+            self._release_if_owned()
+            raise
 
     @property
     def owns_robot(self) -> bool:
@@ -636,7 +643,23 @@ class VegaForceCalibrationManager:
                 daemon=True,
             )
             self._worker = worker
-            worker.start()
+            try:
+                worker.start()
+            except BaseException as exc:
+                self._worker = None
+                failure_message = str(exc).strip() or type(exc).__name__
+                try:
+                    self.adapter.safe_return()
+                except BaseException as return_exc:
+                    return_detail = (
+                        str(return_exc).strip() or type(return_exc).__name__
+                    )
+                    failure_message = (
+                        f"{failure_message}; safe return failed: {return_detail}"
+                    )
+                self._pending_terminal = (run_id, failure_message)
+                self._persist_pending_terminal_locked()
+                raise
             return status
 
     def _run_stage(
@@ -737,8 +760,9 @@ class VegaForceCalibrationManager:
                     and status.state in {"CANCELLED", "FAILED", "SUCCEEDED"}
                 ):
                     if status.state == "SUCCEEDED":
-                        self._install_committed_result(status.run_id)
-                    self._release_if_owned()
+                        self._install_committed_result_and_release(status.run_id)
+                    else:
+                        self._release_if_owned()
                     return status
                 raise
             self._cancel_deadline_locked()
@@ -754,8 +778,9 @@ class VegaForceCalibrationManager:
                     self._worker.start()
             elif status.state in {"CANCELLED", "FAILED", "SUCCEEDED"}:
                 if status.state == "SUCCEEDED":
-                    self._install_committed_result(run_id)
-                self._release_if_owned()
+                    self._install_committed_result_and_release(run_id)
+                else:
+                    self._release_if_owned()
             return status
 
     def expire_deadline(self) -> CalibrationStatusSnapshot:
@@ -772,6 +797,14 @@ class VegaForceCalibrationManager:
         parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
         self.adapter.install_prepared(self.adapter.prepare_install(parameters))
 
+    def _install_committed_result_and_release(self, run_id: str) -> None:
+        try:
+            self._install_committed_result(run_id)
+        finally:
+            # A terminal calibration run must never retain command ownership,
+            # even when publishing its already-durable result fails.
+            self._release_if_owned()
+
     def commit(self, run_id: str, plan_sha256: str) -> CalibrationStatusSnapshot:
         with self._lock:
             current = self.lifecycle.status()
@@ -782,8 +815,7 @@ class VegaForceCalibrationManager:
                 raise LifecycleError("FAILED_PRECONDITION", "stale Commit request")
             if current.state == "SUCCEEDED":
                 status = self.lifecycle.commit(run_id, plan_sha256)
-                self._install_committed_result(run_id)
-                self._release_if_owned()
+                self._install_committed_result_and_release(run_id)
                 return status
             record = self.lifecycle.get_staged_candidate(run_id)
             parameters = self._candidate
@@ -802,9 +834,13 @@ class VegaForceCalibrationManager:
                 repaired = self.lifecycle.repair_partial_commit(run_id)
                 if repaired is None:
                     raise
-                self.adapter.install_prepared(prepared)
+                try:
+                    self.adapter.install_prepared(prepared)
+                finally:
+                    self._release_if_owned()
                 status = repaired
-            self._release_if_owned()
+            else:
+                self._release_if_owned()
             return status
 
     def status(self, run_id: str = "") -> CalibrationStatusSnapshot:
@@ -813,8 +849,7 @@ class VegaForceCalibrationManager:
             if run_id and run_id != status.run_id:
                 raise LifecycleError("NOT_FOUND", "unknown calibration run_id")
             if status.state == "SUCCEEDED" and self._owns_robot:
-                self._install_committed_result(status.run_id)
-                self._release_if_owned()
+                self._install_committed_result_and_release(status.run_id)
             elif status.state in {"CANCELLED", "FAILED"}:
                 self._release_if_owned()
             if self._pending_terminal is not None:
@@ -825,8 +860,7 @@ class VegaForceCalibrationManager:
         with self._lock:
             status = self.lifecycle.status()
             if status.state == "SUCCEEDED" and self._owns_robot:
-                self._install_committed_result(status.run_id)
-                self._release_if_owned()
+                self._install_committed_result_and_release(status.run_id)
             elif status.state in {"CANCELLED", "FAILED"}:
                 self._release_if_owned()
             if self._pending_terminal is not None:

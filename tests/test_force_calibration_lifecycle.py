@@ -165,6 +165,27 @@ def test_plan_is_one_exact_bilateral_artifact(tmp_path: Path) -> None:
         BilateralCalibrationPlan.load(path, "left")
 
 
+@pytest.mark.parametrize("invalid_state", [[], {}])
+def test_unhashable_terminal_state_is_ignored_during_restore(
+    tmp_path: Path,
+    plan: BilateralCalibrationPlan,
+    clock: Clock,
+    invalid_state: object,
+) -> None:
+    lifecycle = _lifecycle(tmp_path, plan, clock)
+    lifecycle.start("run-1", force_recalibrate=True)
+    lifecycle.request_cancel("run-1")
+    lifecycle.finish_cancel("run-1")
+    document = json.loads(lifecycle.terminal_state_path.read_text())
+    document["state"] = invalid_state
+    lifecycle.terminal_state_path.write_text(json.dumps(document))
+
+    restored = _lifecycle(tmp_path, plan, clock)
+
+    assert restored.status().state == "IDLE"
+    assert restored.start("run-2", force_recalibrate=True).state == "READY_FOR_STAGE"
+
+
 def test_plan_validates_unselected_arm_payload(tmp_path: Path) -> None:
     path = tmp_path / "plan.json"
     path.write_text(

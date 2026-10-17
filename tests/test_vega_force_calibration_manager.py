@@ -257,6 +257,25 @@ def test_in_flight_advance_retry_is_idempotent(tmp_path: Path) -> None:
     _wait_state(manager, "READY_FOR_STAGE")
 
 
+def test_advance_worker_start_failure_fails_run_and_releases_robot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+
+    def fail_worker_start(_thread):
+        raise RuntimeError("worker thread unavailable")
+
+    monkeypatch.setattr(manager_module.threading.Thread, "start", fail_worker_start)
+    with pytest.raises(RuntimeError, match="worker thread unavailable"):
+        manager.advance("run-1", 0, "stage-0")
+
+    assert manager.lifecycle.status().state == "FAILED"
+    assert adapter.safe_returns == 1
+    assert claim.owned is False
+    assert manager._worker is None
+
+
 def test_commit_applies_candidate_and_releases_robot(tmp_path: Path) -> None:
     manager, adapter, claim = _manager(tmp_path)
     manager.start("run-1", True)
@@ -361,6 +380,59 @@ def test_restarted_ready_candidate_commits_staged_not_active_parameters(
     assert manager.commit("run-1", ready.plan_sha256).state == "SUCCEEDED"
     assert adapter.installed[-1] == {"tag": "new"}
     assert claim.owned is False
+
+
+def test_restarted_ready_candidate_parse_failure_releases_robot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    lifecycle = _lifecycle(tmp_path)
+    lifecycle.start("run-1", force_recalibrate=True)
+    for index in range(2):
+        lifecycle.advance("run-1", index, f"stage-{index}")
+        lifecycle.set_phase("run-1", "COLLECTING")
+        lifecycle.complete_stage("run-1", index)
+    lifecycle.stage_candidate(
+        "run-1", parameters={"tag": "bad"}, quality={"passed": True}
+    )
+    monkeypatch.setattr(
+        manager_module,
+        "wrist_ft_calibration_from_snapshot",
+        lambda _value: (_ for _ in ()).throw(ValueError("invalid candidate")),
+    )
+    claim = Claim()
+
+    with pytest.raises(ValueError, match="invalid candidate"):
+        VegaForceCalibrationManager(
+            lifecycle=_lifecycle(tmp_path),
+            adapter=FakeAdapter(),
+            claim_robot=claim.acquire,
+            release_robot=claim.release,
+        )
+
+    assert claim.owned is False
+    assert claim.claims == claim.releases == 1
+
+
+def test_post_commit_runtime_install_failure_releases_robot(
+    tmp_path: Path,
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+    manager.advance("run-1", 1, "stage-1")
+    ready = _wait_state(manager, "READY_TO_APPLY")
+
+    def reject_install(_prepared):
+        raise RuntimeError("runtime install failed")
+
+    adapter.install_prepared = reject_install
+    with pytest.raises(RuntimeError, match="runtime install failed"):
+        manager.commit("run-1", ready.plan_sha256)
+
+    assert manager.lifecycle.status().state == "SUCCEEDED"
+    assert claim.owned is False
+    assert claim.claims == claim.releases == 1
 
 
 def test_transient_partial_commit_is_repaired_with_matching_runtime(

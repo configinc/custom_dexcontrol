@@ -570,9 +570,11 @@ class ForceCalibrationLifecycle:
             value = _read_json(path)
         except PERSISTED_RECORD_ERRORS:
             return None
+        state = value.get("state")
         if (
             value.get("schema_version") != SCHEMA_VERSION
-            or value.get("state") not in TERMINAL_STATES
+            or not isinstance(state, str)
+            or state not in TERMINAL_STATES
             or value.get("plan_id") != self.plan.plan_id
             or value.get("plan_sha256") != self.plan.plan_sha256
             or value.get("arm_name") != self.plan.arm_name
