@@ -814,12 +814,19 @@ def test_feedforward_deadman_bypasses_velocity_ema():
 
 
 def test_hardware_dispatch_rejects_overflowed_joint_velocity():
+    sends = []
     robot = VegaRobot.__new__(VegaRobot)
     robot.arm_side = "left"
     robot.arm = type(
         "Arm",
         (),
-        {"joint_pos_limit": None, "get_joint_pos": lambda self: np.zeros(7)},
+        {
+            "joint_pos_limit": None,
+            "get_joint_pos": lambda self: np.zeros(7),
+            "set_joint_pos_vel": lambda self, pos, vel, relative: sends.append(
+                (np.asarray(pos), np.asarray(vel))
+            ),
+        },
     )()
     robot.control_hz = 20
     robot._last_cmd_joint_pos = None
@@ -845,6 +852,17 @@ def test_hardware_dispatch_rejects_overflowed_joint_velocity():
             execution_hz=200,
             feedforward_velocity=np.full(7, 10.0),
         )
+    assert robot._prev_cmd_delta is None
+    assert robot._prev_joint_vel is None
+    assert sends == []
+
+    robot._vel_ratio = 1.0
+    robot.update_joints(
+        np.full(7, -0.05),
+        execution_hz=200,
+        feedforward_velocity=np.full(7, -10.0),
+    )
+    assert np.all(sends[-1][0] < 0.0)
 
 
 def test_jerk_shaped_target_is_revalidated_before_hardware_dispatch():

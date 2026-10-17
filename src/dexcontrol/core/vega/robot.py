@@ -1406,7 +1406,6 @@ class VegaRobot:
         # boundary, so the value that actually reaches hardware needs its own
         # final validation.
         self.validate_joint_limits(target_joint_pos)
-        self._prev_cmd_delta = diff.copy()
 
         # #region agent log
         self._agent_debug_log(
@@ -1486,17 +1485,21 @@ class VegaRobot:
                 raise ValueError(
                     "Refusing to send non-finite joint velocity to hardware"
                 )
-            self._prev_joint_vel = target_joint_vel.copy()
             if self._vel_log_file is not None:
                 self._vel_log_file.write(
                     f"{_time.time()},{','.join(f'{v:.6f}' for v in target_joint_vel)}\n"
                 )
             self.arm.set_joint_pos_vel(target_joint_pos, target_joint_vel, relative=False)
+            self._prev_joint_vel = target_joint_vel.copy()
         elif blocking:
             wait_time = 1.0 / max(1, tick_hz)
             self.arm.set_joint_pos(target_joint_pos, wait_time=wait_time)
         else:
             self.arm._send_position_command(target_joint_pos)
+        # Commit limiter history only after the physical dispatch succeeds.
+        # A validation, log-write, or transport failure must not seed a
+        # phantom previous command that changes the next real trajectory.
+        self._prev_cmd_delta = diff.copy()
         self._last_cmd_joint_pos = target_joint_pos.copy()
         self.sync_motion_manager_with_arm(target_joint_pos)
 
