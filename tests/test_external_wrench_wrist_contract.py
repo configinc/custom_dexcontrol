@@ -24,6 +24,9 @@ from dexcontrol.exceptions import ServiceUnavailableError  # noqa: E402
 
 def _service() -> VegaRobotEnvService:
     service = VegaRobotEnvService.__new__(VegaRobotEnvService)
+    service._shutdown_started = threading.Event()
+    service._transport_rpc_condition = threading.Condition()
+    service._active_transport_rpcs = 0
     service.robot_model = "vega_1"
     service.arm_side = "left"
     service.gripper_type = "robotiq"
@@ -65,6 +68,32 @@ def test_observation_contract_exposes_raw_and_optional_calibrated_wrenches() -> 
     assert spec.fields["external_wrench_world"].required is False
     assert spec.metadata["force_signal_provider_kind"] == "wrist_force_torque"
     assert spec.metadata["force_signal_provider_schema_version"] == "2"
+
+
+def test_observation_spec_transport_access_is_tracked_until_complete() -> None:
+    service = _service()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_hand_dof():
+        entered.set()
+        assert release.wait(timeout=1.0)
+        return 1
+
+    service._robot._hand_dof = blocking_hand_dof
+    result = {}
+    thread = threading.Thread(
+        target=lambda: result.setdefault("spec", service.GetObservationSpec(None, None))
+    )
+    thread.start()
+    assert entered.wait(timeout=1.0)
+    assert service._active_transport_rpcs == 1
+    service._shutdown_started.set()
+    release.set()
+    thread.join(timeout=1.0)
+
+    assert "spec" in result
+    assert service._active_transport_rpcs == 0
 
 
 def test_sensor_boundary_preserves_source_wrench_order_and_sign(monkeypatch) -> None:

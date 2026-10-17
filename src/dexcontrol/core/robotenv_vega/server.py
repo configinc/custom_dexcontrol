@@ -500,6 +500,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         converted[3:6] = rot_vel * self._max_rot_delta
         return converted
 
+    @_track_transport_rpc(robotenv_pb2.ObservationSpec)
     def GetObservationSpec(self, request, context):
         del request, context
         spec = robotenv_pb2.ObservationSpec(
