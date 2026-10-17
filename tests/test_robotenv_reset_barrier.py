@@ -2,16 +2,16 @@ import sys
 import threading
 from types import ModuleType, SimpleNamespace
 
+import grpc
 import numpy as np
 import pytest
-import grpc
 
 # Keep this server test independent of the optional DualSense/hidapi stack.
 _base_arm_teleop = ModuleType("base_arm_teleop")
 _base_arm_teleop.BaseIKController = object
 sys.modules.setdefault("base_arm_teleop", _base_arm_teleop)
 
-from dexcontrol.core.robotenv_vega.server import VegaRobotEnvService
+from dexcontrol.core.robotenv_vega.server import VegaRobotEnvService  # noqa: E402
 
 
 class _Robot:
@@ -38,6 +38,8 @@ def _service():
     service._control_loop_hz = 0
     service._robot = _Robot()
     service._control_loop_thread = None
+    service._force_calibration_owner_lock = threading.Lock()
+    service._force_calibration_owns_robot = threading.Event()
     return service
 
 
@@ -52,6 +54,36 @@ def test_step_dispatch_uses_normal_path_when_no_reset_owns_robot():
     )
 
     assert len(service._robot.commands) == 1
+
+
+def test_step_dispatch_is_rejected_while_force_calibration_owns_robot():
+    service = _service()
+    service._force_calibration_owns_robot.set()
+
+    with pytest.raises(RuntimeError, match="force calibration"):
+        service._dispatch_step_command(
+            np.ones(7),
+            action_space="cartesian_delta",
+            gripper_action_space="position",
+            command_epoch=0,
+        )
+
+    assert service._robot.commands == []
+
+
+def test_motion_reset_is_rejected_while_force_calibration_owns_robot():
+    service = _service()
+    service._force_calibration_owns_robot.set()
+    context = SimpleNamespace(code=None, details="")
+    context.set_code = lambda code: setattr(context, "code", code)
+    context.set_details = lambda details: setattr(context, "details", details)
+
+    response = service.Reset(SimpleNamespace(mode="home", params={}), context)
+
+    assert response.status == ""
+    assert context.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert "force calibration" in context.details
+    assert service._reset_in_progress.is_set() is False
 
 
 def test_reset_epoch_rejects_step_that_was_queued_before_reset():

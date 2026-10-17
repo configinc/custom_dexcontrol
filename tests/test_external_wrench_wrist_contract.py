@@ -1,5 +1,6 @@
 import inspect
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
@@ -11,8 +12,8 @@ sys.modules.setdefault("base_arm_teleop", _base_arm_teleop)
 
 from dexcontrol.core.arm import ArmWrenchSensor  # noqa: E402
 from dexcontrol.core.component import RobotComponent  # noqa: E402
-from dexcontrol.core.robotenv_vega.server import (  # noqa: E402
-    VegaRobotEnvService,
+from dexcontrol.core.robotenv_vega.server import VegaRobotEnvService  # noqa: E402
+from dexcontrol.core.robotenv_vega.wrench_contract import (  # noqa: E402
     sensor_frame_wrench_to_wrist,
 )
 from dexcontrol.core.vega.robot import VegaRobot  # noqa: E402
@@ -46,17 +47,19 @@ def test_robot_server_does_not_default_a_canonical_wrist_transform() -> None:
     )
 
 
-def test_observation_contract_exposes_only_raw_sensor_wrench() -> None:
+def test_observation_contract_exposes_raw_and_optional_calibrated_wrenches() -> None:
     spec = _service().GetObservationSpec(None, None)
 
-    assert "external_wrench_wrist" not in spec.fields
+    assert "external_wrench_wrist" in spec.fields
     assert "external_wrench_sensor_raw" in spec.fields
-    assert "external_wrench_world" not in spec.fields
+    assert "external_wrench_world" in spec.fields
     assert "wrench_state" not in spec.fields
     assert list(spec.fields["external_wrench_sensor_raw"].shape) == [6]
     assert spec.fields["external_wrench_sensor_raw_reference_point"].dtype == "string"
     assert list(spec.fields["external_wrench_wrist_from_sensor_rotation"].shape) == [9]
     assert list(spec.fields["external_wrench_world_from_sensor_rotation"].shape) == [9]
+    assert spec.fields["external_wrench_wrist"].required is False
+    assert spec.fields["external_wrench_world"].required is False
     assert spec.metadata["force_signal_provider_kind"] == "wrist_force_torque"
     assert spec.metadata["force_signal_provider_schema_version"] == "2"
 
@@ -135,6 +138,48 @@ def test_observation_keeps_configured_rotation_out_of_canonical_fields() -> None
     )
     np.testing.assert_allclose(wrist_from_sensor, expected, atol=1e-12)
     np.testing.assert_allclose(world_from_sensor, np.eye(3), atol=1e-12)
+
+
+def test_observation_publishes_both_calibrated_frames_only_with_active_applier() -> None:
+    source = np.arange(6.0)
+    state = {
+        "joint_positions": np.zeros(7),
+        "joint_velocities": np.zeros(7),
+        "joint_torques_computed": np.zeros(7),
+        "gripper_position": 0.0,
+        "cartesian_position": np.zeros(6),
+    }
+
+    class Applier:
+        def measured_sensor_raw_to_calibrated_wrist(self, *args, **kwargs):
+            assert kwargs["reference_point"] == "physical F/T sensor measurement origin"
+            return np.ones(6)
+
+        def measured_sensor_raw_to_calibrated_world(self, *args, **kwargs):
+            return np.full(6, 2.0)
+
+    service = _service()
+    service._force_calibration_applier_lock = threading.Lock()
+    service._force_calibration_applier = Applier()
+    service._robot = SimpleNamespace(
+        get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
+        arm=SimpleNamespace(
+            wrench_sensor=SimpleNamespace(get_wrench_state=lambda: source.copy())
+        ),
+    )
+
+    observation, _ = service._create_observation()
+
+    np.testing.assert_array_equal(
+        observation["external_wrench_wrist"].float_array.values, np.ones(6)
+    )
+    np.testing.assert_array_equal(
+        observation["external_wrench_world"].float_array.values, np.full(6, 2.0)
+    )
+    assert (
+        observation["external_wrench_wrist_reference_point"].string_value
+        == "configured TCP anchor (rotation only)"
+    )
 
 
 def test_robot_state_does_not_read_or_leak_source_wrench() -> None:
