@@ -513,7 +513,18 @@ class RobotEnvClient:
             "cartesian_position": obs.get("cartesian_position", np.zeros(6)).tolist()
                 if isinstance(obs.get("cartesian_position"), np.ndarray)
                 else list(obs.get("cartesian_position", [0]*6)),
-            "gripper_position": float(obs.get("gripper_position", 0)),
+            # Scalar gripper → float; multi-finger hand (joint vector) → list,
+            # preserved as-is (float() would blow up on the array a wuji/F5D6
+            # server sends). Mirrors the robot-control-interface client.
+            "gripper_position": (
+                obs.get("gripper_position").tolist()
+                if isinstance(obs.get("gripper_position"), np.ndarray)
+                else (
+                    list(obs.get("gripper_position"))
+                    if isinstance(obs.get("gripper_position"), (list, tuple))
+                    else float(obs.get("gripper_position", 0))
+                )
+            ),
             "joint_positions": obs.get("joint_positions", np.zeros(7)).tolist()
                 if isinstance(obs.get("joint_positions"), np.ndarray)
                 else list(obs.get("joint_positions", [0]*7)),
@@ -533,6 +544,11 @@ class RobotEnvClient:
         state["prev_controller_latency_ms"] = float(obs.get("prev_controller_latency_ms", 0))
         state["prev_command_successful"] = bool(obs.get("prev_command_successful", True))
         state["prev_gripper_command_successful"] = bool(obs.get("prev_gripper_command_successful", True))
+
+        # Hand tactile, only present for multi-finger hands that stream it.
+        if "hand_tactile" in obs:
+            val = obs["hand_tactile"]
+            state["hand_tactile"] = val.tolist() if isinstance(val, np.ndarray) else list(val)
 
         return state
 

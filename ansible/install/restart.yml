@@ -6,11 +6,95 @@
     dexmate_ip: "192.168.5.20"
     dexmate_user: "dexmate"
     dexmate_pass: "hello-dex"
-    # Gripper selection: "robotiq" (default, ttyUSB) or "sr_gripper" (EtherCAT).
-    # Override with `-e gripper_type=sr_gripper` on the ansible-playbook CLI.
-    gripper_type: "robotiq"
+    # Gripper selection:
+    #   "robotiq"    -> 2-finger over ttyUSB
+    #   "sr_gripper" -> 2-finger over EtherCAT
+    #   "wuji_hand_v1" / "wuji_hand_v2" -> Wuji 5-finger hand (USB gen 1 /
+    #                   Ethernet gen 2; the wuji-sdk driver auto-detects the
+    #                   model and picks each arm's hand by handedness, no port)
+    #   "vega_hand"  -> integrated F5D6 5-finger hand (no port flag)
+    #
+    # EMPTY (the default) resolves it from the unit's data-studio config —
+    # the same source RCI reads at connect — so the servers and the interface
+    # can never disagree just because a restart button was pressed without
+    # flags. `-e gripper_type=...` still overrides for one-offs; resolution
+    # failure is a hard error, never a silent robotiq fallback.
+    gripper_type: ""
+    unit_config_url: "http://data-studio-layout.tailb971f6.ts.net/api/unit_config"
+    # Wuji hand serial numbers are PER UNIT, so they are not stored here.
+    # Each robot host keeps its own map at ~/.wuji/hands.json, written once by
+    # `python examples/wuji/identify_hands.py` — WujiHandAdapter reads it and
+    # binds each arm to the right hand. Needed because shipped serials (plain
+    # STM32 UIDs, e.g. 367A39773134) carry no handedness.
+    # These stay empty; use `-e wuji_right_sn=...` only for a one-off override.
+    wuji_left_sn: ""
+    wuji_right_sn: ""
+    # Opt-in Hand 2 diagnostics: -e wuji_log_current=true adds WUJI_LOG_CURRENT=1.
+    wuji_log_current: false
+    # Try identify_hands.py --auto (reads the handedness the SDK reports; no
+    # motion) when the host has no map yet. Set false to always identify by hand.
+    wuji_auto_identify: true
+    # Abort the deploy when the map is still incomplete. Set false for a
+    # single-hand bring-up, where auto-selection is unambiguous.
+    wuji_require_hand_map: true
+    # Hand 2 is an Ethernet/UDP device with no exclusive open: if only ONE hand
+    # is reachable, both arm servers can end up driving that same hand (two
+    # conflicting 100 Hz target streams -> violent oscillation). Refuse to start
+    # the servers unless exactly one left (SN 4th char J) and one right (K) Hand 2
+    # are visible on the network. Set false only for a deliberate single-hand
+    # bring-up.
+    wuji_require_both_hands: true
 
   tasks:
+    # ── Resolve gripper_type from the unit config ───────────────────────────
+    # Same endpoint and hostname RCI's setup pipeline uses
+    # (backend/setup_pipeline.py _fetch_unit_config), queried FROM the teleop
+    # host so reachability matches RCI's. Skipped entirely when
+    # `-e gripper_type=...` was given.
+    - name: Fetch unit config from data-studio
+      uri:
+        url: "{{ unit_config_url }}/{{ ansible_hostname }}"
+        return_content: true
+        timeout: 10
+      register: unit_cfg
+      become: false
+      failed_when: false
+      when: (gripper_type | default('')) | length == 0
+
+    - name: Resolve gripper_type from unit config
+      vars:
+        _gripper_aliases:
+          robotiq: robotiq
+          robotiq_2f85: robotiq
+          robotiq_2f140: robotiq
+          sr_gripper: sr_gripper
+          sr_gripper_0.1: sr_gripper
+          vega_hand: vega_hand
+          wuji_hand_v1: wuji_hand_v1
+          wuji_hand_v2: wuji_hand_v2
+          wuji_hand: wuji_hand_v1
+          wuji_hand_2: wuji_hand_v2
+        _raw_gripper: "{{ (unit_cfg.json | default({})).gripper_type | default('') }}"
+      set_fact:
+        gripper_type: "{{ _gripper_aliases[_raw_gripper] | default('') }}"
+        gripper_type_source: "unit config (raw={{ _raw_gripper | default('') }})"
+      when: (gripper_type | default('')) | length == 0
+
+    - name: Fail when gripper_type could not be resolved
+      fail:
+        msg: >-
+          Could not resolve gripper_type from the unit config
+          ({{ unit_config_url }}/{{ ansible_hostname }} returned
+          status={{ unit_cfg.status | default('unreachable') }},
+          gripper_type={{ (unit_cfg.json | default({})).gripper_type | default('missing') }}).
+          Fix the unit config in data-studio, or pass
+          -e gripper_type=<robotiq|sr_gripper|vega_hand|wuji_hand_v1|wuji_hand_v2>.
+      when: (gripper_type | default('')) | length == 0
+
+    - name: Display resolved gripper type
+      debug:
+        msg: "gripper_type = {{ gripper_type }} ({{ gripper_type_source | default('explicit -e override') }})"
+
     # ── Pre-flight checks ────────────────────────────────────────────────────
     - name: Install sshpass on teleop host
       apt:
@@ -99,6 +183,202 @@
         right_gripper_port: "{{ sr_iface_list.stdout_lines | last }}"
       when: gripper_type == "sr_gripper"
 
+    # No 5-finger hand has a serial/EtherCAT port — the wuji-sdk scans and selects
+    # each arm's hand by handedness (or --wuji-sn). Provide empty defaults so
+    # the start/debug tasks don't reference undefined vars.
+    - name: Default empty gripper ports for 5-finger hands (wuji/vega)
+      set_fact:
+        left_gripper_port: ""
+        right_gripper_port: ""
+      when: gripper_type in ["vega_hand", "wuji_hand_v1", "wuji_hand_v2"]
+
+    # Installed on EVERY unit, whatever gripper_type says right now: a unit is
+    # expected to switch between vega_hand and wuji_hand_v1/v2 with a config
+    # change alone, and the driver has to already be in the robot env when that
+    # happens (no host visit). Same contract RCI's deploy.yml gives the teleop
+    # host, which installs wuji-sdk unconditionally and best-effort.
+    # Hard failure ONLY when a wuji hand is the gripper actually selected — on
+    # any other unit this is pre-staging, and a pip failure there must NOT abort
+    # the play before the servers are (re)started further down.
+    # The wuji hand v1 is a raw libusb device (VID 0483 / PID 2000, no tty).
+    # Its /dev/bus/usb node must be writable by the dexmate user or the SDK's
+    # scan() silently finds nothing. Installing the udev rule needs root —
+    # a ONE-TIME manual host setup — so this task only VERIFIES access and
+    # fails with the exact fix when it's missing (no sudo over ssh here: the
+    # dexmate account may not have passwordless sudo, and a password prompt
+    # inside a non-interactive ssh would hang the play).
+    - name: Verify wuji hand USB device is accessible on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} '
+          devs=$(lsusb -d 0483:2000 | sed "s#Bus \([0-9]*\) Device \([0-9]*\).*#/dev/bus/usb/\1/\2#")
+          if [ -z "$devs" ]; then echo NO_DEVICE; exit 0; fi
+          for d in $devs; do [ -w "$d" ] || { echo "NO_PERM $d"; exit 0; }; done
+          echo OK'
+      args:
+        executable: /bin/bash
+      register: wuji_usb_check
+      become: false
+      when: gripper_type == "wuji_hand_v1"
+
+    - name: Fail with udev fix instructions when the wuji hand is not accessible
+      fail:
+        msg: >-
+          Wuji hand USB check: {{ wuji_usb_check.stdout }}.
+          NO_DEVICE → plug the hand(s) into the dexmate machine.
+          NO_PERM → run ONCE on dexmate (needs root):
+          echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="2000", MODE="0666"'
+          | sudo tee /etc/udev/rules.d/99-wuji-hand.rules &&
+          sudo udevadm control --reload-rules && sudo udevadm trigger
+      when: gripper_type == "wuji_hand_v1" and wuji_usb_check.stdout is defined and wuji_usb_check.stdout != "OK"
+
+    - name: Verify wuji-sdk is installed in the robot env on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'source ~/miniconda3/etc/profile.d/conda.sh && conda activate robot && python -c "import wuji_sdk" \
+           || (conda activate robot && python -m pip install --no-deps wuji-sdk && python -c "import wuji_sdk")'
+      args:
+        executable: /bin/bash
+      become: false
+      register: wuji_sdk_install
+      ignore_errors: "{{ gripper_type not in ['wuji_hand_v1', 'wuji_hand_v2'] }}"
+
+    # An ignored failure still prints as a red "fatal:" block, which reads like
+    # an abort. Say plainly what it means for a unit that does not need it.
+    - name: Note that wuji-sdk pre-staging did not land (not needed by this gripper)
+      debug:
+        msg: >-
+          wuji-sdk is NOT installed in the robot env on dexmate. Harmless for
+          gripper_type={{ gripper_type }} — the servers start without it — but
+          switching this unit to wuji_hand_v1/v2 later will need it. Usual cause
+          is no PyPI route from dexmate; fix that and rerun, or install by hand:
+          conda activate robot && python -m pip install --no-deps wuji-sdk
+      when:
+        - gripper_type not in ["wuji_hand_v1", "wuji_hand_v2"]
+        - wuji_sdk_install is defined
+        - wuji_sdk_install.failed | default(false)
+
+    # ── Wuji Hand 1 identity (per-unit left/right serial map) ───────────────
+    # V1 STM32 UID serials carry no handedness, so each host keeps its own
+    # ~/.wuji/hands.json. Deploy verifies it, tries a hands-off auto-identify
+    # (reads the handedness the SDK reports; commands no motion), and only then
+    # asks the operator to run the guided one-off. Without a map the servers
+    # still start — they just fall back to SDK auto-selection, which is why a
+    # 2-hand v1 unit must not be left in that state. V2 uses the SN J/K rule
+    # and the separate two-hand discovery check below; no map is required.
+    - name: Check Wuji hand map on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'python3 - <<PY
+        import json, os
+        p = os.path.expanduser(os.environ.get("WUJI_HAND_MAP", "~/.wuji/hands.json"))
+        try:
+            d = json.load(open(p))
+        except Exception:
+            print("MISSING"); raise SystemExit(0)
+        have = [k for k in ("left", "right") if d.get(k)]
+        print("OK" if len(have) == 2 else "INCOMPLETE:" + ",".join(have))
+        PY'
+      args:
+        executable: /bin/bash
+      register: wuji_map_check
+      become: false
+      changed_when: false
+      when: gripper_type == "wuji_hand_v1"
+
+    - name: Auto-identify Wuji hands from SDK-reported handedness (best effort)
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'source ~/miniconda3/etc/profile.d/conda.sh && conda activate robot &&
+           python ~/custom_dexcontrol/examples/wuji/identify_hands.py --auto'
+      args:
+        executable: /bin/bash
+      register: wuji_auto_identify_run
+      become: false
+      ignore_errors: true
+      when:
+        - gripper_type == "wuji_hand_v1"
+        - wuji_auto_identify | bool
+        - wuji_map_check.stdout is defined and wuji_map_check.stdout != "OK"
+
+    - name: Re-check Wuji hand map after auto-identify
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'python3 - <<PY
+        import json, os
+        p = os.path.expanduser(os.environ.get("WUJI_HAND_MAP", "~/.wuji/hands.json"))
+        try:
+            d = json.load(open(p))
+        except Exception:
+            print("MISSING"); raise SystemExit(0)
+        have = [k for k in ("left", "right") if d.get(k)]
+        print("OK" if len(have) == 2 else "INCOMPLETE:" + ",".join(have))
+        PY'
+      args:
+        executable: /bin/bash
+      register: wuji_map_recheck
+      become: false
+      changed_when: false
+      when:
+        - gripper_type == "wuji_hand_v1"
+        - wuji_map_check.stdout is defined and wuji_map_check.stdout != "OK"
+
+    - name: Fail with hand-identification instructions when the map is still incomplete
+      fail:
+        msg: >-
+          Wuji hand map ({{ wuji_map_recheck.stdout }}) — this unit does not know
+          which serial is the left hand and which is the right, and its serials do
+          not encode handedness. Run ONCE on dexmate (interactive; each hand wiggles
+          and you answer which one moved):
+          conda activate robot &&
+          python ~/custom_dexcontrol/examples/wuji/identify_hands.py
+          Then rerun this playbook. Inspect the result with the same script and --show.
+          To proceed anyway on a single-hand bring-up, pass -e wuji_require_hand_map=false
+      when:
+        - gripper_type == "wuji_hand_v1"
+        - wuji_require_hand_map | bool
+        - wuji_map_recheck.stdout is defined and wuji_map_recheck.stdout != "OK"
+
+    # ── Wuji Hand 2: both hands must be reachable BEFORE the servers start ──
+    # Same scan the driver runs (wuji_sdk UDP discovery on every interface).
+    # Sides come from the firmware SN convention (4th char J=left / K=right).
+    - name: Scan for Wuji Hand 2 devices on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'source ~/miniconda3/etc/profile.d/conda.sh && conda activate robot && python - <<PY
+        from wuji_sdk import DeviceType, SdkManager
+        side = {"J": "left", "K": "right"}
+        devs = [d for d in SdkManager.instance().scan()
+                if d.device_type in (DeviceType.WujiHand, DeviceType.WujiHand2)]
+        seen = ["%s(%s)@%s" % (d.sn, side.get(d.sn[3:4].upper(), "no-side"),
+                                getattr(d, "address", "?")) for d in devs]
+        sides = sorted(side.get(d.sn[3:4].upper(), "?") for d in devs)
+        print(("OK " if sides == ["left", "right"] else "BAD ") + ",".join(seen or ["none"]))
+        PY'
+      args:
+        executable: /bin/bash
+      register: wuji_v2_scan
+      become: false
+      changed_when: false
+      when: gripper_type == "wuji_hand_v2"
+
+    - name: Fail unless exactly one left and one right Wuji Hand 2 are visible
+      fail:
+        msg: >-
+          Wuji Hand 2 scan on dexmate: {{ wuji_v2_scan.stdout }}.
+          Both hands must be reachable before the arm servers start — with only one
+          visible, both servers would bind the SAME hand and it oscillates violently
+          on the first clutch engage. Check on dexmate:
+          `wuji upgrade --check` (must list 2 devices),
+          `ping -c2 192.168.1.110` (left) / `ping -c2 192.168.1.111` (right),
+          `nmcli -f NAME,DEVICE,STATE con show | grep wuji` (wuji-left must be activated;
+          fix: `sudo nmcli con up wuji-left`), hand power (XT30) and RJ45 link LEDs.
+          To proceed anyway on a deliberate single-hand bring-up, pass
+          -e wuji_require_both_hands=false
+      when:
+        - gripper_type == "wuji_hand_v2"
+        - wuji_require_both_hands | bool
+        - wuji_v2_scan.stdout is defined and not (wuji_v2_scan.stdout is match("OK "))
+
     - name: Display gripper port assignments
       debug:
         msg: "[{{ gripper_type }}] Left: {{ left_gripper_port }} / Right: {{ right_gripper_port }}"
@@ -112,23 +392,70 @@
         executable: /bin/bash
       become: false
 
+    # Killing the tmux session does not guarantee its python children are gone,
+    # and hand tools left running (joint_diag --watch, identify_hands, bench
+    # scripts) keep an SDK session on the hand. A leftover process makes the
+    # new server's SDK queries time out (stale DeviceBridge) or the hand look
+    # busy. TERM first, wait, then KILL what remains. The [x] bracket trick
+    # keeps pgrep/pkill from matching this very command line.
+    - name: Kill leftover robot-server / wuji hand tool processes on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        pat='[r]obotenv_vega/server\.py|examples/wuji/([i]dentify_hands|[j]oint_diag|[g]love_teleop_bench|[b]ench_test)\.py'
+        if pgrep -f "$pat" > /dev/null; then
+          echo "leftover processes:"; pgrep -af "$pat"
+          pkill -TERM -f "$pat" || true
+          for i in $(seq 1 10); do pgrep -f "$pat" > /dev/null || break; sleep 0.5; done
+          if pgrep -f "$pat" > /dev/null; then
+            echo "still alive after 5s, SIGKILL:"; pgrep -af "$pat"
+            pkill -KILL -f "$pat" || true
+            sleep 0.5
+          fi
+        fi
+        pgrep -af "$pat" && exit 1 || echo "no leftover robot/hand processes"
+        ENDSSH
+      args:
+        executable: /bin/bash
+      become: false
+      changed_when: false
+
     # ── Start robot gRPC servers ─────────────────────────────────────────────
     # The gripper-port flag differs between gripper types:
     #   robotiq      -> --robotiq-comport <ttyUSB>
     #   sr_gripper   -> --gripper-iface   <EtherCAT iface>
+    #   wuji_hand_v1/v2, vega_hand -> (no port flag; the driver selects by
+    #                   handedness/SN)
     - name: Resolve gripper-port CLI flag
       set_fact:
-        gripper_port_flag: "{{ '--gripper-iface' if gripper_type == 'sr_gripper' else '--robotiq-comport' }}"
+        gripper_port_flag: >-
+          {{ '' if gripper_type in ['vega_hand', 'wuji_hand_v1', 'wuji_hand_v2']
+             else '--gripper-iface' if gripper_type == 'sr_gripper'
+             else '--robotiq-comport' }}
+
+    # Only wuji hands take an SN; robotiq/sr/vega_hand get an empty string so
+    # the command line is unchanged for them.
+    - name: Resolve per-arm wuji SN flags
+      set_fact:
+        wuji_current_env: >-
+          {{ 'WUJI_LOG_CURRENT=1' if (gripper_type == 'wuji_hand_v2' and
+             (wuji_log_current | bool)) else '' }}
+        left_wuji_sn_flag: >-
+          {{ ('--wuji-sn ' ~ wuji_left_sn)
+             if (gripper_type in ['wuji_hand_v1', 'wuji_hand_v2'] and wuji_left_sn) else '' }}
+        right_wuji_sn_flag: >-
+          {{ ('--wuji-sn ' ~ wuji_right_sn)
+             if (gripper_type in ['wuji_hand_v1', 'wuji_hand_v2'] and wuji_right_sn) else '' }}
 
     - name: Start robot-server tmux session on dexmate (left + right arm)
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
         tmux new-session -d -s robot-server
-        tmux send-keys -t robot-server "conda activate robot && python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
+        tmux send-keys -t robot-server "conda activate robot && {{ wuji_current_env }} python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
             --arm-side left \
             --grpc-port 50061 \
             --gripper-type {{ gripper_type }} \
             {{ gripper_port_flag }} {{ left_gripper_port }} \
+            {{ left_wuji_sn_flag }} \
             --use-velocity-feedforward \
             --interpolation-method linear \
             --interpolation-history 3 \
@@ -142,11 +469,12 @@
             --vel-ratio 1.0" C-m
         sleep 0.5
         tmux split-window -v -t robot-server
-        tmux send-keys -t robot-server.1 "conda activate robot && python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
+        tmux send-keys -t robot-server.1 "conda activate robot && {{ wuji_current_env }} python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
             --arm-side right \
             --grpc-port 50063 \
             --gripper-type {{ gripper_type }} \
             {{ gripper_port_flag }} {{ right_gripper_port }} \
+            {{ right_wuji_sn_flag }} \
             --use-velocity-feedforward \
             --interpolation-method linear \
             --interpolation-history 3 \

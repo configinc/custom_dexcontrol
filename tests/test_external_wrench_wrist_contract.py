@@ -24,6 +24,10 @@ def _service() -> VegaRobotEnvService:
     service.robot_model = "vega_1"
     service.arm_side = "left"
     service.gripper_type = "robotiq"
+    service._robot = SimpleNamespace(
+        _hand_dof=lambda: 1,
+        hand=SimpleNamespace(),
+    )
     service.frame_type = "vega_mobile_base"
     service.control_hz = 20
     service.R_robot_to_world = None
