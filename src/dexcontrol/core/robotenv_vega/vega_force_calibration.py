@@ -522,6 +522,7 @@ class VegaForceCalibrationManager:
 
     def _restore_runtime_state(self) -> None:
         status = self.lifecycle.status()
+        result: dict[str, Any] = {"available": False}
         if status.state == "READY_TO_APPLY":
             self._owns_robot = self._claim_robot()
             if not self._owns_robot:
@@ -537,6 +538,8 @@ class VegaForceCalibrationManager:
                 parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
                 self.adapter.install_prepared(self.adapter.prepare_install(parameters))
         except BaseException:
+            if result.get("available") and result.get("run_id"):
+                self._runtime_install_pending_run_id = str(result["run_id"])
             self._release_if_owned()
             raise
 

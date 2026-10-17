@@ -161,6 +161,21 @@ def test_control_loop_stop_keeps_live_thread_handle_and_fails_closed():
     assert thread.join_calls == [2.0]
 
 
+@pytest.mark.parametrize("control_hz", [0, -20, 0.5, 20.5, float("nan"), False])
+def test_service_rejects_invalid_control_hz_before_robot_creation(
+    monkeypatch, control_hz
+):
+    robot_calls = []
+    monkeypatch.setattr(
+        server_module, "VegaRobot", lambda **kwargs: robot_calls.append(kwargs)
+    )
+
+    with pytest.raises(ValueError, match="control_hz must be a finite positive integer"):
+        VegaRobotEnvService(arm_side="left", control_hz=control_hz)
+
+    assert robot_calls == []
+
+
 def test_force_calibration_claim_rolls_back_if_control_loop_does_not_stop():
     service = _service()
     service._control_loop_stop = threading.Event()

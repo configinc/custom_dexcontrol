@@ -936,6 +936,22 @@ class ForceCalibrationLifecycle:
                 record = self._load_valid_active()
                 if record is None:
                     return {"available": False, "run_id": "", "message": "no valid applied calibration"}
+                marker = self._read_latest_start_marker()
+                commit_incomplete = self._state != "SUCCEEDED" and (
+                    (bool(self._run_id) and record["run_id"] == self._run_id)
+                    or (marker is not None and record["run_id"] == marker["run_id"])
+                )
+                if commit_incomplete:
+                    # active.json is the authoritative repair marker and is
+                    # intentionally written before history/terminal state. It
+                    # is not externally current until the commit transaction
+                    # reaches SUCCEEDED (and the manager can atomically install
+                    # the matching runtime applier under its publication lock).
+                    return {
+                        "available": False,
+                        "run_id": "",
+                        "message": "calibration commit is incomplete",
+                    }
                 return {"available": True, **record, "message": ""}
             if run_id == self._run_id and self._state not in {"SUCCEEDED"}:
                 return {"available": False, "run_id": run_id, "message": self._message}

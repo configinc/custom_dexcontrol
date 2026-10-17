@@ -691,6 +691,34 @@ def test_transient_partial_commit_is_repaired_with_matching_runtime(
     assert claim.owned is False
 
 
+def test_persistent_partial_commit_is_not_exposed_as_current(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+    manager.advance("run-1", 1, "stage-1")
+    ready = _wait_state(manager, "READY_TO_APPLY")
+    original_write = lifecycle_module._atomic_write_json
+
+    def fail_result_writes(path, value):
+        if path.parent.name == "results":
+            raise OSError("results storage unavailable")
+        return original_write(path, value)
+
+    monkeypatch.setattr(
+        lifecycle_module, "_atomic_write_json", fail_result_writes
+    )
+    with pytest.raises(OSError, match="results storage unavailable"):
+        manager.commit("run-1", ready.plan_sha256)
+
+    assert manager.lifecycle.status().state == "READY_TO_APPLY"
+    assert manager.result("")["available"] is False
+    assert adapter.installed == []
+    assert claim.owned is True
+
+
 def test_partial_commit_retry_rejects_wrong_plan_before_repair(
     tmp_path: Path, monkeypatch
 ) -> None:

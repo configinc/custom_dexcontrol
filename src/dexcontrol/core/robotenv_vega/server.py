@@ -174,7 +174,19 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self.arm_side = arm_side
         self.gripper_type = gripper_type
         self.frame_type = frame_type
-        self.control_hz = int(control_hz)
+        try:
+            normalized_control_hz = int(control_hz)
+            finite_control_hz = np.isfinite(float(control_hz))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("control_hz must be a finite positive integer") from exc
+        if (
+            isinstance(control_hz, bool)
+            or not finite_control_hz
+            or normalized_control_hz <= 0
+            or float(control_hz) != normalized_control_hz
+        ):
+            raise ValueError("control_hz must be a finite positive integer")
+        self.control_hz = normalized_control_hz
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
         self.base_frame_rotation = base_frame_rotation
         self.external_wrench_sensor_to_wrist_yaw_degrees = (
