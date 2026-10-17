@@ -43,6 +43,7 @@ PERSISTED_RECORD_ERRORS = (
     TypeError,
     KeyError,
     ArithmeticError,
+    RecursionError,
     json.JSONDecodeError,
 )
 

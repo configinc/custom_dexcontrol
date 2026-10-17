@@ -182,6 +182,8 @@ def test_same_run_start_retry_reclaims_robot_and_rearms_deadline(
         manager.start("run-1", True)
     assert manager.lifecycle.status().state == "READY_FOR_STAGE"
     assert claim.owned is False
+    with pytest.raises(LifecycleError, match="not owned"):
+        manager.advance("run-1", 0, "stage-0")
 
     retry = manager.start("run-1", True)
 
@@ -190,6 +192,25 @@ def test_same_run_start_retry_reclaims_robot_and_rearms_deadline(
     assert manager._deadline_timer is not None
     manager.request_cancel("run-1")
     _wait_state(manager, "CANCELLED")
+
+
+def test_same_run_start_retry_rolls_back_claim_when_timer_still_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _, claim = _manager(tmp_path)
+
+    def fail_timer_start(_timer):
+        raise RuntimeError("timer thread unavailable")
+
+    monkeypatch.setattr(manager_module.threading.Timer, "start", fail_timer_start)
+    with pytest.raises(RuntimeError, match="timer thread unavailable"):
+        manager.start("run-1", True)
+    with pytest.raises(RuntimeError, match="timer thread unavailable"):
+        manager.start("run-1", True)
+
+    assert manager.lifecycle.status().state == "READY_FOR_STAGE"
+    assert claim.owned is False
+    assert claim.claims == claim.releases == 2
 
 
 def test_new_run_rejection_does_not_flap_robot_claim(tmp_path: Path) -> None:
@@ -269,6 +290,29 @@ def test_commit_retry_is_idempotent(tmp_path: Path, monkeypatch) -> None:
     assert claim.releases == 1
     with pytest.raises(LifecycleError, match="stale Commit request"):
         manager.commit("run-1", "wrong-plan")
+
+
+def test_stale_cancel_does_not_reinstall_an_old_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, adapter, _ = _manager(tmp_path)
+    monkeypatch.setattr(
+        manager_module, "wrist_ft_calibration_from_snapshot", lambda value: value
+    )
+    for run_id in ("run-a", "run-b"):
+        manager.start(run_id, True)
+        manager.advance(run_id, 0, "stage-0")
+        _wait_state(manager, "READY_FOR_STAGE")
+        manager.advance(run_id, 1, "stage-1")
+        ready = _wait_state(manager, "READY_TO_APPLY")
+        manager.commit(run_id, ready.plan_sha256)
+    install_count = len(adapter.installed)
+
+    with pytest.raises(LifecycleError, match="unknown calibration run_id"):
+        manager.request_cancel("run-a")
+
+    assert len(adapter.installed) == install_count
+    assert manager.lifecycle.status().run_id == "run-b"
 
 
 def test_commit_validates_runtime_candidate_before_durable_success(tmp_path: Path) -> None:
@@ -489,6 +533,109 @@ def test_cancel_terminal_write_error_retries_without_second_safe_return(
     assert claim.owned is False
 
 
+def test_terminal_retry_timer_start_failure_is_retryable_from_status(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+
+    def fail_fit(_holds):
+        raise RuntimeError("fit failed")
+
+    adapter.fit = fail_fit
+    original_write = lifecycle_module._atomic_write_json
+    write_failed = False
+
+    def fail_terminal_once(path, value):
+        nonlocal write_failed
+        if path == manager.lifecycle.terminal_state_path and not write_failed:
+            write_failed = True
+            raise OSError("terminal write failed")
+        return original_write(path, value)
+
+    original_timer_start = manager_module.threading.Timer.start
+    timer_failed = False
+
+    def fail_retry_timer_once(timer):
+        nonlocal timer_failed
+        if not timer_failed:
+            timer_failed = True
+            raise RuntimeError("timer thread unavailable")
+        return original_timer_start(timer)
+
+    monkeypatch.setattr(lifecycle_module, "_atomic_write_json", fail_terminal_once)
+    monkeypatch.setattr(manager_module, "TERMINAL_PERSIST_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(
+        manager_module.threading.Timer, "start", fail_retry_timer_once
+    )
+    manager.advance("run-1", 1, "stage-1")
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and manager.lifecycle.status().state != "FAILED":
+        manager.status()
+        time.sleep(0.005)
+    assert manager.lifecycle.status().state == "FAILED"
+    assert manager._terminal_retry_timer is None
+    assert claim.owned is False
+
+
+def test_stage_failure_message_is_normalized_before_terminal_persistence(
+    tmp_path: Path
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+
+    def fail_fit(_holds):
+        raise RuntimeError("fit failed\n")
+
+    adapter.fit = fail_fit
+    manager.advance("run-1", 1, "stage-1")
+    status = _wait_state(manager, "FAILED")
+    assert status.message == "fit failed"
+    assert claim.owned is False
+
+
+def test_same_run_start_does_not_reclaim_pending_terminal_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+
+    def fail_fit(_holds):
+        raise RuntimeError("fit failed")
+
+    adapter.fit = fail_fit
+    monkeypatch.setattr(manager_module, "TERMINAL_PERSIST_RETRY_SECONDS", 60.0)
+
+    original_write = lifecycle_module._atomic_write_json
+
+    def fail_terminal(path, value):
+        if path == manager.lifecycle.terminal_state_path:
+            raise OSError("terminal write failed")
+        return original_write(path, value)
+
+    monkeypatch.setattr(lifecycle_module, "_atomic_write_json", fail_terminal)
+    manager.advance("run-1", 1, "stage-1")
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and claim.owned:
+        time.sleep(0.005)
+    claims = claim.claims
+
+    status = manager.start("run-1", True)
+
+    assert status.state == "FITTING"
+    assert claim.owned is False
+    assert claim.claims == claims
+    if manager._terminal_retry_timer is not None:
+        manager._terminal_retry_timer.cancel()
+
+
 def test_cancel_stops_worker_returns_safe_and_releases(tmp_path: Path) -> None:
     manager, adapter, claim = _manager(tmp_path)
     adapter.block = True
@@ -533,6 +680,16 @@ def test_cancel_reports_failed_when_measured_safe_return_fails(tmp_path: Path) -
     manager.request_cancel("run-1")
     status = _wait_state(manager, "FAILED")
     assert "safe return failed" in status.message
+    assert claim.owned is False
+
+
+def test_cancel_empty_safe_return_error_is_normalized(tmp_path: Path) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    adapter.safe_return_error = RuntimeError("")
+    manager.start("run-1", True)
+    manager.request_cancel("run-1")
+    status = _wait_state(manager, "FAILED")
+    assert status.message.endswith("RuntimeError")
     assert claim.owned is False
 
 

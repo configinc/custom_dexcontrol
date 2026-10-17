@@ -444,7 +444,13 @@ class VegaForceCalibrationManager:
         )
         timer.daemon = True
         self._terminal_retry_timer = timer
-        timer.start()
+        try:
+            timer.start()
+        except BaseException:
+            self._terminal_retry_timer = None
+            LOGGER.exception(
+                "Vega force calibration terminal retry timer could not start"
+            )
 
     def _clear_terminal_retry_locked(self) -> None:
         if self._terminal_retry_timer is not None:
@@ -547,20 +553,35 @@ class VegaForceCalibrationManager:
                     self._install_committed_result(run_id)
                     self._release_if_owned()
                 elif (
+                    self._pending_terminal is not None
+                    and self._pending_terminal[0] == run_id
+                ):
+                    self._schedule_terminal_retry_locked()
+                    return status
+                elif (
                     status.state in ROBOT_OWNING_CALIBRATION_STATES
                     and not self._owns_robot
                 ):
-                    if not self._claim_robot():
-                        raise LifecycleError(
-                            "FAILED_PRECONDITION", "robot command path is busy"
-                        )
-                    self._owns_robot = True
-                    if (
-                        status.state == "READY_FOR_STAGE"
-                        and status.completed_stages == 0
-                    ):
-                        self.adapter.begin_run()
-                if status.state == "READY_FOR_STAGE":
+                    acquired = False
+                    try:
+                        if not self._claim_robot():
+                            raise LifecycleError(
+                                "FAILED_PRECONDITION", "robot command path is busy"
+                            )
+                        self._owns_robot = True
+                        acquired = True
+                        if (
+                            status.state == "READY_FOR_STAGE"
+                            and status.completed_stages == 0
+                        ):
+                            self.adapter.begin_run()
+                        if status.state == "READY_FOR_STAGE":
+                            self._schedule_deadline_locked(status)
+                    except BaseException:
+                        if acquired:
+                            self._release_if_owned()
+                        raise
+                elif status.state == "READY_FOR_STAGE":
                     self._schedule_deadline_locked(status)
                 return status
             if current.state in ACTIVE_CALIBRATION_STATES:
@@ -600,6 +621,10 @@ class VegaForceCalibrationManager:
 
     def advance(self, run_id: str, stage_index: int, stage_id: str) -> CalibrationStatusSnapshot:
         with self._lock:
+            if not self._owns_robot:
+                raise LifecycleError(
+                    "FAILED_PRECONDITION", "robot command path is not owned"
+                )
             status, payload = self.lifecycle.advance(run_id, stage_index, stage_id)
             if payload is None:
                 return status
@@ -667,9 +692,10 @@ class VegaForceCalibrationManager:
             except BaseException as return_exc:
                 exc = RuntimeError(f"{exc}; safe return failed: {return_exc}")
             with self._lock:
+                failure_message = str(exc).strip() or type(exc).__name__
                 self._pending_terminal = (
                     run_id,
-                    str(exc) or type(exc).__name__,
+                    failure_message,
                 )
                 self._persist_pending_terminal_locked()
         finally:
@@ -690,7 +716,8 @@ class VegaForceCalibrationManager:
         try:
             self.adapter.safe_return()
         except BaseException as exc:
-            message = f"force calibration cancelled; safe return failed: {exc}"
+            detail = str(exc).strip() or type(exc).__name__
+            message = f"force calibration cancelled; safe return failed: {detail}"
             return_failed = True
         with self._lock:
             self._pending_terminal = (
@@ -705,9 +732,12 @@ class VegaForceCalibrationManager:
                 status = self.lifecycle.request_cancel(run_id)
             except BaseException:
                 status = self.lifecycle.status()
-                if status.state in {"CANCELLED", "FAILED", "SUCCEEDED"}:
+                if (
+                    run_id == status.run_id
+                    and status.state in {"CANCELLED", "FAILED", "SUCCEEDED"}
+                ):
                     if status.state == "SUCCEEDED":
-                        self._install_committed_result(run_id)
+                        self._install_committed_result(status.run_id)
                     self._release_if_owned()
                     return status
                 raise
@@ -787,6 +817,8 @@ class VegaForceCalibrationManager:
                 self._release_if_owned()
             elif status.state in {"CANCELLED", "FAILED"}:
                 self._release_if_owned()
+            if self._pending_terminal is not None:
+                self._schedule_terminal_retry_locked()
             return status
 
     def result(self, run_id: str = "") -> dict[str, Any]:
@@ -797,6 +829,8 @@ class VegaForceCalibrationManager:
                 self._release_if_owned()
             elif status.state in {"CANCELLED", "FAILED"}:
                 self._release_if_owned()
+            if self._pending_terminal is not None:
+                self._schedule_terminal_retry_locked()
             return self.lifecycle.get_result(run_id)
 
 
