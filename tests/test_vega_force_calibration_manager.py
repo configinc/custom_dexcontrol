@@ -108,9 +108,10 @@ class FakeAdapter:
     def install_prepared(self, prepared):
         self.installed.append(prepared)
 
-    def commit_install(self, prepared, commit):
+    def commit_install(self, prepared, commit, install_if):
         status = commit()
-        self.install_prepared(prepared)
+        if install_if():
+            self.install_prepared(prepared)
         return status
 
 
@@ -318,6 +319,49 @@ def test_commit_applies_candidate_and_releases_robot(tmp_path: Path) -> None:
     assert len(adapter.installed) == 1
     assert claim.owned is False
     assert claim.releases == 1
+
+
+@pytest.mark.parametrize("install_current", [False, True])
+def test_adapter_commit_holds_publication_lock_through_durable_commit(
+    install_current: bool,
+) -> None:
+    class Service:
+        _force_calibration_applier_lock = threading.Lock()
+        _force_calibration_applier = "old"
+
+    service = Service()
+    adapter = VegaRobotCalibrationAdapter(
+        service=service,
+        gripper_mass_kg=1.0,
+        gripper_com_sensor_m=np.zeros(3),
+    )
+    order = []
+    status = object()
+
+    def lock_is_held() -> bool:
+        acquired = service._force_calibration_applier_lock.acquire(blocking=False)
+        if acquired:
+            service._force_calibration_applier_lock.release()
+        return not acquired
+
+    def commit():
+        assert lock_is_held()
+        assert service._force_calibration_applier == "old"
+        order.append("durable")
+        return status
+
+    def install_if():
+        assert lock_is_held()
+        order.append("validity")
+        return install_current
+
+    returned = adapter.commit_install("new", commit, install_if)
+
+    assert returned is status
+    assert order == ["durable", "validity"]
+    assert service._force_calibration_applier == (
+        "new" if install_current else "old"
+    )
 
 
 def test_commit_retry_is_idempotent(tmp_path: Path, monkeypatch) -> None:
@@ -696,11 +740,13 @@ def test_commit_retry_restores_runtime_after_post_commit_cleanup_failure(
     def install(prepared):
         runtime["value"] = prepared
 
-    def commit_install(prepared, commit):
+    def commit_install(prepared, commit, install_if):
         previous = runtime["value"]
-        install(prepared)
         try:
-            return commit()
+            status = commit()
+            if install_if():
+                install(prepared)
+            return status
         except BaseException:
             install(previous)
             raise

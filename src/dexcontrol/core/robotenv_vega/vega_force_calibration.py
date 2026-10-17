@@ -80,7 +80,10 @@ class CalibrationAdapter(Protocol):
     def install_prepared(self, prepared: Any) -> None: ...
 
     def commit_install(
-        self, prepared: Any, commit: Callable[[], CalibrationStatusSnapshot]
+        self,
+        prepared: Any,
+        commit: Callable[[], CalibrationStatusSnapshot],
+        install_if: Callable[[], bool],
     ) -> CalibrationStatusSnapshot: ...
 
 
@@ -393,16 +396,14 @@ class VegaRobotCalibrationAdapter:
         self,
         prepared: WristFtCalibrationApplier | None,
         commit: Callable[[], CalibrationStatusSnapshot],
+        install_if: Callable[[], bool],
     ) -> CalibrationStatusSnapshot:
         """Publish runtime state and durable success as one observable transition."""
         with self.service._force_calibration_applier_lock:
-            previous = self.service._force_calibration_applier
-            self.service._force_calibration_applier = prepared
-            try:
-                return commit()
-            except BaseException:
-                self.service._force_calibration_applier = previous
-                raise
+            status = commit()
+            if install_if():
+                self.service._force_calibration_applier = prepared
+            return status
 
 
 class VegaForceCalibrationManager:
@@ -814,19 +815,9 @@ class VegaForceCalibrationManager:
         self._runtime_install_pending_run_id = None
         return True
 
-    def _install_prepared_if_current(self, run_id: str, prepared: Any) -> bool:
+    def _current_result_matches(self, run_id: str) -> bool:
         result = self.lifecycle.get_result("")
-        if not result.get("available") or result.get("run_id") != run_id:
-            if self._runtime_install_pending_run_id == run_id:
-                self._runtime_install_pending_run_id = None
-            return False
-        try:
-            self.adapter.install_prepared(prepared)
-        except BaseException:
-            self._runtime_install_pending_run_id = run_id
-            raise
-        self._runtime_install_pending_run_id = None
-        return True
+        return bool(result.get("available") and result.get("run_id") == run_id)
 
     def _install_current_result_and_release(self, run_id: str) -> bool:
         try:
@@ -855,16 +846,29 @@ class VegaForceCalibrationManager:
             ):
                 parameters = wrist_ft_calibration_from_snapshot(record["parameters"])
             prepared = self.adapter.prepare_install(parameters)
+
+            def commit_or_repair() -> CalibrationStatusSnapshot:
+                try:
+                    return self.lifecycle.commit(run_id, plan_sha256)
+                except BaseException:
+                    repaired = self.lifecycle.repair_partial_commit(run_id)
+                    if repaired is None:
+                        raise
+                    return repaired
+
             try:
-                status = self.lifecycle.commit(run_id, plan_sha256)
+                status = self.adapter.commit_install(
+                    prepared,
+                    commit_or_repair,
+                    lambda: self._current_result_matches(run_id),
+                )
             except BaseException:
-                repaired = self.lifecycle.repair_partial_commit(run_id)
-                if repaired is None:
-                    raise
-                status = repaired
-            try:
-                self._install_prepared_if_current(run_id, prepared)
-            finally:
+                if self.lifecycle.status().state == "SUCCEEDED":
+                    self._runtime_install_pending_run_id = run_id
+                    self._release_if_owned()
+                raise
+            else:
+                self._runtime_install_pending_run_id = None
                 self._release_if_owned()
             return status
 
