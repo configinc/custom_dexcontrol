@@ -38,6 +38,9 @@ from dexcontrol.core.wuji_hand import (  # noqa: E402
     _wait_for_worker_exit_during_constructor_rollback,
 )
 
+robotiq_module = sys.modules[RobotiqGripper.__module__]
+sr_module = sys.modules[SrGripperAdapter.__module__]
+
 
 class _StuckWorker:
     def __init__(self):
@@ -310,3 +313,35 @@ def test_wuji_wrong_side_candidate_uses_retryable_cleanup(monkeypatch):
         adapter._connect(sn=None, init_timeout=0.0)
 
     assert cleanup_calls == [(hand, manager)]
+
+
+@pytest.mark.parametrize(
+    ("module", "driver_name", "adapter", "kwargs"),
+    [
+        (robotiq_module, "Robotiq2FingerGripper", RobotiqGripper, {}),
+        (sr_module, "SrGripper", SrGripperAdapter, {}),
+    ],
+)
+def test_gripper_constructor_failure_retains_driver_for_cleanup(
+    monkeypatch, module, driver_name, adapter, kwargs
+):
+    instances = []
+
+    class Driver:
+        def __init__(self, **_driver_kwargs):
+            self.shutdown_calls = 0
+            instances.append(self)
+
+        def full_init(self, **_init_kwargs):
+            raise RuntimeError("full init failed")
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    monkeypatch.setattr(module, driver_name, Driver)
+
+    with pytest.raises(RuntimeError, match="full init failed"):
+        adapter(**kwargs)
+
+    assert len(instances) == 1
+    assert instances[0].shutdown_calls == 1

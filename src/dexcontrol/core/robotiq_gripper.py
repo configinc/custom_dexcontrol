@@ -88,25 +88,44 @@ class RobotiqGripper:
             init_timeout: Seconds to wait for the gripper to become ready.
         """
         logger.info("Connecting to Robotiq 2F-85 on {} ...", comport)
-        self._gripper = Robotiq2FingerGripper(comport=comport)
-        self._gripper.full_init(timeout=init_timeout)
-
-        # Locks
         self._gripper_io_lock = threading.Lock()
         self._state_lock = threading.Lock()
-
-        # Cached state (updated by worker thread only — measured, never commanded)
-        self._cached_pos = self._gripper.get_pos()
-
-        # Worker thread
         self._command_queue: Queue[tuple[float, float, float]] = Queue(maxsize=1)
         self._stop_event = threading.Event()
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            name="robotiq-gripper-worker",
-            daemon=True,
-        )
-        self._worker.start()
+        self._worker = threading.Thread()
+        self._gripper = None
+        try:
+            # Retain the driver object even if its __init__ raises after opening
+            # the serial device, so rollback still has a cleanup handle.
+            driver = Robotiq2FingerGripper.__new__(Robotiq2FingerGripper)
+            self._gripper = driver
+            driver.__init__(comport=comport)
+            driver.full_init(timeout=init_timeout)
+            self._cached_pos = driver.get_pos()
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name="robotiq-gripper-worker",
+                daemon=True,
+            )
+            self._worker.start()
+        except BaseException:
+            while True:
+                try:
+                    self._stop_event.set()
+                    if self._worker.is_alive():
+                        self._worker.join(timeout=2.0)
+                        if self._worker.is_alive():
+                            raise RuntimeError("Robotiq worker did not stop")
+                    if self._gripper is not None:
+                        self._gripper.shutdown()
+                    break
+                except BaseException as cleanup_exc:
+                    logger.error(
+                        "Robotiq constructor cleanup is not yet safe; retrying: {}",
+                        cleanup_exc,
+                    )
+                    time.sleep(0.1)
+            raise
 
         logger.info("Robotiq 2F-85 ready (async worker started).")
 

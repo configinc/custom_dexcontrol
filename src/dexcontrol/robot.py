@@ -208,7 +208,7 @@ class Robot(RobotQueryInterface):
                 while not self._shutdown_called:
                     try:
                         self.shutdown()
-                    except Exception as cleanup_exc:  # pylint: disable=broad-except
+                    except BaseException as cleanup_exc:  # pylint: disable=broad-except
                         logger.error(
                             "Robot constructor cleanup is not yet safe; retrying: {}",
                             cleanup_exc,
@@ -396,15 +396,18 @@ class Robot(RobotQueryInterface):
                 continue
 
             component_class = component_mapping[config_cls]
-            component_instance = component_class(
+            # Publish the instance before __init__: real component constructors
+            # acquire base subscribers first and may fail while adding later
+            # wrench/temperature/pass-through transports. The outer Robot
+            # rollback must retain a handle even in that partial state.
+            component_instance = component_class.__new__(component_class)
+            self._components.append(component_instance)
+            component_class.__init__(
+                component_instance,
                 name=component_name,
                 robot_info=self._robot_info,
             )
             component_instances[component_name] = component_instance
-            # Publish ownership immediately. If a later component constructor
-            # fails, Robot.__init__ rollback can still stop/shut down every
-            # already-created subscriber/transport.
-            self._components.append(component_instance)
 
         # Phase 2: Wait for all components to receive first state update
         for component_name, component_instance in component_instances.items():

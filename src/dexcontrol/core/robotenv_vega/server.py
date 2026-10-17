@@ -1925,6 +1925,9 @@ def serve(
     logging.getLogger().addHandler(_file_handler)
 
     managed_signals = {signal.SIGINT, signal.SIGTERM}
+    previous_signal_handlers = {
+        signum: signal.getsignal(signum) for signum in managed_signals
+    }
     previous_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, managed_signals)
     signals_unblocked = False
     try:
@@ -2001,9 +2004,11 @@ def serve(
                 )
                 return
             LOGGER.info("Shutting down Vega RobotEnv server")
-            server.stop(grace=0)
-            _shutdown_service_until_safe(service)
-            service_shutdown_completed = True
+            try:
+                server.stop(grace=0)
+            finally:
+                _shutdown_service_until_safe(service)
+                service_shutdown_completed = True
             raise SystemExit(0)
 
         signal.signal(signal.SIGINT, shutdown_handler)
@@ -2014,12 +2019,22 @@ def serve(
         signals_unblocked = True
         server.wait_for_termination()
     finally:
-        if not signals_unblocked:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
-        if server is not None:
-            server.stop(grace=0)
-        if not service_shutdown_completed:
-            _shutdown_service_until_safe(service)
+        try:
+            if server is not None:
+                server.stop(grace=0)
+        finally:
+            try:
+                if not service_shutdown_completed:
+                    _shutdown_service_until_safe(service)
+            finally:
+                for signum, previous_handler in previous_signal_handlers.items():
+                    signal.signal(signum, previous_handler)
+                if not signals_unblocked:
+                    # Keep pending termination signals blocked until physical
+                    # cleanup is complete; only then restore caller state.
+                    signal.pthread_sigmask(
+                        signal.SIG_SETMASK, previous_signal_mask
+                    )
 
 
 def main() -> None:

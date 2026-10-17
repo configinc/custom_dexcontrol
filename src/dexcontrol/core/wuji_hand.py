@@ -590,10 +590,16 @@ class WujiHandAdapter:
             if sn is not None:
                 match = [d for d in devices if d.sn == sn]
                 if match:
-                    return self._manager.connect(
-                        sn=sn, device_name=f"wuji_hand_{self._handedness}",
-                        **self._connect_kwargs(),
-                    )
+                    try:
+                        return self._manager.connect(
+                            sn=sn, device_name=f"wuji_hand_{self._handedness}",
+                            **self._connect_kwargs(),
+                        )
+                    except BaseException:
+                        _retry_constructor_cleanup_until_safe(
+                            self._manager.disconnect_all
+                        )
+                        raise
                 if (sn_from_map and devices
                         and time.monotonic() >= map_grace_deadline):
                     logger.warning(
@@ -637,7 +643,12 @@ class WujiHandAdapter:
                             sn=dev.sn, device_name=f"wuji_hand_{self._handedness}",
                             **self._connect_kwargs(),
                         )
-                    except Exception as e:
+                    except BaseException as e:
+                        _retry_constructor_cleanup_until_safe(
+                            self._manager.disconnect_all
+                        )
+                        if not isinstance(e, Exception):
+                            raise
                         # Auto-selection has to open a hand to ask which side it
                         # is, so with both arm servers starting at once each can
                         # be probing the other's hand when it claims the USB
@@ -657,13 +668,15 @@ class WujiHandAdapter:
                         reported = getattr(
                             hand, "handedness_name", lambda: None
                         )()
-                    except Exception as exc:
+                    except BaseException as exc:
                         # Connection succeeded, so a verification failure must
                         # release the candidate before probing another one or
                         # propagating the startup failure.
                         _cleanup_connected_hand_until_safe(
                             hand, self._manager
                         )
+                        if not isinstance(exc, Exception):
+                            raise
                         logger.warning(
                             "Wuji hand sn={} could not report handedness while "
                             "looking for the {} hand ({}); retrying.",

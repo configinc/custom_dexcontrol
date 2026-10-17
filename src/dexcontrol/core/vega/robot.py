@@ -141,7 +141,7 @@ class VegaRobot:
                 try:
                     shutdown()
                     break
-                except Exception as exc:  # pylint: disable=broad-except
+                except BaseException as exc:  # pylint: disable=broad-except
                     _logger.error(
                         "Vega constructor cleanup for %s is not yet safe; "
                         "retrying: %s",

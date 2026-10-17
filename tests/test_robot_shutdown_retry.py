@@ -260,14 +260,18 @@ def test_partial_component_creation_is_immediately_owned_for_rollback(monkeypatc
     class Config:
         enabled = True
 
-    first = _Component()
-
     class ComponentClass:
-        def __new__(cls, *, name, robot_info):
+        def __init__(self, *, name, robot_info):
             del robot_info
+            self.name = name
             if name == "second":
                 raise RuntimeError("second failed")
-            return first
+
+        def stop(self):
+            return None
+
+        def shutdown(self):
+            return None
 
     robot = Robot.__new__(Robot)
     robot._shutdown_called = True
@@ -284,7 +288,7 @@ def test_partial_component_creation_is_immediately_owned_for_rollback(monkeypatc
     with pytest.raises(RuntimeError, match="second failed"):
         robot._initialize_robot_components()
 
-    assert robot._components == [first]
+    assert [component.name for component in robot._components] == ["first", "second"]
 
 
 def test_sensor_constructor_retries_partial_cleanup_before_raising(monkeypatch):
@@ -314,6 +318,33 @@ def test_sensor_constructor_retries_partial_cleanup_before_raising(monkeypatch):
         Sensors({"first": object(), "second": object()})
 
     assert calls == ["shutdown", "shutdown"]
+
+
+def test_sensor_start_failure_cleans_the_not_yet_published_sensor(monkeypatch):
+    class Config:
+        enabled = True
+
+    class Sensor:
+        instance = None
+
+        def __init__(self, **_kwargs):
+            self.shutdown_calls = 0
+            Sensor.instance = self
+
+        def start(self):
+            raise RuntimeError("start failed")
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    monkeypatch.setattr(
+        "dexcontrol.core.config.get_sensor_mapping", lambda: {Config: Sensor}
+    )
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        Sensors({"sensor": Config()})
+
+    assert Sensor.instance.shutdown_calls == 1
 
 
 def test_concurrent_robot_shutdown_runs_component_teardown_once():

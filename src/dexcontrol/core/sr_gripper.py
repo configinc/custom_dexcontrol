@@ -177,33 +177,47 @@ class SrGripperAdapter:
     def _bringup(self, calibrate: bool) -> None:
         """Open EtherCAT, run full_init, start worker. Shared by __init__ and reconnect()."""
         logger.info("Connecting to SR gripper on {} ...", self._comport)
-        self._gripper = SrGripper(comport=self._comport, stroke=_STROKE_M)
-        self._gripper.full_init(timeout=self._init_timeout, calibrate=calibrate)
+        try:
+            driver = SrGripper.__new__(SrGripper)
+            self._gripper = driver
+            driver.__init__(comport=self._comport, stroke=_STROKE_M)
+            driver.full_init(timeout=self._init_timeout, calibrate=calibrate)
 
-        # Cached state in driver native frame (0 = open, stroke = closed).
-        self._cached_pos = float(self._gripper.get_pos())
+            # Cached state in driver native frame (0 = open, stroke = closed).
+            self._cached_pos = float(driver.get_pos())
 
-        # Slew limit tracker — last target we *issued* to the firmware
-        # (clipped if needed). The caller's requested target may be further
-        # away; subsequent set_joint_pos calls continue converging at
-        # SLEW_PER_CALL_M per tick.
-        self._last_slew_target: float | None = None
-        # Adapter-level dedup + worker re-stream source. Mirrors upstream
-        # SrGripper.sendCommand()'s dedup guard but adds a periodic
-        # force-resend floor (_FORCE_RESEND_PERIOD_S) to keep the SR
-        # firmware's application state machine alive on long holds. The
-        # worker re-streams this packet from `_resend_active`; the dedup
-        # window prevents the 50 Hz cycling that wedges the firmware.
-        self._last_sent_packet: bytes = b""
-        self._last_send_t: float = 0.0
+            # Slew limit tracker — last target we issued to the firmware.
+            self._last_slew_target: float | None = None
+            # Adapter-level dedup + worker re-stream source.
+            self._last_sent_packet: bytes = b""
+            self._last_send_t: float = 0.0
 
-        self._stop_event = threading.Event()
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            name="sr-gripper-worker",
-            daemon=True,
-        )
-        self._worker.start()
+            self._stop_event = threading.Event()
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name="sr-gripper-worker",
+                daemon=True,
+            )
+            self._worker.start()
+        except BaseException:
+            while True:
+                try:
+                    self._stop_event.set()
+                    worker = self._worker
+                    if worker is not None and worker.is_alive():
+                        worker.join(timeout=2.0)
+                        if worker.is_alive():
+                            raise RuntimeError("SR gripper worker did not stop")
+                    if self._gripper is not None:
+                        self._gripper.shutdown()
+                    break
+                except BaseException as cleanup_exc:
+                    logger.error(
+                        "SR constructor cleanup is not yet safe; retrying: {}",
+                        cleanup_exc,
+                    )
+                    time.sleep(0.1)
+            raise
 
         logger.info("SR gripper ready (async worker started).")
 

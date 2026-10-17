@@ -77,7 +77,7 @@ class Sensors:
                 try:
                     self.shutdown()
                     break
-                except Exception as exc:  # pylint: disable=broad-except
+                except BaseException as exc:  # pylint: disable=broad-except
                     logger.error(
                         "Sensor constructor cleanup is not yet safe; retrying: {}",
                         exc,
@@ -148,8 +148,23 @@ class Sensors:
         sensor_class = sensor_mapping[type(config)]
         sensor = sensor_class(name=name, configs=config)
 
-        if hasattr(sensor, "start"):
-            sensor.start()
+        try:
+            if hasattr(sensor, "start"):
+                sensor.start()
+        except BaseException:
+            shutdown = getattr(sensor, "shutdown", None)
+            if callable(shutdown):
+                while True:
+                    try:
+                        shutdown()
+                        break
+                    except BaseException as cleanup_exc:
+                        logger.error(
+                            "Sensor start rollback is not yet safe; retrying: {}",
+                            cleanup_exc,
+                        )
+                        time.sleep(0.1)
+            raise
 
         return sensor
 
