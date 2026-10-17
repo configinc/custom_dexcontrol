@@ -29,7 +29,10 @@ sys.modules.setdefault("wuji_sdk", wuji_sdk)
 
 from dexcontrol.core.robotiq_gripper import RobotiqGripper  # noqa: E402
 from dexcontrol.core.sr_gripper import SrGripperAdapter  # noqa: E402
-from dexcontrol.core.wuji_hand import WujiHandAdapter  # noqa: E402
+from dexcontrol.core.wuji_hand import (  # noqa: E402
+    WujiHandAdapter,
+    _wait_for_worker_exit_during_constructor_rollback,
+)
 
 
 class _StuckWorker:
@@ -46,6 +49,20 @@ class _StuckWorker:
 class _StoppedWorker:
     def is_alive(self):
         return False
+
+
+class _EventuallyStoppedWorker:
+    def __init__(self):
+        self.join_calls = []
+        self.alive = True
+
+    def is_alive(self):
+        return self.alive
+
+    def join(self, timeout=None):
+        self.join_calls.append(timeout)
+        if len(self.join_calls) == 2:
+            self.alive = False
 
 
 class _Device:
@@ -166,3 +183,16 @@ def test_wuji_shutdown_propagates_disable_failure_and_retries():
 
     adapter.shutdown()
     assert calls == ["disable", "disable", "disconnect"]
+
+
+def test_wuji_constructor_rollback_waits_until_worker_really_exits():
+    worker = _EventuallyStoppedWorker()
+    stop_event = threading.Event()
+
+    _wait_for_worker_exit_during_constructor_rollback(
+        worker, stop_event, join_timeout_s=0.01
+    )
+
+    assert stop_event.is_set()
+    assert worker.join_calls == [0.01, 0.01]
+    assert worker.is_alive() is False

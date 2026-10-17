@@ -89,6 +89,22 @@ try:
 except ImportError:  # pragma: no cover - older SDK
     _WujiException = Exception
 
+
+def _wait_for_worker_exit_during_constructor_rollback(
+    worker: threading.Thread,
+    stop_event: threading.Event,
+    *,
+    join_timeout_s: float = 2.0,
+) -> None:
+    """Keep the constructing process alive until SDK I/O has really stopped."""
+    stop_event.set()
+    while worker.is_alive():
+        worker.join(timeout=join_timeout_s)
+        if worker.is_alive():
+            logger.error(
+                "Wuji constructor rollback is waiting for its I/O worker to stop"
+            )
+
 # Runtime reconnect policy (worker thread). After the link watchdog declares
 # the hand dead, wait _RECONNECT_AFTER_S for a plain stream hiccup to clear,
 # then rebuild the SDK session every _RECONNECT_INTERVAL_S until frames flow
@@ -439,20 +455,18 @@ class WujiHandAdapter:
             # the native SDK.
             self._connected = False
             _stop = getattr(self, "_stop_event", None)
-            if _stop is not None:
-                _stop.set()
             _worker = getattr(self, "_worker", None)
-            if _worker is not None and _worker.is_alive():
-                _worker.join(timeout=2.0)
-            self._teardown_channels()
-            try:
-                self._hand.disable()
-            except Exception:
-                pass
-            try:
-                self._manager.disconnect_all()
-            except Exception:
-                pass
+            if _stop is not None and _worker is not None:
+                _wait_for_worker_exit_during_constructor_rollback(_worker, _stop)
+            elif _worker is None:
+                # Normalize a pre-worker construction failure so strict
+                # shutdown can safely execute the same cleanup path.
+                self._command_queue = Queue(maxsize=1)
+                self._worker = threading.Thread()
+            # Use the same strict, retry-aware cleanup contract as normal
+            # shutdown.  If cleanup itself fails, its exception retains the
+            # original constructor failure as context.
+            self.shutdown()
             raise
 
         logger.info(

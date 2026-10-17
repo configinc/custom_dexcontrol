@@ -66,6 +66,7 @@ class RobotQueryInterface:
         # Register as a top-level owner of the shared Node so it is only torn
         # down once every owner releases it. Balanced in _release_shared_node().
         self._node_released = False
+        self._node_owner_released = False
         self._node = acquire_shared_node()
         self._hand_querier = self._node.create_service_client(
             service_name=configs.querables["hand_info"],
@@ -135,10 +136,17 @@ class RobotQueryInterface:
         """
         if getattr(self, "_node_released", False):
             return
-        self._node_released = True
         from dexcontrol.core.shared_node import shutdown_shared_node
-
-        shutdown_shared_node()
+        release_owner = not getattr(self, "_node_owner_released", False)
+        try:
+            shutdown_shared_node(release_owner=release_owner)
+        finally:
+            # The shared-node transaction decrements ownership before a
+            # possible last-owner transport failure.  Record that fact so a
+            # retry never decrements twice.
+            if release_owner:
+                self._node_owner_released = True
+        self._node_released = True
 
     def close(self) -> None:
         """Release this instance's hold on the shared communication Node.
