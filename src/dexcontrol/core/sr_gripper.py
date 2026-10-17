@@ -267,7 +267,11 @@ class SrGripperAdapter:
                 and (now - self._last_send_t) < _FORCE_RESEND_PERIOD_S
             ):
                 return
-            ok = self._gripper.client.sendCommand(packet)
+            try:
+                ok = self._gripper.client.sendCommand(packet)
+            except Exception:
+                self._command_failed.set()
+                raise
             if not ok:
                 self._command_failed.set()
                 raise RuntimeError("SR gripper target transmission failed")
@@ -290,7 +294,11 @@ class SrGripperAdapter:
             now = time.time()
             if (now - self._last_send_t) < _FORCE_RESEND_PERIOD_S:
                 return
-            ok = self._gripper.client.sendCommand(self._last_sent_packet)
+            try:
+                ok = self._gripper.client.sendCommand(self._last_sent_packet)
+            except Exception:
+                self._command_failed.set()
+                raise
             if not ok:
                 self._command_failed.set()
                 raise RuntimeError("SR gripper re-stream transmission failed")

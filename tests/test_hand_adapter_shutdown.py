@@ -616,6 +616,41 @@ def test_sr_physical_commit_rechecks_sticky_failure_under_io_lock():
     assert sends == []
 
 
+@pytest.mark.parametrize("method_name", ["_commit_target", "_resend_active"])
+def test_sr_send_exception_is_latched_before_io_lock_release(method_name):
+    adapter = SrGripperAdapter.__new__(SrGripperAdapter)
+    adapter._command_failed = threading.Event()
+    adapter._last_sent_packet = b"packet"
+    adapter._last_send_t = 0.0
+    release_states = []
+
+    class ObserveExit:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            release_states.append(adapter._command_failed.is_set())
+            return False
+
+    adapter._gripper_io_lock = ObserveExit()
+    adapter._gripper = SimpleNamespace(
+        client=SimpleNamespace(
+            sendCommand=lambda _packet: (_ for _ in ()).throw(
+                OSError("ethercat write failed")
+            )
+        )
+    )
+
+    with pytest.raises(OSError, match="ethercat write failed"):
+        if method_name == "_commit_target":
+            adapter._commit_target(0.04, 0.05, 95)
+        else:
+            adapter._resend_active()
+
+    assert release_states == [True]
+    assert adapter.command_path_healthy is False
+
+
 def test_sr_worker_latches_failed_state_readback():
     adapter = SrGripperAdapter.__new__(SrGripperAdapter)
     adapter._stop_event = threading.Event()
