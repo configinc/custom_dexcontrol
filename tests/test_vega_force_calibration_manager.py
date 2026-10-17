@@ -17,6 +17,8 @@ from dexcontrol.core.robotenv_vega.force_calibration_lifecycle import (
 from dexcontrol.core.robotenv_vega.vega_force_calibration import (
     CalibrationCancelled,
     VegaForceCalibrationManager,
+    VegaRobotCalibrationAdapter,
+    _minimum_jerk_rotation_steps,
 )
 
 
@@ -91,8 +93,16 @@ class FakeAdapter:
         assert len(holds) == 2
         return FakeParameters()
 
-    def install(self, parameters):
-        self.installed.append(parameters)
+    def prepare_install(self, parameters):
+        return parameters
+
+    def install_prepared(self, prepared):
+        self.installed.append(prepared)
+
+    def commit_install(self, prepared, commit):
+        status = commit()
+        self.install_prepared(prepared)
+        return status
 
 
 class Claim:
@@ -172,6 +182,24 @@ def test_commit_applies_candidate_and_releases_robot(tmp_path: Path) -> None:
     assert claim.releases == 1
 
 
+def test_commit_validates_runtime_candidate_before_durable_success(tmp_path: Path) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+    manager.advance("run-1", 1, "stage-1")
+    ready = _wait_state(manager, "READY_TO_APPLY")
+
+    def reject(_parameters):
+        raise ValueError("invalid runtime parameters")
+
+    adapter.prepare_install = reject
+    with pytest.raises(ValueError, match="invalid runtime parameters"):
+        manager.commit("run-1", ready.plan_sha256)
+    assert manager.status().state == "READY_TO_APPLY"
+    assert claim.owned is True
+
+
 def test_cancel_stops_worker_returns_safe_and_releases(tmp_path: Path) -> None:
     manager, adapter, claim = _manager(tmp_path)
     adapter.block = True
@@ -183,6 +211,162 @@ def test_cancel_stops_worker_returns_safe_and_releases(tmp_path: Path) -> None:
     _wait_state(manager, "CANCELLED")
     assert adapter.safe_returns == 1
     assert claim.owned is False
+
+
+def test_cancel_during_fit_finishes_cancelled_not_failed(tmp_path: Path) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    fit_entered = threading.Event()
+    fit_release = threading.Event()
+    original_fit = adapter.fit
+
+    def delayed_fit(holds):
+        fit_entered.set()
+        assert fit_release.wait(1.0)
+        return original_fit(holds)
+
+    adapter.fit = delayed_fit
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+    manager.advance("run-1", 1, "stage-1")
+    assert fit_entered.wait(1.0)
+    assert manager.request_cancel("run-1").state == "CANCELLING"
+    fit_release.set()
+    _wait_state(manager, "CANCELLED")
+    assert claim.owned is False
+
+
+def test_rotation_profile_uses_euler_deltas_and_returns_exactly() -> None:
+    target = np.radians(np.array([25.0, -30.0, 40.0]))
+    forward, reverse = _minimum_jerk_rotation_steps(target, 20.0)
+    np.testing.assert_allclose(np.sum(forward, axis=0), target, atol=1e-12)
+    np.testing.assert_allclose(
+        np.sum((*forward, *reverse), axis=0), np.zeros(3), atol=1e-12
+    )
+
+
+class _FakeSensor:
+    def __init__(self, timestamp_ns: int) -> None:
+        self.timestamp_ns = timestamp_ns
+
+    def get_wrench_sample(self):
+        return np.arange(6, dtype=np.float64), self.timestamp_ns
+
+
+class _FakeArm:
+    def __init__(self, joints=None, sensor_timestamp_ns: int = 1_000_000_000) -> None:
+        self._joints = np.zeros(7) if joints is None else np.asarray(joints, dtype=float)
+        self.wrench_sensor = _FakeSensor(sensor_timestamp_ns)
+
+    def get_joint_pos(self):
+        return self._joints.copy()
+
+
+class _FakeRobot:
+    def __init__(self, joints=None, sensor_timestamp_ns: int = 1_000_000_000) -> None:
+        self.arm = _FakeArm(joints, sensor_timestamp_ns)
+
+    def get_robot_state(self):
+        return (
+            {
+                "cartesian_position": np.zeros(6),
+                "joint_positions": self.arm.get_joint_pos(),
+                "gripper_position": 0.0,
+            },
+            {"robot_timestamp_us": 1_000_000},
+        )
+
+    def update_command(self, *_args, **_kwargs):
+        return None
+
+
+class _FakeService:
+    gripper_type = "robotiq"
+    arm_side = "left"
+    frame_type = "world"
+    control_hz = 20.0
+    R_robot_to_world = None
+    R_world_to_robot = None
+
+    def __init__(self, joints=None, sensor_timestamp_ns: int = 1_000_000_000) -> None:
+        self._robot = _FakeRobot(joints, sensor_timestamp_ns)
+        self._cmd_lock = threading.Lock()
+
+    def _execute_reset_sequence(self, target, **_kwargs):
+        self._robot.arm._joints = np.asarray(target, dtype=float).copy()
+
+    @staticmethod
+    def _timestamp_us(timestamp):
+        return timestamp["robot_timestamp_us"]
+
+
+def _physical_adapter(service: _FakeService) -> VegaRobotCalibrationAdapter:
+    return VegaRobotCalibrationAdapter(service, 1.2, np.array([0.0, 0.0, 0.072]))
+
+
+def test_sample_uses_sensor_timestamp_and_rejects_cross_stream_skew() -> None:
+    adapter = _physical_adapter(_FakeService(sensor_timestamp_ns=1_000_000_000))
+    assert adapter._sample()[3] == pytest.approx(1.0)
+
+    stale = _physical_adapter(_FakeService(sensor_timestamp_ns=500_000_000))
+    with pytest.raises(RuntimeError, match="not time aligned"):
+        stale._sample()
+
+
+def test_safe_return_verification_rejects_unreached_joint_target() -> None:
+    adapter = _physical_adapter(_FakeService(joints=np.ones(7)))
+    with pytest.raises(RuntimeError, match="safe return joint error"):
+        adapter._verify_joint_return(np.zeros(7))
+
+
+def test_real_adapter_prepare_completes_against_lifecycle(tmp_path: Path) -> None:
+    plan_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "dexcontrol"
+        / "core"
+        / "robotenv_vega"
+        / "force_calibration"
+        / "vega_bilateral_plan_v1.json"
+    )
+    lifecycle = ForceCalibrationLifecycle(
+        plan=BilateralCalibrationPlan.load(plan_path, "left"),
+        server_identity={"robot": "vega", "arm": "left"},
+        storage_directory=tmp_path / "state",
+        calibration_kind="vega_wrist_ft_v1",
+        reference_point_id="sensor-origin",
+    )
+    adapter = _physical_adapter(_FakeService())
+    lifecycle.start("run-1", force_recalibrate=True)
+    _, payload = lifecycle.advance("run-1", 0, "prepare")
+    adapter.execute_stage(
+        "prepare",
+        payload,
+        threading.Event(),
+        lambda state, message: lifecycle.set_phase("run-1", state, message),
+    )
+    assert lifecycle.complete_stage("run-1", 0).state == "READY_FOR_STAGE"
+
+
+def test_real_adapter_cancel_during_pose_preserves_cancel_signal() -> None:
+    adapter = _physical_adapter(_FakeService())
+    adapter._start_joints = np.zeros(7)
+    cancelled = threading.Event()
+    phases = []
+
+    def set_phase(state, _message):
+        phases.append(state)
+        if state == "SETTLING":
+            cancelled.set()
+
+    with pytest.raises(CalibrationCancelled):
+        adapter.execute_stage(
+            "pose-1",
+            {"kind": "pose", "rpy_degrees": [0.0, 0.0, 0.0]},
+            cancelled,
+            set_phase,
+        )
+    assert phases == ["MOVING", "SETTLING"]
 
 
 def test_second_start_is_rejected_while_first_run_owns_robot(tmp_path: Path) -> None:

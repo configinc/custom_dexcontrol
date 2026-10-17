@@ -845,8 +845,21 @@ class ArmWrenchSensor(RobotComponent):
             Source-native sensor-axis wrench ``[Fx, Fy, Fz, Tx, Ty, Tz]`` at the
             physical sensor measurement origin. Force is in N and torque is in Nm.
         """
+        wrench, _ = self.get_wrench_sample()
+        return wrench
+
+    def get_wrench_sample(self) -> tuple[Float[np.ndarray, "6"], int]:
+        """Return one wrench and its sensor-acquisition timestamp atomically.
+
+        The timestamp is read from the same decoded sensor message as the wrench;
+        callers must not substitute a robot-state timestamp because the two
+        streams can advance independently.
+        """
         state = super().get_state()
-        return np.array(state["wrench"], dtype=np.float32)
+        timestamp_ns = state.get("timestamp_ns")
+        if isinstance(timestamp_ns, bool) or not isinstance(timestamp_ns, int):
+            raise ServiceUnavailableError("Wrench sensor timestamp is unavailable")
+        return np.array(state["wrench"], dtype=np.float32), timestamp_ns
 
     def get_button_state(self) -> dict[str, bool]:
         """Get the state of the wrench sensor buttons.

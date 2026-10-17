@@ -76,6 +76,16 @@ def _collect_all(lifecycle: ForceCalibrationLifecycle, run_id: str) -> None:
         lifecycle.complete_stage(run_id, index)
 
 
+def test_prepare_stage_can_return_directly_from_moving(
+    tmp_path: Path, plan: BilateralCalibrationPlan, clock: Clock
+) -> None:
+    lifecycle = _lifecycle(tmp_path, plan, clock)
+    lifecycle.start("run-prepare", force_recalibrate=True)
+    lifecycle.advance("run-prepare", 0, "tilt-x")
+    status = lifecycle.set_phase("run-prepare", "RETURNING")
+    assert status.state == "RETURNING"
+
+
 def test_plan_is_one_exact_bilateral_artifact(tmp_path: Path) -> None:
     path = tmp_path / "plan.json"
     _write_plan(path)

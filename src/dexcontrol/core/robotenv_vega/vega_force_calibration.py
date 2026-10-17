@@ -36,6 +36,10 @@ FIT_TAIL_SECONDS = 2.0
 SPEED_WINDOW_SECONDS = 0.5
 SETTLED_MAX_JOINT_SPEED_DPS = 2.5
 REFERENCE_POINT = "physical F/T sensor measurement origin"
+SENSOR_ROBOT_MAX_SKEW_SECONDS = 0.25
+RETURN_MAX_JOINT_ERROR_RAD = np.radians(5.0)
+RETURN_MAX_POSITION_ERROR_M = 0.01
+RETURN_MAX_ROTATION_ERROR_RAD = np.radians(5.0)
 
 
 class CalibrationCancelled(RuntimeError):
@@ -57,19 +61,29 @@ class CalibrationAdapter(Protocol):
 
     def fit(self, holds: Sequence[WristFtCalibrationHold]) -> WristFtCalibrationParameters: ...
 
-    def install(self, parameters: WristFtCalibrationParameters | None) -> None: ...
+    def prepare_install(self, parameters: WristFtCalibrationParameters | None) -> Any: ...
+
+    def install_prepared(self, prepared: Any) -> None: ...
+
+    def commit_install(
+        self, prepared: Any, commit: Callable[[], CalibrationStatusSnapshot]
+    ) -> CalibrationStatusSnapshot: ...
 
 
-def _minimum_jerk_rotation_steps(target_rpy: np.ndarray, hz: float) -> tuple[np.ndarray, ...]:
+def _minimum_jerk_rotation_steps(
+    target_rpy: np.ndarray, hz: float
+) -> tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...]]:
     target = np.asarray(target_rpy, dtype=np.float64)
     if target.shape != (3,) or not np.isfinite(target).all():
         raise ValueError("target_rpy must contain three finite values")
     duration = 1.875 * np.degrees(np.linalg.norm(target)) / MAX_ROTATION_SPEED_DPS
     progress = np.linspace(0.0, 1.0, max(1, ceil(duration * hz)) + 1)
     blend = progress**3 * (10.0 - 15.0 * progress + 6.0 * progress**2)
-    rotations = Rotation.from_euler("xyz", blend[:, None] * target).as_matrix()
-    deltas = rotations[1:] @ np.swapaxes(rotations[:-1], -1, -2)
-    return tuple(Rotation.from_matrix(deltas).as_rotvec())
+    # Vega's cartesian_delta boundary consumes additive xyz Euler deltas.
+    # Keep trajectory generation in that same representation; a rotation-vector
+    # delta is numerically similar only for small single-axis moves.
+    forward = np.diff(blend[:, None] * target, axis=0)
+    return tuple(forward), tuple(-forward[::-1])
 
 
 def _settled_tail(
@@ -182,24 +196,60 @@ class VegaRobotCalibrationAdapter:
             cartesian, gripper_type=self.service.gripper_type
         )
         sensor = self.service._robot.arm.wrench_sensor
-        wrench = np.asarray(sensor.get_wrench_state(), dtype=np.float64)
+        wrench_raw, sensor_timestamp_ns = sensor.get_wrench_sample()
+        wrench = np.asarray(wrench_raw, dtype=np.float64)
         joints = np.asarray(state["joint_positions"], dtype=np.float64)
-        timestamp_us = self.service._timestamp_us(timestamps)
+        robot_timestamp_us = self.service._timestamp_us(timestamps)
         if wrench.shape != (6,) or not np.isfinite(wrench).all():
             raise RuntimeError("Vega wrist F/T sample is unavailable")
         if joints.shape != (7,) or not np.isfinite(joints).all():
             raise RuntimeError("Vega joint sample is unavailable")
-        if timestamp_us <= 0:
-            raise RuntimeError("Vega acquisition timestamp is unavailable")
-        return wrench, world_from_sensor, joints, timestamp_us * 1e-6
+        if sensor_timestamp_ns <= 0 or robot_timestamp_us <= 0:
+            raise RuntimeError("Vega acquisition timestamps are unavailable")
+        sensor_timestamp = sensor_timestamp_ns * 1e-9
+        robot_timestamp = robot_timestamp_us * 1e-6
+        if abs(sensor_timestamp - robot_timestamp) > SENSOR_ROBOT_MAX_SKEW_SECONDS:
+            raise RuntimeError("Vega wrench and robot-state samples are not time aligned")
+        return wrench, world_from_sensor, joints, sensor_timestamp
+
+    def _current_cartesian(self) -> np.ndarray:
+        state, _ = self.service._robot.get_robot_state()
+        cartesian = np.asarray(state["cartesian_position"], dtype=np.float64)
+        if cartesian.shape != (6,) or not np.isfinite(cartesian).all():
+            raise RuntimeError("Vega Cartesian pose is unavailable")
+        if self.service.R_robot_to_world is not None:
+            cartesian = self.service._transform_state_to_env_frame(cartesian)
+        return cartesian
+
+    def _verify_joint_return(self, target: np.ndarray) -> None:
+        actual = np.asarray(self.service._robot.arm.get_joint_pos(), dtype=np.float64)
+        if actual.shape != (7,) or not np.isfinite(actual).all():
+            raise RuntimeError("Vega joint pose is unavailable after safe return")
+        error = float(np.max(np.abs(actual - target)))
+        if error > RETURN_MAX_JOINT_ERROR_RAD:
+            raise RuntimeError(f"Vega safe return joint error is {error:.4f} rad")
+
+    def _verify_cartesian_return(self, target: np.ndarray) -> None:
+        actual = self._current_cartesian()
+        position_error = float(np.linalg.norm(actual[:3] - target[:3]))
+        rotation_error = float(
+            (Rotation.from_euler("xyz", actual[3:]) * Rotation.from_euler("xyz", target[3:]).inv()).magnitude()
+        )
+        if position_error > RETURN_MAX_POSITION_ERROR_M:
+            raise RuntimeError(f"Vega pose return position error is {position_error:.4f} m")
+        if rotation_error > RETURN_MAX_ROTATION_ERROR_RAD:
+            raise RuntimeError(f"Vega pose return rotation error is {rotation_error:.4f} rad")
 
     def _prepare(self, payload: Mapping[str, Any], cancelled: threading.Event) -> None:
         joints = np.asarray(payload.get("start_joints"), dtype=np.float64)
         if joints.shape != (7,) or not np.isfinite(joints).all():
             raise ValueError("prepare stage requires seven finite start_joints")
         self._start_joints = joints.copy()
-        self.service._execute_reset_sequence(joints, cancelled=cancelled)
+        self.service._execute_reset_sequence(
+            joints, cancelled=cancelled, interruptible_gripper=True
+        )
         self._check_cancelled(cancelled)
+        self._verify_joint_return(joints)
         state, _ = self.service._robot.get_robot_state()
         gripper = np.asarray(state.get("gripper_position", 0.0), dtype=np.float64).reshape(-1)
         if gripper.size != 1 or not np.isfinite(gripper[0]):
@@ -218,9 +268,12 @@ class VegaRobotCalibrationAdapter:
         degrees = np.asarray(payload.get("rpy_degrees"), dtype=np.float64)
         if degrees.shape != (3,) or not np.isfinite(degrees).all():
             raise ValueError("pose stage requires three finite rpy_degrees")
-        steps = _minimum_jerk_rotation_steps(np.radians(degrees), self.service.control_hz)
+        forward_steps, reverse_steps = _minimum_jerk_rotation_steps(
+            np.radians(degrees), self.service.control_hz
+        )
+        start_cartesian = self._current_cartesian()
         set_phase("MOVING", f"moving to {stage_id}")
-        self._move_profile(steps, cancelled)
+        self._move_profile(forward_steps, cancelled)
         samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float]] = []
         try:
             set_phase("SETTLING", f"settling at {stage_id}")
@@ -248,8 +301,11 @@ class VegaRobotCalibrationAdapter:
                 measured_sensor_wrench_samples=raw_samples,
             )
         finally:
+            if cancelled.is_set():
+                raise CalibrationCancelled("force calibration cancelled")
             set_phase("RETURNING", f"returning from {stage_id}")
-            self._move_profile(tuple(-delta for delta in reversed(steps)), cancelled)
+            self._move_profile(reverse_steps, cancelled)
+            self._verify_cartesian_return(start_cartesian)
 
     def execute_stage(
         self,
@@ -279,6 +335,7 @@ class VegaRobotCalibrationAdapter:
                 cancelled=safe_cancel,
                 interruptible_gripper=True,
             )
+            self._verify_joint_return(self._start_joints)
 
     def fit(self, holds: Sequence[WristFtCalibrationHold]) -> WristFtCalibrationParameters:
         return fit_wrist_ft_calibration(
@@ -292,10 +349,28 @@ class VegaRobotCalibrationAdapter:
             gripper_com_sensor_m=self.gripper_com_sensor_m,
         )
 
-    def install(self, parameters: WristFtCalibrationParameters | None) -> None:
-        self.service._set_force_calibration_applier(
-            None if parameters is None else WristFtCalibrationApplier(parameters)
-        )
+    def prepare_install(
+        self, parameters: WristFtCalibrationParameters | None
+    ) -> WristFtCalibrationApplier | None:
+        return None if parameters is None else WristFtCalibrationApplier(parameters)
+
+    def install_prepared(self, prepared: WristFtCalibrationApplier | None) -> None:
+        self.service._set_force_calibration_applier(prepared)
+
+    def commit_install(
+        self,
+        prepared: WristFtCalibrationApplier | None,
+        commit: Callable[[], CalibrationStatusSnapshot],
+    ) -> CalibrationStatusSnapshot:
+        """Publish runtime state and durable success as one observable transition."""
+        with self.service._force_calibration_applier_lock:
+            previous = self.service._force_calibration_applier
+            self.service._force_calibration_applier = prepared
+            try:
+                return commit()
+            except BaseException:
+                self.service._force_calibration_applier = previous
+                raise
 
 
 class VegaForceCalibrationManager:
@@ -330,7 +405,7 @@ class VegaForceCalibrationManager:
         result = self.lifecycle.get_result("")
         if result.get("available"):
             parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
-            self.adapter.install(parameters)
+            self.adapter.install_prepared(self.adapter.prepare_install(parameters))
 
     @property
     def owns_robot(self) -> bool:
@@ -367,8 +442,9 @@ class VegaForceCalibrationManager:
                 self._candidate = None
                 if status.state == "SUCCEEDED":
                     result = self.lifecycle.get_result("")
-                    self.adapter.install(
-                        wrist_ft_calibration_from_snapshot(result["parameters"])
+                    parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
+                    self.adapter.install_prepared(
+                        self.adapter.prepare_install(parameters)
                     )
                     self._release_if_owned()
                 return status
@@ -414,6 +490,8 @@ class VegaForceCalibrationManager:
             status = self.lifecycle.complete_stage(run_id, stage_index)
             if status.state == "FITTING":
                 parameters = self.adapter.fit(tuple(self._holds))
+                if self._cancelled.is_set():
+                    raise CalibrationCancelled("force calibration cancelled")
                 self._candidate = parameters
                 self.lifecycle.stage_candidate(
                     run_id,
@@ -471,14 +549,16 @@ class VegaForceCalibrationManager:
 
     def commit(self, run_id: str, plan_sha256: str) -> CalibrationStatusSnapshot:
         with self._lock:
-            status = self.lifecycle.commit(run_id, plan_sha256)
             result = self.lifecycle.get_result("")
             parameters = (
                 self._candidate
                 if self._candidate is not None
                 else wrist_ft_calibration_from_snapshot(result["parameters"])
             )
-            self.adapter.install(parameters)
+            prepared = self.adapter.prepare_install(parameters)
+            status = self.adapter.commit_install(
+                prepared, lambda: self.lifecycle.commit(run_id, plan_sha256)
+            )
             self._release_if_owned()
             return status
 

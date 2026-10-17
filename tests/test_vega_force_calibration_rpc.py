@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import json
+import sys
+from types import ModuleType
 
 import grpc
 
-from dexcontrol.core.robotenv_vega.force_calibration_lifecycle import (
+# Keep this RPC test independently collectible without the optional hidapi stack.
+_base_arm_teleop = ModuleType("base_arm_teleop")
+_base_arm_teleop.BaseIKController = object
+sys.modules.setdefault("base_arm_teleop", _base_arm_teleop)
+
+from dexcontrol.core.robotenv_vega.force_calibration_lifecycle import (  # noqa: E402
     CalibrationStatusSnapshot,
     LifecycleError,
 )
-from dexcontrol.core.robotenv_vega.server import VegaRobotEnvService
-from proto import robotenv_pb2
+from dexcontrol.core.robotenv_vega.server import VegaRobotEnvService  # noqa: E402
+from proto import robotenv_pb2  # noqa: E402
 
 
 class Context:

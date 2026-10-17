@@ -159,12 +159,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         if self.external_wrench_sensor_to_wrist_yaw_degrees is None:
             LOGGER.info(
                 "publishing source-native external_wrench_sensor_raw; "
-                "RCI owns calibrated wrist/world fields"
+                "RobotEnv publishes calibrated wrist/world after calibration"
             )
         else:
             LOGGER.warning(
                 "ignoring deprecated sensor-to-wrist yaw %.6f degrees; "
-                "RCI owns calibrated wrist/world fields",
+                "RobotEnv owns the calibrated wrist/world transform",
                 self.external_wrench_sensor_to_wrist_yaw_degrees,
             )
         self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(
@@ -1418,6 +1418,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     _RESET_CMD_HZ = 100.0
     _RESET_MAX_STEP_RAD = 0.2
     _RESET_SETTLE_S = 0.5
+    _RESET_GRIPPER_TIMEOUT_S = 5.0
+    _RESET_GRIPPER_TOLERANCE = 0.05
 
     def _execute_reset_sequence(
         self,
@@ -1435,6 +1437,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             velocity=False,
             blocking=not interruptible_gripper,
         )
+        if interruptible_gripper:
+            gripper_deadline = time.monotonic() + self._RESET_GRIPPER_TIMEOUT_S
+            while abs(float(self._robot.get_cached_gripper_position())) > (
+                self._RESET_GRIPPER_TOLERANCE
+            ):
+                if cancelled is not None and cancelled.is_set():
+                    return
+                if time.monotonic() >= gripper_deadline:
+                    raise RuntimeError("Vega gripper did not open before reset motion")
+                time.sleep(0.02)
         if cancelled is not None and cancelled.is_set():
             return
         LOGGER.info("Reset[%s]: gripper done (%.2fs), starting reset motion", self.arm_side, time.time() - t0)
@@ -1772,8 +1784,8 @@ def main() -> None:
         type=float,
         default=None,
         help=(
-            "Deprecated compatibility option. RobotEnv publishes only "
-            "external_wrench_sensor_raw; RCI owns calibrated wrist/world output."
+            "Deprecated compatibility option. RobotEnv owns the calibrated "
+            "wrist/world transform and ignores this override."
         ),
     )
     parser.add_argument(

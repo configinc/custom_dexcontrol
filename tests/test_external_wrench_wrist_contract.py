@@ -69,7 +69,7 @@ def test_sensor_boundary_preserves_source_wrench_order_and_sign(monkeypatch) -> 
     monkeypatch.setattr(
         RobotComponent,
         "get_state",
-        lambda _sensor: {"wrench": upstream_wrench_on_robot},
+        lambda _sensor: {"wrench": upstream_wrench_on_robot, "timestamp_ns": 123},
     )
     sensor = ArmWrenchSensor.__new__(ArmWrenchSensor)
 
@@ -77,6 +77,8 @@ def test_sensor_boundary_preserves_source_wrench_order_and_sign(monkeypatch) -> 
         sensor.get_wrench_state(),
         np.asarray(upstream_wrench_on_robot, dtype=np.float32),
     )
+    _, timestamp_ns = sensor.get_wrench_sample()
+    assert timestamp_ns == 123
 
 
 def test_sensor_to_wrist_yaw_rotates_force_and_torque() -> None:

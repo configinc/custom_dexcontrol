@@ -726,7 +726,7 @@ class ForceCalibrationLifecycle:
             raise ValueError("unsupported calibration worker phase")
         with self._lock:
             allowed = {
-                "MOVING": {"MOVING", "SETTLING", "COLLECTING"},
+                "MOVING": {"MOVING", "SETTLING", "COLLECTING", "RETURNING"},
                 "SETTLING": {"SETTLING", "COLLECTING"},
                 "COLLECTING": {"COLLECTING", "RETURNING"},
                 "FITTING": {"FITTING", "RETURNING"},
