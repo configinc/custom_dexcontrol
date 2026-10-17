@@ -180,7 +180,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("control_hz must be a finite positive integer") from exc
         if (
-            isinstance(control_hz, bool)
+            isinstance(control_hz, (bool, np.bool_))
             or not finite_control_hz
             or normalized_control_hz <= 0
             or float(control_hz) != normalized_control_hz
@@ -225,13 +225,25 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             prepared_base_rotation = R.from_euler(
                 "XYZ", values, degrees=True
             ).as_matrix()
-        if not np.isfinite(float(control_loop_hz)):
-            raise ValueError("control_loop_hz must be finite")
+        try:
+            normalized_control_loop_hz = int(control_loop_hz)
+            finite_control_loop_hz = np.isfinite(float(control_loop_hz))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "control_loop_hz must be a finite non-negative integer"
+            ) from exc
+        if (
+            isinstance(control_loop_hz, (bool, np.bool_))
+            or not finite_control_loop_hz
+            or normalized_control_loop_hz < 0
+            or float(control_loop_hz) != normalized_control_loop_hz
+        ):
+            raise ValueError("control_loop_hz must be a finite non-negative integer")
 
         self._robot = VegaRobot(
             robot_model=robot_model,
             arm_side=arm_side,
-            control_hz=control_hz,
+            control_hz=self.control_hz,
             use_velocity_feedforward=use_velocity_feedforward,
             gripper_type=gripper_type,
             ik_solver_type=ik_solver_type,
@@ -263,7 +275,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         # When interpolation is active, gRPC Step() buffers commands at
         # input rate and this thread dispatches them to hardware at
         # control_loop_hz (typically 100 Hz).
-        self._control_loop_hz = control_loop_hz if control_loop_hz > 0 else 0
+        self._control_loop_hz = normalized_control_loop_hz
         self._control_loop_thread: Optional[threading.Thread] = None
         self._control_loop_stop = threading.Event()
         # Override home position with per-arm init joints.
@@ -306,7 +318,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             LOGGER.info(
                 "Control loop thread started: %d Hz (input≈%d Hz → control=%d Hz)",
                 self._control_loop_hz,
-                control_hz,
+                self.control_hz,
                 self._control_loop_hz,
             )
         LOGGER.info(
@@ -315,7 +327,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             arm_side,
             gripper_type,
             frame_type,
-            control_hz,
+            self.control_hz,
         )
         LOGGER.info(
             "Joint command mode: %s",
@@ -335,7 +347,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self._max_rot_delta,
         )
         if ema_alpha > 0:
-            _omega = ema_alpha / ((1.0 / max(1, control_hz)) * (1.0 - ema_alpha))
+            _omega = ema_alpha / (
+                (1.0 / self.control_hz) * (1.0 - ema_alpha)
+            )
             LOGGER.info(
                 "2nd-order smoothing: enabled (alpha=%.3f, omega=%.1f rad/s, critically damped)",
                 ema_alpha, _omega,
