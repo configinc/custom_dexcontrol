@@ -132,3 +132,25 @@ def test_base_transport_waits_until_required_hand_teardown_succeeds():
     assert robot.robot.shutdown_calls == 1
     assert robot._hand_shutdown_completed is True
     assert robot._robot_shutdown_completed is True
+
+
+def test_failed_constructor_cleanup_retries_hand_before_base():
+    calls = []
+
+    class Resource:
+        def __init__(self, name, failures):
+            self.name = name
+            self.failures = failures
+
+        def shutdown(self):
+            calls.append(self.name)
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError(f"{self.name} busy")
+
+    hand = Resource("hand", 1)
+    robot = Resource("robot", 1)
+
+    VegaRobot._retry_failed_constructor_cleanup(robot, hand)
+
+    assert calls == ["hand", "hand", "robot", "robot"]

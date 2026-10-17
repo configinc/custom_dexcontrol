@@ -119,6 +119,36 @@ class CommunicationFailedError(RuntimeError):
 class VegaRobot:
     """Thin wrapper around dexcontrol Robot for single-arm control."""
 
+    @staticmethod
+    def _retry_failed_constructor_cleanup(
+        robot: object | None,
+        custom_hand: object | None,
+    ) -> None:
+        """Drain acquired hardware before propagating constructor failure.
+
+        Once a custom hand worker or the base Robot exists, losing the wrapper
+        object would also lose the only retry handle.  Keep retrying the same
+        strict hand-before-base shutdown contract used by service shutdown.
+        """
+        for label, resource in (("custom hand", custom_hand), ("base robot", robot)):
+            if resource is None:
+                continue
+            shutdown = getattr(resource, "shutdown", None)
+            if not callable(shutdown):
+                continue
+            while True:
+                try:
+                    shutdown()
+                    break
+                except Exception as exc:  # pylint: disable=broad-except
+                    _logger.error(
+                        "Vega constructor cleanup for %s is not yet safe; "
+                        "retrying: %s",
+                        label,
+                        exc,
+                    )
+                    _time.sleep(0.1)
+
     def __init__(
         self,
         robot_model: str = "vega_1",
@@ -193,43 +223,51 @@ class VegaRobot:
         )
         self.arm = getattr(self.robot, f"{arm_side}_arm")
         hand_component = f"{arm_side}_hand"
-
-        if gripper_type == "robotiq":
-            from dexcontrol.core.robotiq_gripper import RobotiqGripper  # lazy import
-            self.hand = RobotiqGripper(comport=self._robotiq_comport)
-        elif gripper_type == "sr_gripper":
-            from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
-            self.hand = SrGripperAdapter(comport=self._robotiq_comport)
-        elif gripper_type in ("wuji_hand_v1", "wuji_hand_v2"):
-            from dexcontrol.core.wuji_hand import WujiHandAdapter  # lazy import
-            if wuji_effort_limit is None:
-                wuji_effort_limit = 1.7 if gripper_type == "wuji_hand_v2" else 1.5
-            self.hand = WujiHandAdapter(
-                handedness=arm_side,
-                sn=wuji_sn,
-                effort_limit=wuji_effort_limit,
-            )
-            # The adapter connects whichever wuji generation is attached, but
-            # RCI builds its finger retargeter from the CONFIGURED type — a
-            # generation mismatch runs without any error while every finger
-            # command uses the wrong kinematics, and recordings claim the
-            # wrong hand. Refuse to start instead.
-            if self.hand.model != gripper_type:
-                raise RuntimeError(
-                    f"Unit config says gripper_type={gripper_type!r} but the "
-                    f"attached hand is a {self.hand.model!r} "
-                    f"(sn={self.hand.serial_number}). Fix the unit config in "
-                    f"data-studio or attach the matching hand, then restart."
+        custom_hand = None
+        try:
+            if gripper_type == "robotiq":
+                from dexcontrol.core.robotiq_gripper import RobotiqGripper  # lazy import
+                self.hand = RobotiqGripper(comport=self._robotiq_comport)
+                custom_hand = self.hand
+            elif gripper_type == "sr_gripper":
+                from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
+                self.hand = SrGripperAdapter(comport=self._robotiq_comport)
+                custom_hand = self.hand
+            elif gripper_type in ("wuji_hand_v1", "wuji_hand_v2"):
+                from dexcontrol.core.wuji_hand import WujiHandAdapter  # lazy import
+                if wuji_effort_limit is None:
+                    wuji_effort_limit = 1.7 if gripper_type == "wuji_hand_v2" else 1.5
+                self.hand = WujiHandAdapter(
+                    handedness=arm_side,
+                    sn=wuji_sn,
+                    effort_limit=wuji_effort_limit,
                 )
-        else:
-            self.hand = getattr(self.robot, hand_component) if self.robot.has_component(hand_component) else None
+                custom_hand = self.hand
+                # The adapter connects whichever wuji generation is attached,
+                # but RCI builds its retargeter from the configured type.
+                if self.hand.model != gripper_type:
+                    raise RuntimeError(
+                        f"Unit config says gripper_type={gripper_type!r} but the "
+                        f"attached hand is a {self.hand.model!r} "
+                        f"(sn={self.hand.serial_number}). Fix the unit config in "
+                        f"data-studio or attach the matching hand, then restart."
+                    )
+            else:
+                self.hand = (
+                    getattr(self.robot, hand_component)
+                    if self.robot.has_component(hand_component)
+                    else None
+                )
 
-        custom_ik_cfg = self._build_ik_config()
-        self.ik_controller = BaseIKController(
-            bot=self.robot, visualize=False,
-            ik_solver_type=self._ik_solver_type,
-            custom_local_ik_config=custom_ik_cfg,
-        )
+            custom_ik_cfg = self._build_ik_config()
+            self.ik_controller = BaseIKController(
+                bot=self.robot, visualize=False,
+                ik_solver_type=self._ik_solver_type,
+                custom_local_ik_config=custom_ik_cfg,
+            )
+        except Exception:
+            self._retry_failed_constructor_cleanup(self.robot, custom_hand)
+            raise
         self._arm_joint_names = [f"{arm_side[0].upper()}_arm_j{i + 1}" for i in range(7)]
 
         # Use Vega unfold pose (L_shape) as default reset, same as fold_robot.py unfold.

@@ -27,10 +27,14 @@ for name in ("DeviceType", "JointCommand", "LowPass", "SdkManager", "WujiHand2")
     setattr(wuji_sdk, name, object)
 sys.modules.setdefault("wuji_sdk", wuji_sdk)
 
+import dexcontrol.core.wuji_hand as wuji_module  # noqa: E402
 from dexcontrol.core.robotiq_gripper import RobotiqGripper  # noqa: E402
 from dexcontrol.core.sr_gripper import SrGripperAdapter  # noqa: E402
 from dexcontrol.core.wuji_hand import (  # noqa: E402
     WujiHandAdapter,
+    _cleanup_connected_hand_until_safe,
+    _retry_constructor_cleanup_until_safe,
+    _validate_tactile_override,
     _wait_for_worker_exit_during_constructor_rollback,
 )
 
@@ -196,3 +200,79 @@ def test_wuji_constructor_rollback_waits_until_worker_really_exits():
     assert stop_event.is_set()
     assert worker.join_calls == [0.01, 0.01]
     assert worker.is_alive() is False
+
+
+def test_wuji_tactile_override_is_validated_before_hardware_claim():
+    with pytest.raises(ValueError, match="not a recognised value"):
+        _validate_tactile_override("banana")
+
+    assert _validate_tactile_override(" ON ") == "on"
+
+
+def test_wuji_constructor_cleanup_retries_until_every_resource_is_safe():
+    calls = []
+    sleeps = []
+
+    def shutdown():
+        calls.append("shutdown")
+        if len(calls) == 1:
+            raise RuntimeError("channel busy")
+
+    _retry_constructor_cleanup_until_safe(
+        shutdown, retry_delay_s=0.25, sleep_fn=sleeps.append
+    )
+
+    assert calls == ["shutdown", "shutdown"]
+    assert sleeps == [0.25]
+
+
+def test_wuji_connect_releases_candidate_when_handedness_probe_fails(monkeypatch):
+    device_type = object()
+    monkeypatch.setattr(
+        wuji_module,
+        "DeviceType",
+        SimpleNamespace(WujiHand=device_type, WujiHand2=object()),
+    )
+    device = SimpleNamespace(device_type=device_type, sn="abc")
+
+    class Hand:
+        def handedness_name(self):
+            raise RuntimeError("probe failed")
+
+    disconnects = []
+    adapter = WujiHandAdapter.__new__(WujiHandAdapter)
+    adapter._handedness = "left"
+    adapter._manager = SimpleNamespace(
+        scan=lambda: [device],
+        connect=lambda **_kwargs: Hand(),
+        disconnect_all=lambda: disconnects.append("disconnect"),
+    )
+    adapter._stop_event = threading.Event()
+
+    with pytest.raises(ConnectionError, match="No Wuji hand found"):
+        adapter._connect(sn=None, init_timeout=0.0)
+
+    assert disconnects == ["disconnect"]
+
+
+def test_wuji_pre_worker_cleanup_retries_only_incomplete_phase():
+    calls = []
+
+    class Hand:
+        def disable(self):
+            calls.append("disable")
+
+    disconnect_attempts = 0
+
+    def disconnect_all():
+        nonlocal disconnect_attempts
+        disconnect_attempts += 1
+        calls.append("disconnect")
+        if disconnect_attempts == 1:
+            raise RuntimeError("session busy")
+
+    _cleanup_connected_hand_until_safe(
+        Hand(), SimpleNamespace(disconnect_all=disconnect_all)
+    )
+
+    assert calls == ["disable", "disconnect", "disconnect"]

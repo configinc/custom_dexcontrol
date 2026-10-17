@@ -105,6 +105,51 @@ def _wait_for_worker_exit_during_constructor_rollback(
                 "Wuji constructor rollback is waiting for its I/O worker to stop"
             )
 
+
+def _validate_tactile_override(raw_value: str) -> str:
+    value = raw_value.strip().lower()
+    if value and value not in _TACTILE_ENV_VALUES:
+        raise ValueError(
+            f"WUJI_TACTILE={value!r} is not a recognised value "
+            f"(use one of {sorted(_TACTILE_ENV_VALUES)}, or unset it to "
+            "follow the per-model default)"
+        )
+    return value
+
+
+def _retry_constructor_cleanup_until_safe(
+    shutdown_fn,
+    *,
+    retry_delay_s: float = 1.0,
+    sleep_fn=time.sleep,
+) -> None:
+    while True:
+        try:
+            shutdown_fn()
+            return
+        except Exception:
+            logger.exception(
+                "Wuji constructor rollback cleanup is not yet safe; retrying"
+            )
+            sleep_fn(retry_delay_s)
+
+
+def _cleanup_connected_hand_until_safe(hand, manager) -> None:
+    """Retry pre-worker motor/session cleanup without repeating completed work."""
+    disabled = False
+    disconnected = False
+
+    def cleanup() -> None:
+        nonlocal disabled, disconnected
+        if not disabled:
+            hand.disable()
+            disabled = True
+        if not disconnected:
+            manager.disconnect_all()
+            disconnected = True
+
+    _retry_constructor_cleanup_until_safe(cleanup)
+
 # Runtime reconnect policy (worker thread). After the link watchdog declares
 # the hand dead, wait _RECONNECT_AFTER_S for a plain stream hiccup to clear,
 # then rebuild the SDK session every _RECONNECT_INTERVAL_S until frames flow
@@ -373,30 +418,31 @@ class WujiHandAdapter:
         self._ctrl_params = dict(effort_limit=effort_limit, mit_kp=mit_kp, mit_kd=mit_kd,
                                  lowpass_cutoff_hz=lowpass_cutoff_hz, init_timeout=init_timeout)
         self._stop_event = threading.Event()
+        # Validate the operator-facing switch before claiming the physical
+        # device. Model-specific defaults are resolved after connection.
+        _tactile_env = _validate_tactile_override(
+            os.environ.get("WUJI_TACTILE", "")
+        )
         self._hand = self._connect(sn, init_timeout)
-        # Reconnects (startup retries and runtime) always target THIS serial —
-        # never the map / auto-selection again.
-        self._bound_sn = self.serial_number
-        self._is_hand2 = isinstance(self._hand, WujiHand2)
-        self._command_hz = self._resolve_command_hz(self._command_hz_arg, self._is_hand2)
-        # Tactile: per-model default from TACTILE_BY_MODEL (resolved here,
-        # after connect, once the model is known); WUJI_TACTILE=on/off is an
-        # explicit override. When enabled, a missing/dead tactile stream is a
-        # hard startup error (see _setup_tactile) — never a silent skip.
-        _tactile_env = os.environ.get("WUJI_TACTILE", "").strip().lower()
-        if _tactile_env in _TACTILE_ENV_VALUES:
-            self._tactile_enabled = _TACTILE_ENV_VALUES[_tactile_env]
-        elif _tactile_env:
-            # Never fall back to the table on an unrecognised value: silently
-            # reading "WUJI_TACTILE=yes" as OFF is exactly the "collected a
-            # dataset believing tactile was on" failure this design forbids.
-            raise ValueError(
-                f"WUJI_TACTILE={_tactile_env!r} is not a recognised value "
-                f"(use one of {sorted(_TACTILE_ENV_VALUES)}, or unset it to "
-                f"follow the per-model default)"
+        try:
+            # Reconnects (startup retries and runtime) always target THIS
+            # serial — never the map / auto-selection again.
+            self._bound_sn = self.serial_number
+            self._is_hand2 = isinstance(self._hand, WujiHand2)
+            self._command_hz = self._resolve_command_hz(
+                self._command_hz_arg, self._is_hand2
             )
-        else:
-            self._tactile_enabled = TACTILE_BY_MODEL.get(self.model, False)
+            # Tactile: per-model default from TACTILE_BY_MODEL (resolved here,
+            # after connect, once the model is known).
+            if _tactile_env in _TACTILE_ENV_VALUES:
+                self._tactile_enabled = _TACTILE_ENV_VALUES[_tactile_env]
+            else:
+                self._tactile_enabled = TACTILE_BY_MODEL.get(self.model, False)
+        except Exception:
+            # The constructor has not reached its normal strict-shutdown state
+            # yet, but the physical hand is already connected.
+            _cleanup_connected_hand_until_safe(self._hand, self._manager)
+            raise
 
         # Everything below can touch live hardware; a failure part-way must
         # not leave motors enabled / channels open with no owner.
@@ -466,7 +512,7 @@ class WujiHandAdapter:
             # Use the same strict, retry-aware cleanup contract as normal
             # shutdown.  If cleanup itself fails, its exception retains the
             # original constructor failure as context.
-            self.shutdown()
+            _retry_constructor_cleanup_until_safe(self.shutdown)
             raise
 
         logger.info(
@@ -585,6 +631,7 @@ class WujiHandAdapter:
                             self._handedness,
                         )
                 for dev in candidates:
+                    hand = None
                     try:
                         hand = self._manager.connect(
                             sn=dev.sn, device_name=f"wuji_hand_{self._handedness}",
@@ -606,7 +653,25 @@ class WujiHandAdapter:
                     # device answers. Hand 2 does not implement it — its side
                     # lives in the SN convention instead (the same convention
                     # the SDK's own connect-by-handedness filters by).
-                    reported = getattr(hand, "handedness_name", lambda: None)()
+                    try:
+                        reported = getattr(
+                            hand, "handedness_name", lambda: None
+                        )()
+                    except Exception as exc:
+                        # Connection succeeded, so a verification failure must
+                        # release the candidate before probing another one or
+                        # propagating the startup failure.
+                        _retry_constructor_cleanup_until_safe(
+                            self._manager.disconnect_all
+                        )
+                        logger.warning(
+                            "Wuji hand sn={} could not report handedness while "
+                            "looking for the {} hand ({}); retrying.",
+                            dev.sn,
+                            self._handedness,
+                            exc,
+                        )
+                        continue
                     normalized = str(reported).lower() if reported is not None else ""
                     if normalized == self._handedness:
                         # SDO-verified: pin it in the hand map so the next

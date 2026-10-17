@@ -891,16 +891,19 @@ class Robot(RobotQueryInterface):
         # once the last owner releases it) and clean up the DexComm session.
         if not getattr(self, "_shutdown_shared_node_completed", False):
             try:
-                self._release_shared_node()
+                self._shutdown_session_cleanup_required = (
+                    self._release_shared_node()
+                )
                 self._shutdown_shared_node_completed = True
             except Exception as e:
                 raise RuntimeError(f"shared node cleanup failed: {e}") from e
         if not getattr(self, "_shutdown_session_completed", False):
-            try:
-                cleanup_session()
-                self._shutdown_session_completed = True
-            except Exception as e:
-                raise RuntimeError(f"session cleanup failed: {e}") from e
+            if getattr(self, "_shutdown_session_cleanup_required", False):
+                try:
+                    cleanup_session()
+                except Exception as e:
+                    raise RuntimeError(f"session cleanup failed: {e}") from e
+            self._shutdown_session_completed = True
         self._shutdown_called = True
         logger.info("Robot shutdown complete")
 

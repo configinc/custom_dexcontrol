@@ -32,6 +32,7 @@ from dexcomm.codecs import (
     RobotComponentEnum,
     RobotComponentStatesCodec,
 )
+from dexcomm import cleanup_session
 from loguru import logger
 
 from dexcontrol.core.shared_node import acquire_shared_node
@@ -67,43 +68,62 @@ class RobotQueryInterface:
         # down once every owner releases it. Balanced in _release_shared_node().
         self._node_released = False
         self._node_owner_released = False
+        self._node_session_cleanup_required = False
+        self._session_cleanup_completed = False
         self._node = acquire_shared_node()
-        self._hand_querier = self._node.create_service_client(
-            service_name=configs.querables["hand_info"],
-            request_encoder=None,
-            response_decoder=DictDataCodec.decode,
-            timeout=5.0,
-        )
-        self._ntp_querier = self._node.create_service_client(
-            service_name=configs.querables["soc_ntp"],
-            request_encoder=DictDataCodec.encode,
-            response_decoder=DictDataCodec.decode,
-            timeout=5.0,
-        )
-        self._version_querier = self._node.create_service_client(
-            service_name=configs.querables["version_info"],
-            request_encoder=None,
-            response_decoder=DictDataCodec.decode,
-            timeout=5.0,
-        )
-        self._component_status_querier = self._node.create_service_client(
-            service_name=configs.querables["status_info"],
-            request_encoder=None,
-            response_decoder=RobotComponentStatesCodec.decode,
-            timeout=5.0,
-        )
-        self._reboot_querier = self._node.create_service_client(
-            service_name=configs.querables["reboot"],
-            request_encoder=RebootComponentCodec.encode,
-            response_decoder=None,
-            timeout=5.0,
-        )
-        self._clear_error_querier = self._node.create_service_client(
-            service_name=configs.querables["clear_error"],
-            request_encoder=ClearErrorCodec.encode,
-            response_decoder=None,
-            timeout=5.0,
-        )
+        try:
+            self._hand_querier = self._node.create_service_client(
+                service_name=configs.querables["hand_info"],
+                request_encoder=None,
+                response_decoder=DictDataCodec.decode,
+                timeout=5.0,
+            )
+            self._ntp_querier = self._node.create_service_client(
+                service_name=configs.querables["soc_ntp"],
+                request_encoder=DictDataCodec.encode,
+                response_decoder=DictDataCodec.decode,
+                timeout=5.0,
+            )
+            self._version_querier = self._node.create_service_client(
+                service_name=configs.querables["version_info"],
+                request_encoder=None,
+                response_decoder=DictDataCodec.decode,
+                timeout=5.0,
+            )
+            self._component_status_querier = self._node.create_service_client(
+                service_name=configs.querables["status_info"],
+                request_encoder=None,
+                response_decoder=RobotComponentStatesCodec.decode,
+                timeout=5.0,
+            )
+            self._reboot_querier = self._node.create_service_client(
+                service_name=configs.querables["reboot"],
+                request_encoder=RebootComponentCodec.encode,
+                response_decoder=None,
+                timeout=5.0,
+            )
+            self._clear_error_querier = self._node.create_service_client(
+                service_name=configs.querables["clear_error"],
+                request_encoder=ClearErrorCodec.encode,
+                response_decoder=None,
+                timeout=5.0,
+            )
+        except Exception:
+            # A constructor that acquired ownership but never returned cannot
+            # be closed by its caller.  Finish the release transaction here,
+            # retrying a last-owner Node teardown until it is actually safe.
+            while True:
+                try:
+                    self._close_shared_resources()
+                    break
+                except Exception as cleanup_exc:  # pylint: disable=broad-except
+                    logger.error(
+                        "RobotQueryInterface constructor cleanup is not yet safe; "
+                        "retrying: {}",
+                        cleanup_exc,
+                    )
+                    time.sleep(0.1)
+            raise
 
     @classmethod
     def create(cls) -> "RobotQueryInterface":
@@ -127,7 +147,7 @@ class RobotQueryInterface:
 
         return instance
 
-    def _release_shared_node(self) -> None:
+    def _release_shared_node(self) -> bool:
         """Release this instance's hold on the shared Node exactly once.
 
         Idempotent so that calling both ``shutdown()`` (on Robot) and
@@ -135,18 +155,32 @@ class RobotQueryInterface:
         other live owners.
         """
         if getattr(self, "_node_released", False):
-            return
+            return bool(getattr(self, "_node_session_cleanup_required", False))
         from dexcontrol.core.shared_node import shutdown_shared_node
         release_owner = not getattr(self, "_node_owner_released", False)
         try:
-            shutdown_shared_node(release_owner=release_owner)
+            session_cleanup_required = shutdown_shared_node(
+                release_owner=release_owner
+            )
         finally:
             # The shared-node transaction decrements ownership before a
             # possible last-owner transport failure.  Record that fact so a
             # retry never decrements twice.
             if release_owner:
                 self._node_owner_released = True
+        self._node_session_cleanup_required = session_cleanup_required
         self._node_released = True
+        return session_cleanup_required
+
+    def _close_shared_resources(self) -> None:
+        """Release Node ownership and, for the final owner, its session."""
+        session_cleanup_required = self._release_shared_node()
+        if (
+            session_cleanup_required
+            and not getattr(self, "_session_cleanup_completed", False)
+        ):
+            cleanup_session()
+            self._session_cleanup_completed = True
 
     def close(self) -> None:
         """Release this instance's hold on the shared communication Node.
@@ -155,7 +189,7 @@ class RobotQueryInterface:
         RobotQueryInterface. The shared Node is only fully shut down once every
         live owner (Robot / RobotQueryInterface) in the process has released it.
         """
-        self._release_shared_node()
+        self._close_shared_resources()
 
     def __enter__(self) -> "RobotQueryInterface":
         """Enter context manager."""

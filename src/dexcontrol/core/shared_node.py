@@ -66,18 +66,22 @@ def acquire_shared_node() -> Node:
         return node
 
 
-def shutdown_shared_node(*, release_owner: bool = True) -> None:
+def shutdown_shared_node(*, release_owner: bool = True) -> bool:
     """Release one top-level owner's hold on the shared Node.
 
     The underlying Node is shut down and the singleton reset only when the last
     owner releases it. This prevents one instance's teardown from destroying a
     Node that other live components in the same process still depend on.
+
+    Returns ``True`` only when this call successfully shuts down the final
+    shared Node.  That is also the only owner allowed to clean up the
+    process-global DexComm session.  Non-final owners return ``False``.
     """
     global _shared_node, _owner_count, _shutdown_pending
     with _lock:
         if _shared_node is None:
             _shutdown_pending = False
-            return
+            return False
         if release_owner and _owner_count > 0:
             _owner_count -= 1
         if _owner_count <= 0:
@@ -89,3 +93,5 @@ def shutdown_shared_node(*, release_owner: bool = True) -> None:
                 raise
             _shared_node = None
             _shutdown_pending = False
+            return True
+        return False
