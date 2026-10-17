@@ -1299,6 +1299,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                         or self._active_reset_cancel is not motion_cancelled
                     ):
                         raise RuntimeError("Reset was superseded before its response was committed")
+                    hand_health = getattr(
+                        self._robot, "hand_command_path_healthy", lambda: True
+                    )
+                    if not getattr(
+                        self._robot, "_prev_gripper_command_successful", True
+                    ) or not hand_health():
+                        raise RuntimeError(
+                            "hand command path failed before Reset response commit"
+                        )
                     self._command_recovery_error = ""
                     self._command_recovery_required.clear()
                     return robotenv_pb2.ResetResponse(
@@ -1607,7 +1616,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             hand_health = getattr(
                 self._robot, "hand_command_path_healthy", lambda: True
             )
-            if not hand_health():
+            if not getattr(
+                self._robot, "_prev_gripper_command_successful", True
+            ) or not hand_health():
                 self._command_recovery_error = "asynchronous hand dispatch failed"
                 self._command_recovery_required.set()
             if self._command_recovery_required.is_set():

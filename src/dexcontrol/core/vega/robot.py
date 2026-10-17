@@ -624,9 +624,16 @@ class VegaRobot:
             if latest_target is not None:
                 if self._gripper_stop_event.is_set():
                     break
-                self._execute_gripper_command(
-                    latest_target, wait_time=0.0, raise_on_error=False
-                )
+                if not self.hand_command_path_healthy():
+                    # A sticky adapter failure is a command boundary.  Do not
+                    # allow an already-dequeued target to reach the adapter
+                    # after the server has entered recovery; only the strict
+                    # reset/hold path may transmit while recovering.
+                    self._prev_gripper_command_successful = False
+                else:
+                    self._execute_gripper_command(
+                        latest_target, wait_time=0.0, raise_on_error=False
+                    )
 
             if self._gripper_stop_event.is_set():
                 break

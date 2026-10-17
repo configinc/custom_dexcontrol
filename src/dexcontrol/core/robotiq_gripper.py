@@ -144,7 +144,7 @@ class RobotiqGripper:
                 pass
 
             # Execute command
-            if latest_cmd is not None:
+            if latest_cmd is not None and not self._command_failed.is_set():
                 if self._stop_event.is_set():
                     break
                 pos_m, vel, force = latest_cmd

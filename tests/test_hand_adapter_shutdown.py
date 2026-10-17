@@ -423,6 +423,60 @@ def test_wuji_worker_latches_physical_send_failure():
     assert adapter.command_path_healthy is False
 
 
+def test_wuji_worker_does_not_resend_stale_target_after_failure():
+    adapter = WujiHandAdapter.__new__(WujiHandAdapter)
+    adapter._command_hz = 1000.0
+    adapter._stop_event = threading.Event()
+    adapter._command_queue = Queue(maxsize=1)
+    adapter._latest_target = np.zeros(20)
+    adapter._connected = True
+    adapter._is_hand2 = False
+    adapter._command_failed = threading.Event()
+    refreshes = []
+
+    def refresh_state():
+        refreshes.append(True)
+        if len(refreshes) >= 3:
+            adapter._stop_event.set()
+
+    adapter._refresh_state = refresh_state
+    adapter._refresh_tactile = lambda: None
+    adapter._check_watchdog = lambda _now: None
+    adapter._maybe_reconnect = lambda _now: None
+    sends = []
+
+    def fail_send(_target):
+        sends.append(True)
+        raise OSError("publisher failed")
+
+    adapter._send = fail_send
+    adapter._worker_loop()
+
+    assert sends == [True]
+    assert adapter.command_path_healthy is False
+
+
+def test_wuji_watchdog_failure_stays_latched_after_frames_resume():
+    adapter = WujiHandAdapter.__new__(WujiHandAdapter)
+    adapter._state_lock = threading.Lock()
+    adapter._state_seen_mask = np.ones(20, dtype=bool)
+    adapter._last_valid_time = np.zeros(20)
+    adapter._last_state_time = 0.0
+    adapter._connected = True
+    adapter._command_failed = threading.Event()
+    adapter._handedness = "left"
+    adapter._cmd_pos = np.zeros(20)
+    adapter._last_send_time = 1.0
+
+    adapter._check_watchdog(2.0)
+    assert adapter.command_path_healthy is False
+
+    adapter._last_valid_time[:] = 2.0
+    adapter._check_watchdog(2.0)
+    assert adapter._connected is True
+    assert adapter.command_path_healthy is False
+
+
 def test_robotiq_worker_latches_false_send_result():
     adapter = RobotiqGripper.__new__(RobotiqGripper)
     adapter._stop_event = threading.Event()
@@ -445,6 +499,41 @@ def test_robotiq_worker_latches_false_send_result():
     )
     adapter._worker_loop()
 
+    assert adapter.command_path_healthy is False
+
+
+def test_robotiq_worker_does_not_send_queued_target_after_failure():
+    adapter = RobotiqGripper.__new__(RobotiqGripper)
+    adapter._stop_event = threading.Event()
+    adapter._command_queue = Queue(maxsize=1)
+    adapter._command_queue.put((0.04, 0.05, 95))
+    adapter._command_failed = threading.Event()
+    adapter._gripper_io_lock = threading.Lock()
+    adapter._state_lock = threading.Lock()
+    adapter._cached_pos = 0.04
+    calls = []
+    polls = []
+
+    def send():
+        calls.append("send")
+        adapter._command_queue.put((0.02, 0.05, 95))
+        return False
+
+    def status():
+        polls.append(True)
+        if len(polls) >= 2:
+            adapter._stop_event.set()
+        return True
+
+    adapter._gripper = SimpleNamespace(
+        goto=lambda **_kwargs: calls.append("goto"),
+        sendCommand=send,
+        getStatus=status,
+        get_pos=lambda: 0.04,
+    )
+    adapter._worker_loop()
+
+    assert calls == ["goto", "send"]
     assert adapter.command_path_healthy is False
 
 
@@ -499,6 +588,35 @@ def test_sr_worker_latches_failed_state_readback():
     adapter._gripper = SimpleNamespace(getStatus=failed_status)
     adapter._worker_loop()
 
+    assert adapter.command_path_healthy is False
+
+
+def test_sr_worker_does_not_restream_after_failure():
+    adapter = SrGripperAdapter.__new__(SrGripperAdapter)
+    adapter._stop_event = threading.Event()
+    adapter._command_failed = threading.Event()
+    adapter._gripper_io_lock = threading.Lock()
+    adapter._state_lock = threading.Lock()
+    adapter._cached_pos = 0.03
+    adapter._last_sent_packet = b"packet"
+    resend_calls = []
+    polls = []
+
+    def resend():
+        resend_calls.append(True)
+        raise OSError("ethercat failed")
+
+    def status():
+        polls.append(True)
+        if len(polls) >= 2:
+            adapter._stop_event.set()
+        return True
+
+    adapter._resend_active = resend
+    adapter._gripper = SimpleNamespace(getStatus=status, get_pos=lambda: 0.03)
+    adapter._worker_loop()
+
+    assert resend_calls == [True]
     assert adapter.command_path_healthy is False
 
 

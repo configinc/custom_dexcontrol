@@ -299,7 +299,8 @@ class SrGripperAdapter:
             if self._stop_event.is_set():
                 break
             try:
-                self._resend_active()
+                if not self._command_failed.is_set():
+                    self._resend_active()
             except Exception as e:
                 self._command_failed.set()
                 logger.warning("SR worker re-stream error: {}", e)

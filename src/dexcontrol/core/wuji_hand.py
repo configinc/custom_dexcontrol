@@ -1071,6 +1071,7 @@ class WujiHandAdapter:
             # watchdog says the sensor is dead, and for Hand 2 HELD until a
             # finite seed exists for every joint that has ever reported.
             if (self._latest_target is not None and self._connected
+                    and not self._command_failed.is_set()
                     and (not self._is_hand2 or self._hand2_ready_to_send())):
                 try:
                     self._send(self._latest_target)
@@ -1108,6 +1109,7 @@ class WujiHandAdapter:
             stale = (now - self._last_state_time) > self._STALE_S
         if stale and self._connected:
             self._connected = False
+            self._command_failed.set()
             logger.warning(
                 "Wuji hand ({}): no valid joint_states for >{}s{} — link lost or "
                 "sensor fault? Pausing command stream until valid frames resume.",
@@ -1121,7 +1123,11 @@ class WujiHandAdapter:
             # have moved (or been power-cycled) while we were silent.
             self._cmd_pos = None
             self._last_send_time = None
-            logger.info("Wuji hand ({}): valid joint_states resumed.", self._handedness)
+            logger.info(
+                "Wuji hand ({}): valid joint_states resumed; command path remains "
+                "latched until Reset establishes a fresh measured hold.",
+                self._handedness,
+            )
 
     def _hand2_ready_to_send(self) -> bool:
         """Hand 2 only: may a command go out this tick?

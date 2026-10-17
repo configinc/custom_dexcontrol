@@ -1,5 +1,6 @@
 import threading
 import sys
+from queue import Queue
 from types import ModuleType
 
 import numpy as np
@@ -530,6 +531,28 @@ def test_successful_telemetry_does_not_erase_sticky_hand_dispatch_failure():
     robot._prev_gripper_command_successful = False
 
     assert robot._refresh_gripper_state() is True
+    assert robot._prev_gripper_command_successful is False
+
+
+def test_outer_gripper_worker_drops_buffered_target_after_adapter_failure():
+    robot = VegaRobot.__new__(VegaRobot)
+    robot._gripper_stop_event = threading.Event()
+    robot._gripper_command_queue = Queue(maxsize=1)
+    robot._gripper_command_queue.put(0.8)
+    robot._gripper_poll_interval_s = 0.001
+    robot._prev_gripper_command_successful = True
+    robot.hand_command_path_healthy = lambda: False
+    sends = []
+    robot._execute_gripper_command = lambda *_args, **_kwargs: sends.append(True)
+
+    def refresh():
+        robot._gripper_stop_event.set()
+        return True
+
+    robot._refresh_gripper_state = refresh
+    robot._gripper_worker_loop()
+
+    assert sends == []
     assert robot._prev_gripper_command_successful is False
 
 

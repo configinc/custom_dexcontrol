@@ -593,6 +593,37 @@ def test_successful_current_reset_commits_recovery_clear():
     assert service._command_recovery_error == ""
 
 
+def test_reset_does_not_commit_if_restarted_hand_worker_fails_during_observation():
+    class Context:
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    healthy = [True]
+    service._robot.hand_command_path_healthy = lambda: healthy[0]
+
+    def observation():
+        healthy[0] = False
+        return {}, 1
+
+    service._create_observation = observation
+    context = Context()
+
+    response = service.Reset(
+        SimpleNamespace(mode="current", params={}), context
+    )
+
+    assert response.status == ""
+    assert service._command_recovery_required.is_set()
+    assert context.code == grpc.StatusCode.INTERNAL
+
+
 def test_control_loop_dispatch_failure_latches_recovery_and_stops_dispatch():
     service = _service()
     service._control_loop_hz = 1000
@@ -654,6 +685,22 @@ def test_health_check_latches_idle_adapter_dispatch_failure_without_state_read()
     service._robot.hand_command_path_healthy = lambda: False
     service._robot.get_robot_state = lambda: pytest.fail(
         "known adapter failure must fail before transport read"
+    )
+
+    response = service.HealthCheck(None, SimpleNamespace())
+
+    assert response.status == "UNHEALTHY"
+    assert service._command_recovery_required.is_set()
+    assert "hand dispatch failed" in response.message
+
+
+def test_health_check_latches_idle_outer_gripper_failure_without_state_read():
+    service = _service()
+    service._load_version_info = lambda: {"tag": "test"}
+    service._robot.hand_command_path_healthy = lambda: True
+    service._robot._prev_gripper_command_successful = False
+    service._robot.get_robot_state = lambda: pytest.fail(
+        "known outer gripper failure must fail before transport read"
     )
 
     response = service.HealthCheck(None, SimpleNamespace())
