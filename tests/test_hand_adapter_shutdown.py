@@ -219,11 +219,13 @@ def test_wuji_command_boundary_discards_queue_and_holds_measured(monkeypatch):
     adapter._connected = True
     adapter._state_seen_mask = np.ones(20, dtype=bool)
     adapter._state_generation = 4
+    adapter._last_valid_time = np.zeros(20)
     adapter._last_state_time = time.monotonic()
     def refresh_state():
         with adapter._state_lock:
             adapter._cached_pos = fresh.copy()
             adapter._state_generation += 1
+            adapter._last_valid_time[:] = time.monotonic()
         adapter._last_state_time = time.monotonic()
 
     adapter._refresh_state = refresh_state
@@ -251,6 +253,7 @@ def test_wuji_command_boundary_rejects_unobserved_joint_state(monkeypatch):
     adapter._cached_pos = np.zeros(20)
     adapter._state_seen_mask = np.zeros(20, dtype=bool)
     adapter._state_generation = 0
+    adapter._last_valid_time = np.zeros(20)
     adapter._latest_target = np.ones(20)
     adapter._cmd_pos = np.ones(20)
     adapter._last_send_time = None
@@ -273,6 +276,7 @@ def test_wuji_command_boundary_requires_post_drain_state_frame(monkeypatch):
     adapter._cached_pos = np.linspace(0.0, 0.19, 20)
     adapter._state_seen_mask = np.ones(20, dtype=bool)
     adapter._state_generation = 7
+    adapter._last_valid_time = np.full(20, time.monotonic())
     adapter._latest_target = np.ones(20)
     adapter._cmd_pos = np.ones(20)
     adapter._last_send_time = None
@@ -297,6 +301,7 @@ def test_wuji_command_boundary_recovers_disconnected_link_from_new_frame(monkeyp
     adapter._cached_pos = np.zeros(20)
     adapter._state_seen_mask = np.ones(20, dtype=bool)
     adapter._state_generation = 2
+    adapter._last_valid_time = np.zeros(20)
     adapter._latest_target = None
     adapter._cmd_pos = None
     adapter._last_send_time = None
@@ -309,6 +314,7 @@ def test_wuji_command_boundary_recovers_disconnected_link_from_new_frame(monkeyp
         with adapter._state_lock:
             adapter._cached_pos = measured.copy()
             adapter._state_generation += 1
+            adapter._last_valid_time[:] = time.monotonic()
         adapter._last_state_time = time.monotonic()
 
     adapter._refresh_state = refresh_state
@@ -323,6 +329,40 @@ def test_wuji_command_boundary_recovers_disconnected_link_from_new_frame(monkeyp
     assert len(holds) == 1
     assert holds[0] == pytest.approx(measured)
     assert adapter._worker.started
+
+
+def test_wuji_command_boundary_rejects_partial_post_drain_frame(monkeypatch):
+    adapter = WujiHandAdapter.__new__(WujiHandAdapter)
+    adapter._stop_event = threading.Event()
+    adapter._command_queue = Queue(maxsize=1)
+    adapter._worker = _StoppedWorker()
+    adapter._state_lock = threading.Lock()
+    adapter._cached_pos = np.arange(20, dtype=np.float64)
+    adapter._state_seen_mask = np.ones(20, dtype=bool)
+    adapter._state_generation = 5
+    adapter._last_valid_time = np.full(20, time.monotonic() - 10.0)
+    adapter._latest_target = None
+    adapter._cmd_pos = None
+    adapter._last_send_time = None
+    adapter._last_state_time = time.monotonic() - 10.0
+    adapter._handedness = "left"
+    adapter._connected = False
+    adapter._disconnected_since = time.monotonic()
+
+    def refresh_one_joint():
+        now = time.monotonic()
+        with adapter._state_lock:
+            adapter._cached_pos[0] = 0.5
+            adapter._last_valid_time[0] = now
+            adapter._state_generation += 1
+        adapter._last_state_time = now
+
+    adapter._refresh_state = refresh_one_joint
+    adapter._send = lambda _target: pytest.fail("partial stale hold reached wire")
+    monkeypatch.setattr(wuji_module.threading, "Thread", _NewWorker)
+
+    with pytest.raises(RuntimeError, match="measured hold is unavailable"):
+        adapter.reset_command_state()
 
 
 def test_wuji_worker_does_not_send_after_shutdown_during_reconnect():
@@ -357,6 +397,70 @@ def test_wuji_worker_does_not_send_after_shutdown_during_reconnect():
 
     assert not worker.is_alive()
     assert sends == []
+
+
+def test_wuji_worker_latches_physical_send_failure():
+    adapter = WujiHandAdapter.__new__(WujiHandAdapter)
+    adapter._command_hz = 1000.0
+    adapter._stop_event = threading.Event()
+    adapter._command_queue = Queue(maxsize=1)
+    adapter._latest_target = np.zeros(20)
+    adapter._connected = True
+    adapter._is_hand2 = False
+    adapter._command_failed = threading.Event()
+    adapter._refresh_state = lambda: None
+    adapter._refresh_tactile = lambda: None
+    adapter._check_watchdog = lambda _now: None
+    adapter._maybe_reconnect = lambda _now: None
+
+    def fail_send(_target):
+        adapter._stop_event.set()
+        raise OSError("publisher failed")
+
+    adapter._send = fail_send
+    adapter._worker_loop()
+
+    assert adapter.command_path_healthy is False
+
+
+def test_robotiq_worker_latches_false_send_result():
+    adapter = RobotiqGripper.__new__(RobotiqGripper)
+    adapter._stop_event = threading.Event()
+    adapter._command_queue = Queue(maxsize=1)
+    adapter._command_queue.put((0.04, 0.05, 95))
+    adapter._command_failed = threading.Event()
+    adapter._gripper_io_lock = threading.Lock()
+    adapter._state_lock = threading.Lock()
+    adapter._cached_pos = 0.04
+
+    def status_then_stop():
+        adapter._stop_event.set()
+        return True
+
+    adapter._gripper = SimpleNamespace(
+        goto=lambda **_kwargs: None,
+        sendCommand=lambda: False,
+        getStatus=status_then_stop,
+        get_pos=lambda: 0.04,
+    )
+    adapter._worker_loop()
+
+    assert adapter.command_path_healthy is False
+
+
+def test_sr_set_joint_pos_latches_commit_failure():
+    adapter = SrGripperAdapter.__new__(SrGripperAdapter)
+    adapter._state_lock = threading.Lock()
+    adapter._cached_pos = 0.03
+    adapter._last_slew_target = None
+    adapter._command_failed = threading.Event()
+    adapter._commit_target = lambda *_args: (_ for _ in ()).throw(
+        OSError("ethercat failed")
+    )
+
+    adapter.set_joint_pos(np.array([0.04]))
+
+    assert adapter.command_path_healthy is False
 
 
 def test_wuji_shutdown_propagates_disable_failure_and_retries():

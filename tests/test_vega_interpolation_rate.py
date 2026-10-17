@@ -19,6 +19,31 @@ from dexcontrol.core.vega.robot import (
 from dexcontrol.utils.trajectory_interpolator import TrajectoryInterpolator
 
 
+def test_compensated_head_startup_pose_is_revalidated_before_dispatch():
+    sent = []
+    robot = robot_module._RobotWithCustomHeadPose.__new__(
+        robot_module._RobotWithCustomHeadPose
+    )
+    robot._shutdown_called = True
+    robot._head_init_pos = np.array([-1.483, 0.0, 0.0])
+    robot.head = type(
+        "Head",
+        (),
+        {
+            "set_mode": lambda self, _mode: None,
+            "set_joint_pos": lambda self, value: sent.append(value),
+        },
+    )()
+    robot.compensate_torso_pitch = lambda value, _component: (
+        np.asarray(value) + np.array([-1.57, 0.0, 0.0])
+    )
+
+    with pytest.raises(ValueError, match="compensated head"):
+        robot._set_default_state()
+
+    assert sent == []
+
+
 def test_resampled_smoothing_alpha_preserves_wall_clock_omega():
     source_alpha = 0.1
     source_hz = 20.0
@@ -118,6 +143,23 @@ def test_direct_command_rejects_nonfinite_before_read_or_dispatch():
         robot.update_command(
             np.concatenate([np.zeros(7), [np.nan]]),
             action_space="joint_position",
+        )
+
+
+@pytest.mark.parametrize(
+    ("action_space", "gripper_action_space"),
+    [("joint_typo", "position"), ("joint_position", "velocity_typo")],
+)
+def test_interpolated_command_rejects_unknown_semantics_before_state_read(
+    action_space, gripper_action_space
+):
+    robot = VegaRobot.__new__(VegaRobot)
+    robot._interpolator = object()
+    robot.get_robot_state = lambda: pytest.fail("state read after invalid semantics")
+
+    with pytest.raises(ValueError, match="Unsupported"):
+        robot.add_command_point(
+            np.zeros(8), action_space, gripper_action_space
         )
 
 
@@ -464,12 +506,31 @@ def test_reset_command_state_reseeds_outer_gripper_cache_from_hold():
     robot._gripper_close_pos = np.array([0.0])
     robot._gripper_joint_pos = np.array([0.0])
     robot._gripper_position = 1.0
+    robot._prev_gripper_command_successful = False
     robot.reset_filter_state = lambda: None
 
     robot.reset_command_state()
 
     assert robot._gripper_joint_pos == pytest.approx([0.085])
     assert robot._gripper_position == pytest.approx(0.0)
+    assert robot._prev_gripper_command_successful is True
+
+
+def test_successful_telemetry_does_not_erase_sticky_hand_dispatch_failure():
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.hand = type(
+        "Hand", (), {"get_joint_pos": lambda self: np.array([0.04])}
+    )()
+    robot._gripper_io_lock = threading.Lock()
+    robot._gripper_state_lock = threading.Lock()
+    robot._gripper_open_pos = np.array([0.085])
+    robot._gripper_close_pos = np.array([0.0])
+    robot._gripper_joint_pos = np.array([0.0])
+    robot._gripper_position = 0.0
+    robot._prev_gripper_command_successful = False
+
+    assert robot._refresh_gripper_state() is True
+    assert robot._prev_gripper_command_successful is False
 
 
 def test_reset_command_state_retains_restart_intent_after_adapter_failure():

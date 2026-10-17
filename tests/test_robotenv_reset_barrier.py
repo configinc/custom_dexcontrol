@@ -317,6 +317,7 @@ def test_service_rejects_invalid_ema_alpha_before_robot_creation(
         ("head_init_pos", [1.484, 0.0, 0.0]),
         ("head_init_pos", [0.0, 2.793, 0.0]),
         ("head_init_pos", [0.0, 0.0, -1.379]),
+        ("head_init_pos", [True, False, False]),
         ("wuji_effort_limit", float("inf")),
         ("wuji_effort_limit", 1.71),
         ("interpolation_history", 1),
@@ -499,7 +500,7 @@ def test_force_calibration_claim_drain_failure_restores_prior_loop_state():
     assert service._command_recovery_required.is_set()
 
 
-def test_command_recovery_interlock_clears_only_after_successful_retry():
+def test_command_recovery_drain_does_not_clear_interlock_before_reset_commit():
     service = _service()
     attempts = []
 
@@ -515,7 +516,57 @@ def test_command_recovery_interlock_clears_only_after_successful_retry():
     assert service._command_recovery_required.is_set()
 
     service._reset_robot_command_state()
+    assert service._command_recovery_required.is_set()
+
+
+def test_failed_recovery_reset_keeps_interlock_latched():
+    class Context:
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    service._command_recovery_required.set()
+    service.reset_joints = np.zeros(7)
+    service._execute_reset_sequence = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(RuntimeError("arm transport still failed"))
+    )
+    context = Context()
+
+    service.Reset(SimpleNamespace(mode="home", params={}), context)
+
+    assert service._command_recovery_required.is_set()
+    assert context.code == grpc.StatusCode.INTERNAL
+
+
+def test_successful_current_reset_commits_recovery_clear():
+    class Context:
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, _code):
+            pass
+
+        def set_details(self, _details):
+            pass
+
+    service = _service()
+    service._command_recovery_required.set()
+    service._command_recovery_error = "old dispatch failure"
+    service._create_observation = lambda: ({}, 1)
+
+    response = service.Reset(
+        SimpleNamespace(mode="current", params={}), Context()
+    )
+
+    assert response.status == "SUCCESS"
     assert service._command_recovery_required.is_set() is False
+    assert service._command_recovery_error == ""
 
 
 def test_control_loop_dispatch_failure_latches_recovery_and_stops_dispatch():

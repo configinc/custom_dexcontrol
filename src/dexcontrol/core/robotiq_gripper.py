@@ -92,6 +92,7 @@ class RobotiqGripper:
         self._state_lock = threading.Lock()
         self._command_queue: Queue[tuple[float, float, float]] = Queue(maxsize=1)
         self._stop_event = threading.Event()
+        self._command_failed = threading.Event()
         self._worker = threading.Thread()
         self._gripper = None
         try:
@@ -150,8 +151,11 @@ class RobotiqGripper:
                 try:
                     with self._gripper_io_lock:
                         self._gripper.goto(pos=pos_m, vel=vel, force=force)
-                        self._gripper.sendCommand()
+                        sent = self._gripper.sendCommand()
+                        if sent is False:
+                            raise RuntimeError("Robotiq command transmission failed")
                 except Exception as e:
+                    self._command_failed.set()
                     logger.warning("Robotiq worker command error: {}", e)
 
             if self._stop_event.is_set():
@@ -259,6 +263,9 @@ class RobotiqGripper:
             sent = self._gripper.sendCommand()
             if sent is False:
                 raise RuntimeError("Robotiq measured hold transmission failed")
+        if not hasattr(self, "_command_failed"):
+            self._command_failed = threading.Event()
+        self._command_failed.clear()
         with self._state_lock:
             self._cached_pos = measured
         self._command_queue = Queue(maxsize=1)
@@ -269,6 +276,11 @@ class RobotiqGripper:
             daemon=True,
         )
         self._worker.start()
+
+    @property
+    def command_path_healthy(self) -> bool:
+        failed = getattr(self, "_command_failed", None)
+        return failed is None or not failed.is_set()
 
     def shutdown(self) -> None:
         """Stop worker thread and disconnect from the gripper."""

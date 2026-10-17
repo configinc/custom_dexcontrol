@@ -485,6 +485,7 @@ class WujiHandAdapter:
             self._command_queue: Queue[np.ndarray] = Queue(maxsize=1)
             self._latest_target: np.ndarray | None = None
             self._connected = True
+            self._command_failed = threading.Event()
             self._disconnected_since: float | None = None
             self._next_reconnect_at = 0.0
             self._reconnects = 0
@@ -1074,6 +1075,7 @@ class WujiHandAdapter:
                 try:
                     self._send(self._latest_target)
                 except Exception as e:
+                    self._command_failed.set()
                     logger.warning("Wuji hand worker command error: {}", e)
 
             dt = time.monotonic() - t0
@@ -1449,20 +1451,32 @@ class WujiHandAdapter:
             self._worker.join(timeout=2.0)
             if self._worker.is_alive():
                 raise RuntimeError("Wuji hand worker did not stop within 2 seconds")
-        with self._state_lock:
-            generation_before = self._state_generation
+        # Drain frames queued before the boundary first. They may describe the
+        # pose before the just-finished command and cannot authorize the hold.
         self._refresh_state()
         with self._state_lock:
-            measured = self._cached_pos.copy()
-            all_joints_observed = bool(self._state_seen_mask.all())
-            generation_after = self._state_generation
-        measured_is_finite = bool(np.isfinite(measured).all())
-        if (
-            generation_after <= generation_before
-            or not all_joints_observed
-            or not measured_is_finite
-            or time.monotonic() - self._last_state_time > self._STALE_S
-        ):
+            generation_before = self._state_generation
+        boundary_started_at = time.monotonic()
+        deadline = boundary_started_at + 0.25
+        measured = None
+        while time.monotonic() < deadline:
+            self._refresh_state()
+            with self._state_lock:
+                candidate = self._cached_pos.copy()
+                all_joints_observed = bool(self._state_seen_mask.all())
+                generation_after = self._state_generation
+                last_valid_time = self._last_valid_time.copy()
+            if (
+                generation_after > generation_before
+                and all_joints_observed
+                and bool(np.isfinite(candidate).all())
+                and bool(np.all(last_valid_time >= boundary_started_at))
+                and time.monotonic() - self._last_state_time <= self._STALE_S
+            ):
+                measured = candidate
+                break
+            time.sleep(0.005)
+        if measured is None:
             raise RuntimeError(
                 "Wuji fresh post-boundary finite measured hold is unavailable"
             )
@@ -1471,13 +1485,16 @@ class WujiHandAdapter:
         # link disconnected. Do this only after the complete-state checks.
         self._connected = True
         self._disconnected_since = None
-        self._latest_target = measured if measured_is_finite else None
-        self._cmd_pos = measured.copy() if measured_is_finite else None
+        self._latest_target = measured
+        self._cmd_pos = measured.copy()
         self._last_send_time = None
-        if measured_is_finite and self._connected:
+        if self._connected:
             # Establish the hold before returning the ownership boundary; do
             # not rely on the replacement worker being scheduled promptly.
             self._send(measured)
+        if not hasattr(self, "_command_failed"):
+            self._command_failed = threading.Event()
+        self._command_failed.clear()
         self._command_queue = Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._worker = threading.Thread(
@@ -1486,6 +1503,11 @@ class WujiHandAdapter:
             daemon=True,
         )
         self._worker.start()
+
+    @property
+    def command_path_healthy(self) -> bool:
+        failed = getattr(self, "_command_failed", None)
+        return failed is None or not failed.is_set()
 
     def get_predefined_pose(self, name: str) -> np.ndarray:
         """Return a predefined pose by name ('open' or 'close')."""

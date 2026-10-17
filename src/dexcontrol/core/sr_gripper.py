@@ -172,6 +172,7 @@ class SrGripperAdapter:
         self._gripper: SrGripper | None = None
         self._worker: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._command_failed = threading.Event()
         self._bringup(calibrate=True)
 
     def _bringup(self, calibrate: bool) -> None:
@@ -276,8 +277,9 @@ class SrGripperAdapter:
             return
         with self._gripper_io_lock:
             ok = self._gripper.client.sendCommand(self._last_sent_packet)
-        if ok:
-            self._last_send_t = now
+        if not ok:
+            raise RuntimeError("SR gripper re-stream transmission failed")
+        self._last_send_t = now
 
     def _worker_loop(self) -> None:
         """Background loop: re-assert the latest commit every tick + refresh state.
@@ -299,6 +301,7 @@ class SrGripperAdapter:
             try:
                 self._resend_active()
             except Exception as e:
+                self._command_failed.set()
                 logger.warning("SR worker re-stream error: {}", e)
 
             try:
@@ -371,6 +374,7 @@ class SrGripperAdapter:
         try:
             self._commit_target(issued, 0.05, 95)
         except Exception as e:
+            self._command_failed.set()
             logger.warning("SR set_joint_pos send error: {}", e)
         # No optimistic _cached_pos update — the worker fights it with
         # the real 1 kHz PDO measurement otherwise, producing visible jumps.
@@ -411,6 +415,9 @@ class SrGripperAdapter:
         self._last_send_t = 0.0
         self._last_slew_target = measured
         self._commit_target(measured, 0.05, 95)
+        if not hasattr(self, "_command_failed"):
+            self._command_failed = threading.Event()
+        self._command_failed.clear()
         self._stop_event = threading.Event()
         self._worker = threading.Thread(
             target=self._worker_loop,
@@ -418,6 +425,11 @@ class SrGripperAdapter:
             daemon=True,
         )
         self._worker.start()
+
+    @property
+    def command_path_healthy(self) -> bool:
+        failed = getattr(self, "_command_failed", None)
+        return failed is None or not failed.is_set()
 
     def reconnect(self) -> None:
         """Tear down and re-establish the SR EtherCAT connection.

@@ -75,6 +75,18 @@ class _RobotWithCustomHeadPose(Robot):
                 init_pos = self.compensate_torso_pitch(
                     head.get_predefined_pose("home"), "head"
                 )
+            init_pos = np.asarray(init_pos, dtype=np.float64)
+            lower = np.array([-1.483, -2.792, -1.378], dtype=np.float64)
+            upper = np.array([1.483, 2.792, 1.483], dtype=np.float64)
+            if (
+                init_pos.shape != (3,)
+                or not np.isfinite(init_pos).all()
+                or np.any(init_pos < lower)
+                or np.any(init_pos > upper)
+            ):
+                raise ValueError(
+                    "torso-compensated head startup pose exceeds Vega joint limits"
+                )
             head.set_joint_pos(init_pos)
 
 _base_arm_teleop_error = None
@@ -554,6 +566,7 @@ class VegaRobot:
             raise RuntimeError(
                 "fresh hand state is unavailable after command-boundary hold"
             )
+        self._prev_gripper_command_successful = True
         self.reset_filter_state()
         if restart_worker:
             self._start_gripper_worker()
@@ -641,7 +654,6 @@ class VegaRobot:
             with self._gripper_state_lock:
                 self._gripper_joint_pos = hand_joint_pos.copy()
                 self._gripper_position = gripper_position
-            self._prev_gripper_command_successful = True
             return True
         except Exception:
             self._prev_gripper_command_successful = False
@@ -711,6 +723,12 @@ class VegaRobot:
             return np.zeros(1, dtype=np.float64)
         with self._gripper_state_lock:
             return np.asarray(self._gripper_joint_pos, dtype=np.float64).copy()
+
+    def hand_command_path_healthy(self) -> bool:
+        if self.hand is None:
+            return True
+        health = getattr(self.hand, "command_path_healthy", True)
+        return bool(health() if callable(health) else health)
 
     # gripper_types that expose the end-effector as a multi-DoF joint vector.
     # Everything else — INCLUDING gripper_type "default" with an integrated
@@ -862,12 +880,25 @@ class VegaRobot:
         if kind == "none":
             return
         if kind == "scalar":
-            self.update_gripper(float(target[0]), velocity=False, blocking=blocking)
+            if blocking:
+                self._clear_gripper_command_queue()
+                self._execute_gripper_command(
+                    float(target[0]),
+                    wait_time=1.0 / max(1, self.control_hz),
+                    raise_on_error=True,
+                )
+            else:
+                self._enqueue_gripper_target(float(target[0]))
+                self._prev_gripper_command_successful = True
             return
         wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
-        with self._gripper_io_lock:
-            self.hand.set_joint_pos(target, wait_time=wait_time)
-        self._prev_gripper_command_successful = True
+        try:
+            with self._gripper_io_lock:
+                self.hand.set_joint_pos(target, wait_time=wait_time)
+            self._prev_gripper_command_successful = True
+        except Exception:
+            self._prev_gripper_command_successful = False
+            raise
 
     def update_command(
         self,
@@ -973,6 +1004,12 @@ class VegaRobot:
         When interpolation is disabled this falls back to the
         synchronous ``update_command()`` path.
         """
+        if action_space not in SUPPORTED_ACTION_SPACES:
+            raise ValueError(f"Unsupported action_space '{action_space}'")
+        if gripper_action_space not in ("position", "velocity"):
+            raise ValueError(
+                f"Unsupported gripper_action_space '{gripper_action_space}'"
+            )
         if self._interpolator is None:
             # No interpolation — direct execution (legacy path).
             self.update_command(command, action_space, gripper_action_space, blocking=False)
@@ -1087,7 +1124,10 @@ class VegaRobot:
         thread.  Returns ``True`` if a command was sent, ``False`` if
         there is no data yet.
         """
-        if getattr(self, "hand", None) is not None and not self._prev_gripper_command_successful:
+        if getattr(self, "hand", None) is not None and (
+            not self._prev_gripper_command_successful
+            or not self.hand_command_path_healthy()
+        ):
             raise CommunicationFailedError(
                 "previous asynchronous hand dispatch or state refresh failed"
             )

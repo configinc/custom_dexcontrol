@@ -202,6 +202,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         )
         if not 0.0 <= normalized_rot_sensitivity <= 2.0:
             raise ValueError("rot_sensitivity must be between 0 and 2")
+        raw_head_init_pos = np.asarray(head_init_pos)
+        if raw_head_init_pos.shape == (3,) and any(
+            isinstance(value, (bool, np.bool_)) for value in raw_head_init_pos.flat
+        ):
+            raise ValueError("head_init_pos must contain numeric radians, not booleans")
         normalized_head_init_pos = np.asarray(head_init_pos, dtype=np.float64)
         if (
             normalized_head_init_pos.shape != (3,)
@@ -604,17 +609,39 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         LOGGER.info("Control loop running at %d Hz", self._control_loop_hz)
         while not self._control_loop_stop.is_set():
             t0 = time.perf_counter()
+            dispatch_error = None
             try:
                 if (
                     not self._reset_in_progress.is_set()
                     and not self._force_calibration_owns_robot.is_set()
                     and not self._command_recovery_required.is_set()
+                    and self._cmd_lock.acquire(blocking=False)
                 ):
-                    self._robot.execute_interpolated_tick()
+                    try:
+                        # Recheck after acquiring the same admission gate used
+                        # by Step. A physical failure publishes the recovery
+                        # latch before this gate is released, so no later Step
+                        # can queue work in the failure window.
+                        if (
+                            not self._reset_in_progress.is_set()
+                            and not self._force_calibration_owns_robot.is_set()
+                            and not self._command_recovery_required.is_set()
+                        ):
+                            self._robot.execute_interpolated_tick()
+                    except Exception as exc:
+                        dispatch_error = exc
+                        self._command_recovery_error = (
+                            f"interpolated dispatch failed: {exc}"
+                        )
+                        self._command_recovery_required.set()
+                    finally:
+                        self._cmd_lock.release()
             except Exception as exc:
-                LOGGER.error("Control loop tick error: %s", exc)
-                self._command_recovery_error = f"interpolated dispatch failed: {exc}"
+                dispatch_error = exc
+                self._command_recovery_error = f"control loop failed: {exc}"
                 self._command_recovery_required.set()
+            if dispatch_error is not None:
+                LOGGER.error("Control loop tick error: %s", dispatch_error)
             elapsed = time.perf_counter() - t0
             sleep_time = dt - elapsed
             if sleep_time > 0:
@@ -622,7 +649,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
     def _claim_robot_for_force_calibration(self) -> bool:
         with self._force_calibration_owner_lock:
-            if self._shutdown_started.is_set():
+            if (
+                self._shutdown_started.is_set()
+                or self._command_recovery_required.is_set()
+            ):
                 return False
             if self._force_calibration_owns_robot.is_set() or self._reset_in_progress.is_set():
                 return False
@@ -685,8 +715,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self._command_recovery_error = "command-boundary recovery failed"
             self._command_recovery_required.set()
             raise
-        self._command_recovery_error = ""
-        self._command_recovery_required.clear()
 
     def _set_force_calibration_applier(self, applier) -> None:
         with self._force_calibration_applier_lock:
@@ -1266,6 +1294,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                         or self._active_reset_cancel is not motion_cancelled
                     ):
                         raise RuntimeError("Reset was superseded before its response was committed")
+                    self._command_recovery_error = ""
+                    self._command_recovery_required.clear()
                     return robotenv_pb2.ResetResponse(
                         observation=observation,
                         status="SUCCESS",
@@ -1532,18 +1562,33 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     gripper_action_space=gripper_action_space,
                 )
             else:
-                self._robot.update_command(
-                    action,
-                    action_space=action_space,
-                    gripper_action_space=gripper_action_space,
-                    blocking=False,
+                hand_health = getattr(
+                    self._robot, "hand_command_path_healthy", lambda: True
                 )
+                if not getattr(
+                    self._robot, "_prev_gripper_command_successful", True
+                ) or not hand_health():
+                    self._command_recovery_error = (
+                        "previous asynchronous hand dispatch failed"
+                    )
+                    self._command_recovery_required.set()
+                    raise CommunicationFailedError(self._command_recovery_error)
+                try:
+                    self._robot.update_command(
+                        action,
+                        action_space=action_space,
+                        gripper_action_space=gripper_action_space,
+                        blocking=False,
+                    )
+                except CommunicationFailedError as exc:
+                    self._command_recovery_error = f"direct dispatch failed: {exc}"
+                    self._command_recovery_required.set()
+                    raise
 
     @_track_transport_rpc(robotenv_pb2.HealthCheckResponse)
     def HealthCheck(self, request, context):
         del request, context
         try:
-            self._robot.get_robot_state()
             version_info = self._load_version_info()
             version_str = version_info.get("tag", "1.0.0-vega")
             if self._command_recovery_required.is_set():
@@ -1559,6 +1604,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     ),
                     version=version_str,
                 )
+            self._robot.get_robot_state()
             return robotenv_pb2.HealthCheckResponse(
                 status="HEALTHY",
                 message=f"Vega {self.arm_side} arm operational",
