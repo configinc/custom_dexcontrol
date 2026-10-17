@@ -197,6 +197,82 @@ def test_service_uses_normalized_control_hz_after_validation(monkeypatch):
     assert calls == [20]
 
 
+@pytest.mark.parametrize(
+    "control_loop_hz",
+    [-1, 0.5, float("nan"), float("inf"), False, np.bool_(True)],
+)
+def test_service_rejects_invalid_control_loop_hz_before_robot_creation(
+    monkeypatch, control_loop_hz
+):
+    robot_calls = []
+    monkeypatch.setattr(
+        server_module,
+        "VegaRobot",
+        lambda **kwargs: robot_calls.append(kwargs),
+    )
+
+    with pytest.raises(
+        ValueError, match="control_loop_hz must be a finite non-negative integer"
+    ):
+        VegaRobotEnvService(arm_side="left", control_loop_hz=control_loop_hz)
+
+    assert robot_calls == []
+
+
+@pytest.mark.parametrize("control_loop_hz", ["0", "100", 100.0, np.int64(100)])
+def test_service_normalizes_control_loop_hz_before_robot_creation(
+    monkeypatch, control_loop_hz
+):
+    class StopConstruction(Exception):
+        pass
+
+    class Robot:
+        def __init__(self, **kwargs):
+            raise StopConstruction
+
+    monkeypatch.setattr(server_module, "VegaRobot", Robot)
+
+    with pytest.raises(StopConstruction):
+        VegaRobotEnvService(arm_side="left", control_loop_hz=control_loop_hz)
+
+
+@pytest.mark.parametrize("ema_alpha", [1.0, "1.0", 2.0])
+def test_service_normalizes_ema_alpha_before_robot_creation(monkeypatch, ema_alpha):
+    calls = []
+
+    class StopConstruction(Exception):
+        pass
+
+    class Robot:
+        def __init__(self, **kwargs):
+            calls.append(kwargs["ema_alpha"])
+            raise StopConstruction
+
+    monkeypatch.setattr(server_module, "VegaRobot", Robot)
+
+    with pytest.raises(StopConstruction):
+        VegaRobotEnvService(arm_side="left", ema_alpha=ema_alpha)
+
+    assert calls == [0.99]
+
+
+@pytest.mark.parametrize("ema_alpha", [float("nan"), float("inf"), "bad"])
+def test_service_rejects_invalid_ema_alpha_before_robot_creation(
+    monkeypatch, ema_alpha
+):
+    robot_calls = []
+    monkeypatch.setattr(
+        server_module,
+        "VegaRobot",
+        lambda **kwargs: robot_calls.append(kwargs),
+    )
+
+    with pytest.raises(ValueError, match="ema_alpha must be finite"):
+        VegaRobotEnvService(arm_side="left", ema_alpha=ema_alpha)
+
+    assert robot_calls == []
+
+
 def test_force_calibration_claim_rolls_back_if_control_loop_does_not_stop():
     service = _service()
     service._control_loop_stop = threading.Event()

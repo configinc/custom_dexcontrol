@@ -239,6 +239,13 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             or float(control_loop_hz) != normalized_control_loop_hz
         ):
             raise ValueError("control_loop_hz must be a finite non-negative integer")
+        try:
+            raw_ema_alpha = float(ema_alpha)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("ema_alpha must be finite") from exc
+        if not np.isfinite(raw_ema_alpha):
+            raise ValueError("ema_alpha must be finite")
+        normalized_ema_alpha = float(np.clip(raw_ema_alpha, 0.0, 0.99))
 
         self._robot = VegaRobot(
             robot_model=robot_model,
@@ -250,7 +257,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             robotiq_comport=robotiq_comport,
             wuji_sn=wuji_sn,
             wuji_effort_limit=wuji_effort_limit,
-            ema_alpha=ema_alpha,
+            ema_alpha=normalized_ema_alpha,
             interpolation_method=interpolation_method,
             interpolation_history=interpolation_history,
             filter_type=filter_type,
@@ -346,13 +353,13 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self._max_lin_delta,
             self._max_rot_delta,
         )
-        if ema_alpha > 0:
-            _omega = ema_alpha / (
-                (1.0 / self.control_hz) * (1.0 - ema_alpha)
+        if normalized_ema_alpha > 0:
+            _omega = normalized_ema_alpha / (
+                (1.0 / self.control_hz) * (1.0 - normalized_ema_alpha)
             )
             LOGGER.info(
                 "2nd-order smoothing: enabled (alpha=%.3f, omega=%.1f rad/s, critically damped)",
-                ema_alpha, _omega,
+                normalized_ema_alpha, _omega,
             )
         else:
             LOGGER.info("Smoothing: disabled (alpha=0.0)")
