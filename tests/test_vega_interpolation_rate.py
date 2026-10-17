@@ -847,6 +847,38 @@ def test_hardware_dispatch_rejects_overflowed_joint_velocity():
         )
 
 
+def test_jerk_shaped_target_is_revalidated_before_hardware_dispatch():
+    sends = []
+    limits = np.column_stack((np.full(7, -1.0), np.full(7, 1.0)))
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.arm_side = "left"
+    robot.arm = type(
+        "Arm",
+        (),
+        {
+            "joint_pos_limit": limits,
+            "get_joint_pos": lambda self: np.full(7, 0.99),
+            "_send_position_command": lambda self, target: sends.append(target),
+        },
+    )()
+    robot.control_hz = 20
+    robot._last_cmd_joint_pos = np.full(7, 0.99)
+    robot._max_delta_scale = 1.0
+    robot._MOTOR_MAX_JERK_RAD = 0.25
+    robot._prev_cmd_delta = np.full(7, 0.035)
+    robot._HW_CORRECTION_OUTLIER_THRESH = 0.5
+    robot._HW_CORRECTION_ALPHA = 0.7
+    robot._INTERPOLATION_HW_CORRECTION_ALPHA = 0.7
+    robot.use_velocity_feedforward = False
+    robot._agent_debug_log = lambda **kwargs: None
+    robot.sync_motion_manager_with_arm = lambda target: None
+
+    with pytest.raises(robot_module.JointLimitExceededError):
+        robot.update_joints(np.full(7, 0.9), execution_hz=200)
+
+    assert sends == []
+
+
 def test_wuji_velocity_uses_measured_anchor_without_host_clipping():
     class Interpolator:
         def add_point(self, timestamp, target):

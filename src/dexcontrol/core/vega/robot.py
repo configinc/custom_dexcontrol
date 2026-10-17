@@ -1401,6 +1401,11 @@ class VegaRobot:
                 accel = np.clip(accel, -jerk_limit, jerk_limit)
                 diff = self._prev_cmd_delta + accel
                 target_joint_pos = current + diff
+        # Delta/jerk shaping rewrites the already validated target.  The
+        # shaped continuation can overshoot a hard limit when braking near a
+        # boundary, so the value that actually reaches hardware needs its own
+        # final validation.
+        self.validate_joint_limits(target_joint_pos)
         self._prev_cmd_delta = diff.copy()
 
         # #region agent log
