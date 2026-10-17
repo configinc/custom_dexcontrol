@@ -680,6 +680,7 @@ class VegaRobot:
         hand_action: np.ndarray,
         gripper_action_space: str,
         blocking: bool,
+        execution_hz: float | None = None,
     ) -> None:
         """Send the end-effector command.
 
@@ -693,6 +694,7 @@ class VegaRobot:
                 float(hand_action.reshape(-1)[0]) if hand_action.size else 0.0,
                 velocity=(gripper_action_space == "velocity"),
                 blocking=blocking,
+                execution_hz=execution_hz,
             )
             return
         if self.hand is None:
@@ -708,7 +710,8 @@ class VegaRobot:
                     raise ValueError(
                         f"hand velocity command size {target.size} != state size {current.size}"
                     )
-                target = current + target * (1.0 / max(1, self.control_hz))
+                tick_hz = self.control_hz if execution_hz is None else execution_hz
+                target = current + target * (1.0 / max(1, tick_hz))
             # Check before clipping: infinities must fail rather than turn
             # into finite boundary commands that the adapter would accept.
             if not np.isfinite(target).all():
@@ -718,7 +721,8 @@ class VegaRobot:
             if not is_wuji and limits is not None and np.asarray(limits).shape == (target.size, 2):
                 limits = np.asarray(limits, dtype=np.float64)
                 target = np.clip(target, limits[:, 0], limits[:, 1])
-            wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
+            tick_hz = self.control_hz if execution_hz is None else execution_hz
+            wait_time = (1.0 / max(1, tick_hz)) if blocking else 0.0
             with self._gripper_io_lock:
                 self.hand.set_joint_pos(target, wait_time=wait_time)
             self._prev_gripper_command_successful = True
@@ -902,11 +906,17 @@ class VegaRobot:
                 pos = self._filter_pos.copy()
 
         try:
-            self.update_joints(pos, velocity=False, blocking=False)
+            self.update_joints(
+                pos,
+                velocity=False,
+                blocking=False,
+                execution_hz=self.interpolation_control_hz,
+            )
             self._apply_hand_action(
                 hand_action,
                 "velocity" if gripper_vel else "position",
                 blocking=False,
+                execution_hz=self.interpolation_control_hz,
             )
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
@@ -949,11 +959,13 @@ class VegaRobot:
         joint_pos_command: np.ndarray,
         velocity: bool = False,
         blocking: bool = False,
+        execution_hz: float | None = None,
     ) -> None:
         run_id = f"joint-diagnostics-{self.arm_side}"
+        tick_hz = self.control_hz if execution_hz is None else execution_hz
         target_joint_pos = np.asarray(joint_pos_command, dtype=np.float64)
         if velocity:
-            dt = 1.0 / max(1, self.control_hz)
+            dt = 1.0 / max(1, tick_hz)
             current_joint_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
             target_joint_pos = current_joint_pos + target_joint_pos * dt
 
@@ -1078,7 +1090,7 @@ class VegaRobot:
         # #endregion
 
         if self.use_velocity_feedforward and not blocking:
-            dt = 1.0 / max(1, self.control_hz)
+            dt = 1.0 / max(1, tick_hz)
             raw_vel = (target_joint_pos - current) / dt
             if self._prev_joint_vel is not None:
                 a = self._vel_smoothing_alpha
@@ -1098,25 +1110,32 @@ class VegaRobot:
                 )
             self.arm.set_joint_pos_vel(target_joint_pos, target_joint_vel, relative=False)
         elif blocking:
-            wait_time = 1.0 / max(1, self.control_hz)
+            wait_time = 1.0 / max(1, tick_hz)
             self.arm.set_joint_pos(target_joint_pos, wait_time=wait_time)
         else:
             self.arm._send_position_command(target_joint_pos)
         self._last_cmd_joint_pos = target_joint_pos.copy()
         self.sync_motion_manager_with_arm(target_joint_pos)
 
-    def update_gripper(self, command: float, velocity: bool = True, blocking: bool = False) -> None:
+    def update_gripper(
+        self,
+        command: float,
+        velocity: bool = True,
+        blocking: bool = False,
+        execution_hz: float | None = None,
+    ) -> None:
         if self.hand is None:
             self._prev_gripper_command_successful = True
             return
         current = self.get_cached_gripper_position()
+        tick_hz = self.control_hz if execution_hz is None else execution_hz
         if velocity:
-            target = current + float(command) * (1.0 / max(1, self.control_hz))
+            target = current + float(command) * (1.0 / max(1, tick_hz))
         else:
             target = float(command)
 
         target = float(np.clip(target, 0.0, 1.0))
-        wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
+        wait_time = (1.0 / max(1, tick_hz)) if blocking else 0.0
 
         if blocking:
             self._clear_gripper_command_queue()
