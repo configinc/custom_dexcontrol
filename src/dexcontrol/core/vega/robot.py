@@ -1102,10 +1102,6 @@ class VegaRobot:
                 if _force is not None:
                     hand_tactile = np.asarray(_force, dtype=np.float64).tolist()
 
-        wrench_state = np.zeros(6, dtype=np.float64)
-        if getattr(self.arm, "wrench_sensor", None) is not None:
-            wrench_state = np.asarray(self.arm.wrench_sensor.get_wrench_state(), dtype=np.float64)
-
         cartesian_position = self._get_cartesian_pose(joint_positions=joint_positions)
 
         timestamp_ns = int(self.arm.get_timestamp_ns())
@@ -1124,11 +1120,19 @@ class VegaRobot:
             "motor_torques_measured": joint_torques.copy(),
             "gripper_position": gripper_position,
             "cartesian_position": cartesian_position,
-            "wrench_state": wrench_state,
             "prev_controller_latency_ms": float(self._prev_controller_latency_ms),
             "prev_command_successful": bool(self._prev_command_successful),
             "prev_gripper_command_successful": bool(self._prev_gripper_command_successful),
         }
+        for field_name, component_name in (
+            ("torso_joint_positions", "torso"),
+            ("head_joint_positions", "head"),
+        ):
+            component = getattr(getattr(self, "robot", None), component_name, None)
+            if component is not None:
+                values = np.asarray(component.get_joint_pos(), dtype=np.float64)
+                if values.shape == (3,) and np.isfinite(values).all():
+                    state_dict[field_name] = values
         # Only present for hands with a tactile stream; scalar grippers never
         # add this key.
         if hand_tactile is not None:

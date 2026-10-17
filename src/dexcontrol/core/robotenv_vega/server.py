@@ -30,6 +30,10 @@ from core.vega.robot import (  # noqa: E402
     JointLimitExceededError,
     VegaRobot,
 )
+from core.robotenv_vega.wrench_contract import (  # noqa: E402
+    sensor_frame_wrench_to_wrist,
+    vega_wrench_frame_rotations,
+)
 from proto import robotenv_pb2, robotenv_pb2_grpc  # noqa: E402
 
 
@@ -65,6 +69,8 @@ _RESET_MIDDLE_JOINTS = {
 class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     """RobotEnv service implementation for one Vega arm."""
 
+    _WRENCH_WARNING_INTERVAL_SECONDS = 10.0
+
     def __init__(
         self,
         robot_model: str = "vega_1",
@@ -74,6 +80,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         control_hz: int = 20,
         use_velocity_feedforward: bool = False,
         base_frame_rotation: Optional[list[float]] = None,
+        external_wrench_sensor_to_wrist_yaw_degrees: float | None = None,
         ik_solver_type: str = "pink",
         robotiq_comport: str = "/dev/ttyUSB0",
         wuji_sn: Optional[str] = None,
@@ -124,6 +131,29 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self.control_hz = int(control_hz)
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
         self.base_frame_rotation = base_frame_rotation
+        self.external_wrench_sensor_to_wrist_yaw_degrees = (
+            None
+            if external_wrench_sensor_to_wrist_yaw_degrees is None
+            else float(external_wrench_sensor_to_wrist_yaw_degrees)
+        )
+        if (
+            self.external_wrench_sensor_to_wrist_yaw_degrees is not None
+            and not np.isfinite(self.external_wrench_sensor_to_wrist_yaw_degrees)
+        ):
+            raise ValueError(
+                "external_wrench_sensor_to_wrist_yaw_degrees must be finite"
+            )
+        if self.external_wrench_sensor_to_wrist_yaw_degrees is None:
+            LOGGER.info(
+                "publishing source-native external_wrench_sensor_raw; "
+                "RCI owns calibrated wrist/world fields"
+            )
+        else:
+            LOGGER.warning(
+                "ignoring deprecated sensor-to-wrist yaw %.6f degrees; "
+                "RCI owns calibrated wrist/world fields",
+                self.external_wrench_sensor_to_wrist_yaw_degrees,
+            )
         self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(
             self.control_hz, rot_sensitivity=rot_sensitivity,
         )
@@ -187,9 +217,13 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         # Serialize all robot commands — prevents concurrent Reset/Step from
         # sending conflicting position commands to the same arm.
         self._cmd_lock = threading.Lock()
-        # Set by a new Reset to cancel any in-progress _move_incremental loop.
-        self._cancel_move = threading.Event()
-
+        self._command_epoch_lock = threading.Lock()
+        self._command_epoch = 0
+        self._reset_in_progress = threading.Event()
+        self._reset_state_lock = threading.Lock()
+        self._active_reset_count = 0
+        self._active_reset_cancel = None
+        self._reset_restart_control_loop = False
         LOGGER.info(
             "Initialized VegaRobotEnvService model=%s arm=%s gripper=%s frame=%s hz=%s",
             robot_model,
@@ -261,7 +295,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         while not self._control_loop_stop.is_set():
             t0 = time.perf_counter()
             try:
-                self._robot.execute_interpolated_tick()
+                if not self._reset_in_progress.is_set():
+                    self._robot.execute_interpolated_tick()
             except Exception as exc:
                 LOGGER.error("Control loop tick error: %s", exc)
             elapsed = time.perf_counter() - t0
@@ -312,6 +347,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "gripper_type": self.gripper_type,
                 "frame_type": self.frame_type,
                 "control_hz": str(self.control_hz),
+                "force_signal_provider_kind": "wrist_force_torque",
+                "force_signal_provider_schema_version": "2",
+                "force_signal_stream_id": f"{self.robot_model}:{self.arm_side}:wrist_ft",
+                "external_wrench_world_frame_id": self.frame_type,
             },
         )
 
@@ -391,12 +430,51 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description="End-effector pose [x, y, z, roll, pitch, yaw]",
             )
         )
-        spec.fields["wrench_state"].CopyFrom(
+        spec.fields["external_wrench_sensor_raw"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="float64",
                 shape=[6],
                 required=False,
-                description="Wrench state [fx, fy, fz, tx, ty, tz]",
+                description=(
+                    "Source-native uncalibrated F/T sample expressed in sensor axes "
+                    "at the physical sensor origin [fx, fy, fz, tx, ty, tz] "
+                    "(N, N, N, Nm, Nm, Nm); wrench_on_robot sign"
+                ),
+            )
+        )
+        spec.fields["external_wrench_sensor_raw_reference_point"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="string",
+                shape=[],
+                required=False,
+                description="Physical reference point of external_wrench_sensor_raw",
+            )
+        )
+        for field_name, description in (
+            (
+                "external_wrench_wrist_from_sensor_rotation",
+                "3x3 row-major rotation from physical sensor axes to company wrist axes",
+            ),
+            (
+                "external_wrench_world_from_sensor_rotation",
+                "3x3 row-major rotation from physical sensor axes to configured world axes",
+            ),
+        ):
+            spec.fields[field_name].CopyFrom(
+                robotenv_pb2.FieldSpec(
+                    dtype="float64", shape=[9], required=False, description=description
+                )
+            )
+        spec.fields["torso_joint_positions"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64", shape=[3], required=False,
+                description="Measured torso_j1..torso_j3 positions in radians",
+            )
+        )
+        spec.fields["head_joint_positions"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64", shape=[3], required=False,
+                description="Measured head_j1..head_j3 positions in radians",
             )
         )
         spec.fields["prev_controller_latency_ms"].CopyFrom(
@@ -485,58 +563,137 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "robot_model": self.robot_model,
                 "control_hz": str(self.control_hz),
                 "arm_side": self.arm_side,
+                "force_signal_provider_kind": "wrist_force_torque",
+                "force_signal_provider_schema_version": "2",
+                "force_signal_stream_id": f"{self.robot_model}:{self.arm_side}:wrist_ft",
+                "external_wrench_world_frame_id": self.frame_type,
+                "external_wrench_sensor_to_wrist_yaw_degrees": (
+                    "unset"
+                    if self.external_wrench_sensor_to_wrist_yaw_degrees is None
+                    else str(self.external_wrench_sensor_to_wrist_yaw_degrees)
+                ),
             },
         )
 
     def Reset(self, request, context):
         mode = request.mode or "home"
         LOGGER.info("Reset requested: mode=%s arm=%s", mode, self.arm_side)
+        rpc_cancelled = threading.Event()
+        motion_cancelled = threading.Event()
 
-        # Cancel any in-progress _move_incremental from a previous Reset.
-        self._cancel_move.set()
+        def cancel_reset_motion() -> None:
+            rpc_cancelled.set()
+            motion_cancelled.set()
 
-        # Pause the control loop during reset to prevent conflicting commands.
-        was_running = self._control_loop_thread is not None and self._control_loop_thread.is_alive()
-        if was_running:
-            self._stop_control_loop()
+        if hasattr(context, "add_callback") and not context.add_callback(cancel_reset_motion):
+            cancel_reset_motion()
 
-        with self._cmd_lock:
-            self._cancel_move.clear()
-            try:
+        # Establish reset ownership before waiting for the command lock. A new
+        # reset cancels the previous reset's local motion loop, while the
+        # shared in-progress event stays set until every superseded handler has
+        # unwound.
+        with self._reset_state_lock:
+            if self._active_reset_cancel is not None:
+                self._active_reset_cancel.set()
+            self._active_reset_cancel = motion_cancelled
+            self._active_reset_count += 1
+            self._reset_in_progress.set()
+            with self._command_epoch_lock:
+                self._command_epoch += 1
+
+        was_running = False
+        try:
+            with self._cmd_lock:
+                if motion_cancelled.is_set():
+                    raise RuntimeError("Reset was cancelled before robot motion started")
+                calibration_cancellable = bool(
+                    request.params.get("calibration_cancellable", robotenv_pb2.Value()).int_value
+                )
+                # Pause the control loop while this reset owns robot commands.
+                was_running = self._control_loop_thread is not None and self._control_loop_thread.is_alive()
+                if was_running:
+                    with self._reset_state_lock:
+                        self._reset_restart_control_loop = True
+                    self._stop_control_loop()
                 if mode == "home":
                     target_joints = self.reset_joints
-                    self._execute_reset_sequence(target_joints)
+                    self._execute_reset_sequence(
+                        target_joints,
+                        cancelled=motion_cancelled,
+                        interruptible_gripper=calibration_cancellable,
+                    )
                 elif mode == "target":
                     target_joints = self._extract_target_joints(request)
-                    self._execute_reset_sequence(target_joints)
+                    self._execute_reset_sequence(
+                        target_joints,
+                        cancelled=motion_cancelled,
+                        interruptible_gripper=calibration_cancellable,
+                    )
                 elif mode == "random":
                     target_joints = self._sample_random_target()
-                    self._execute_reset_sequence(target_joints)
+                    self._execute_reset_sequence(
+                        target_joints,
+                        cancelled=motion_cancelled,
+                        interruptible_gripper=calibration_cancellable,
+                    )
                 elif mode == "current":
                     pass
                 else:
                     context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                     context.set_details(f"Unknown reset mode: {mode}")
                     return robotenv_pb2.ResetResponse()
+                if motion_cancelled.is_set():
+                    raise RuntimeError("Reset was cancelled during robot motion")
 
                 observation, timestamp_us = self._create_observation()
-                return robotenv_pb2.ResetResponse(
-                    observation=observation,
-                    status="SUCCESS",
-                    message=f"Reset to {mode}",
-                    timestamp_us=timestamp_us,
-                )
-            except Exception as exc:
-                LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
+                # Linearize success against registration of a newer Reset.
+                # A newer owner either sets our cancellation event before
+                # acquiring the command lock or cannot register until after
+                # this response has been committed as the current owner.
+                with self._reset_state_lock:
+                    if (
+                        motion_cancelled.is_set()
+                        or self._active_reset_cancel is not motion_cancelled
+                    ):
+                        raise RuntimeError("Reset was superseded before its response was committed")
+                    return robotenv_pb2.ResetResponse(
+                        observation=observation,
+                        status="SUCCESS",
+                        message=f"Reset to {mode}",
+                        timestamp_us=timestamp_us,
+                    )
+        except Exception as exc:
+            LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
+            if rpc_cancelled.is_set():
+                pass
+            elif motion_cancelled.is_set():
+                context.set_code(grpc.StatusCode.ABORTED)
+                context.set_details("Reset was superseded by a newer reset request")
+            else:
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(f"Reset failed: {exc}")
-                return robotenv_pb2.ResetResponse()
-            finally:
-                # Restart control loop if it was running before reset.
-                if was_running:
-                    self._start_control_loop()
+            return robotenv_pb2.ResetResponse()
+        finally:
+            restart_control_loop = False
+            with self._reset_state_lock:
+                self._active_reset_count -= 1
+                if self._active_reset_cancel is motion_cancelled:
+                    self._active_reset_cancel = None
+                if self._active_reset_count == 0:
+                    self._reset_in_progress.clear()
+                    restart_control_loop = self._reset_restart_control_loop
+                    self._reset_restart_control_loop = False
+            if restart_control_loop:
+                self._start_control_loop()
 
     def Step(self, request, context):
+        rpc_cancelled = threading.Event()
+        if hasattr(context, "add_callback") and not context.add_callback(rpc_cancelled.set):
+            rpc_cancelled.set()
+        with self._reset_state_lock:
+            reset_active_at_entry = self._reset_in_progress.is_set()
+            with self._command_epoch_lock:
+                command_epoch = self._command_epoch
         action_space = request.action_space
         action_space_for_robot = action_space
         action = np.asarray(request.action, dtype=np.float64)
@@ -545,6 +702,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             gripper_action_space = "velocity" if "velocity" in action_space else "position"
 
         try:
+            if reset_active_at_entry:
+                raise RuntimeError("Step was admitted while robot reset was active")
             # -- gripper debug --
             if self._robot.hand is not None:
                 _cur_grip_joint = self._robot.get_cached_gripper_joint_pos()
@@ -597,21 +756,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 np.round(np.asarray(pre_action_state["cartesian_position"], dtype=np.float64), 4).tolist(),
             )
 
-            if self._robot.interpolation_enabled and self._control_loop_hz > 0:
-                # Interpolation mode: buffer command; control loop dispatches.
-                self._robot.add_command_point(
-                    action,
-                    action_space=action_space_for_robot,
-                    gripper_action_space=gripper_action_space,
-                )
-            else:
-                # Legacy synchronous path.
-                self._robot.update_command(
-                    action,
-                    action_space=action_space_for_robot,
-                    gripper_action_space=gripper_action_space,
-                    blocking=False,
-                )
+            self._dispatch_step_command(
+                action,
+                action_space=action_space_for_robot,
+                gripper_action_space=gripper_action_space,
+                command_epoch=command_epoch,
+                rpc_cancelled=rpc_cancelled,
+                reset_active_at_entry=reset_active_at_entry,
+            )
             t_after_cmd = time.time()
 
             # Build comprehensive action_info using the original request action_space
@@ -659,6 +811,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 message=str(exc),
                 timestamp_us=timestamp_us,
             )
+
         except IKFailedError as exc:
             observation, timestamp_us = self._safe_observation()
             return robotenv_pb2.StepResponse(
@@ -684,6 +837,41 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 message=str(exc),
                 timestamp_us=timestamp_us,
             )
+
+    def _dispatch_step_command(
+        self,
+        action: np.ndarray,
+        *,
+        action_space: str,
+        gripper_action_space: str,
+        command_epoch: int,
+        rpc_cancelled: threading.Event | None = None,
+        reset_active_at_entry: bool = False,
+    ) -> None:
+        """Serialize physical Step dispatch with Reset and reject stale work."""
+        with self._cmd_lock:
+            with self._command_epoch_lock:
+                reset_superseded_command = command_epoch != self._command_epoch
+            if (
+                self._reset_in_progress.is_set()
+                or reset_superseded_command
+                or reset_active_at_entry
+                or (rpc_cancelled is not None and rpc_cancelled.is_set())
+            ):
+                raise RuntimeError("Step was superseded by robot reset")
+            if self._robot.interpolation_enabled and self._control_loop_hz > 0:
+                self._robot.add_command_point(
+                    action,
+                    action_space=action_space,
+                    gripper_action_space=gripper_action_space,
+                )
+            else:
+                self._robot.update_command(
+                    action,
+                    action_space=action_space,
+                    gripper_action_space=gripper_action_space,
+                    blocking=False,
+                )
 
     def HealthCheck(self, request, context):
         del request, context
@@ -794,9 +982,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             "cartesian_position": robotenv_pb2.Value(
                 float_array=robotenv_pb2.FloatArray(values=cartesian_position.tolist())
             ),
-            "wrench_state": robotenv_pb2.Value(
-                float_array=robotenv_pb2.FloatArray(values=np.asarray(state_dict["wrench_state"]).tolist())
-            ),
             "prev_controller_latency_ms": robotenv_pb2.Value(
                 float_value=float(state_dict.get("prev_controller_latency_ms", 0.0))
             ),
@@ -810,6 +995,68 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 int_value=int(timestamp_us)
             ),
         }
+        wrench_sensor = getattr(getattr(self._robot, "arm", None), "wrench_sensor", None)
+        if wrench_sensor is not None:
+            try:
+                sensor_wrench = np.asarray(
+                    wrench_sensor.get_wrench_state(),
+                    dtype=np.float64,
+                )
+                if sensor_wrench.shape != (6,) or not np.all(np.isfinite(sensor_wrench)):
+                    raise ValueError("sensor wrench must contain six finite values")
+            except Exception as exc:
+                now = time.monotonic()
+                last_warning = getattr(
+                    self, "_last_wrench_warning_monotonic", float("-inf")
+                )
+                if now - last_warning >= self._WRENCH_WARNING_INTERVAL_SECONDS:
+                    LOGGER.warning(
+                        "Omitting unavailable or malformed source-native F/T "
+                        "sample; expected six finite values (%s: %s)",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    self._last_wrench_warning_monotonic = now
+            else:
+                reference_point = "physical F/T sensor measurement origin"
+                observation["external_wrench_sensor_raw"] = robotenv_pb2.Value(
+                    float_array=robotenv_pb2.FloatArray(
+                        values=sensor_wrench.tolist()
+                    )
+                )
+                observation["external_wrench_sensor_raw_reference_point"] = (
+                    robotenv_pb2.Value(
+                        string_value=reference_point
+                    )
+                )
+                try:
+                    wrist_from_sensor, world_from_sensor = vega_wrench_frame_rotations(
+                        cartesian_position, gripper_type=self.gripper_type
+                    )
+                except ValueError as exc:
+                    LOGGER.warning("Omitting unsupported wrench frame rotations: %s", exc)
+                else:
+                    observation["external_wrench_wrist_from_sensor_rotation"] = (
+                        robotenv_pb2.Value(
+                            float_array=robotenv_pb2.FloatArray(
+                                values=wrist_from_sensor.reshape(-1).tolist()
+                            )
+                        )
+                    )
+                    observation["external_wrench_world_from_sensor_rotation"] = (
+                        robotenv_pb2.Value(
+                            float_array=robotenv_pb2.FloatArray(
+                                values=world_from_sensor.reshape(-1).tolist()
+                            )
+                        )
+                    )
+        for field_name in ("torso_joint_positions", "head_joint_positions"):
+            if field_name in state_dict:
+                observation[field_name] = robotenv_pb2.Value(
+                    float_array=robotenv_pb2.FloatArray(
+                        values=np.asarray(state_dict[field_name], dtype=np.float64).tolist()
+                    )
+                )
         # Hand tactile, present only when the hand streams it. Added as a
         # float_array under its own key when get_robot_state() supplied it;
         # scalar grippers never set "hand_tactile" so the observation is
@@ -857,23 +1104,37 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     _RESET_MAX_STEP_RAD = 0.2
     _RESET_SETTLE_S = 0.5
 
-    def _execute_reset_sequence(self, target_joints: np.ndarray) -> None:
+    def _execute_reset_sequence(
+        self,
+        target_joints: np.ndarray,
+        *,
+        cancelled: threading.Event | None = None,
+        interruptible_gripper: bool = False,
+    ) -> None:
         t0 = time.time()
+        if cancelled is not None and cancelled.is_set():
+            return
         LOGGER.info("Reset[%s]: starting gripper open", self.arm_side)
-        self._robot.update_gripper(0.0, velocity=False, blocking=True)
+        self._robot.update_gripper(
+            0.0,
+            velocity=False,
+            blocking=not interruptible_gripper,
+        )
+        if cancelled is not None and cancelled.is_set():
+            return
         LOGGER.info("Reset[%s]: gripper done (%.2fs), starting reset motion", self.arm_side, time.time() - t0)
         self._robot.reset_filter_state()
 
         # Move to middle waypoint to avoid collisions.
         middle_f64 = np.asarray(self.reset_middle_joints, dtype=np.float64)
         LOGGER.info("Reset[%s]: moving to middle waypoint", self.arm_side)
-        self._move_incremental(middle_f64)
+        self._move_incremental(middle_f64, cancelled=cancelled)
         LOGGER.info("Reset[%s]: middle waypoint reached (%.2fs)", self.arm_side, time.time() - t0)
 
         # Then move to the final target (home/init position).
         target_f64 = np.asarray(target_joints, dtype=np.float64)
         LOGGER.info("Reset[%s]: moving to target", self.arm_side)
-        self._move_incremental(target_f64)
+        self._move_incremental(target_f64, cancelled=cancelled)
         LOGGER.info("Reset[%s]: target reached (%.2fs), syncing motion manager", self.arm_side, time.time() - t0)
 
         self._robot.reset_filter_state()
@@ -889,6 +1150,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         target: np.ndarray,
         tolerance: float | None = None,
         timeout: float | None = None,
+        cancelled: threading.Event | None = None,
     ) -> None:
         """Move to target in incremental steps respecting motor delta limit."""
         tol = tolerance if tolerance is not None else self._RESET_TOLERANCE_RAD
@@ -903,7 +1165,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         _tick = 0  # [BUG PROBE]
 
         while time.time() < deadline:
-            if self._cancel_move.is_set():
+            if cancelled is not None and cancelled.is_set():
                 LOGGER.info("_move_incremental cancelled by new request")
                 return
 
@@ -1015,6 +1277,7 @@ def serve(
     control_hz: int = 20,
     use_velocity_feedforward: bool = False,
     base_frame_rotation: Optional[list[float]] = None,
+    external_wrench_sensor_to_wrist_yaw_degrees: float | None = None,
     ik_solver_type: str = "pink",
     robotiq_comport: str = "/dev/ttyUSB0",
     wuji_sn: Optional[str] = None,
@@ -1072,6 +1335,9 @@ def serve(
         control_hz=control_hz,
         use_velocity_feedforward=use_velocity_feedforward,
         base_frame_rotation=base_frame_rotation,
+        external_wrench_sensor_to_wrist_yaw_degrees=(
+            external_wrench_sensor_to_wrist_yaw_degrees
+        ),
         ik_solver_type=ik_solver_type,
         robotiq_comport=robotiq_comport,
         wuji_sn=wuji_sn,
@@ -1179,6 +1445,15 @@ def main() -> None:
         default=None,
         metavar=("ROLL", "PITCH", "YAW"),
         help="Custom base-frame rotation in degrees",
+    )
+    parser.add_argument(
+        "--external-wrench-sensor-to-wrist-yaw-degrees",
+        type=float,
+        default=None,
+        help=(
+            "Deprecated compatibility option. RobotEnv publishes only "
+            "external_wrench_sensor_raw; RCI owns calibrated wrist/world output."
+        ),
     )
     parser.add_argument(
         "--ik-solver",
@@ -1364,6 +1639,9 @@ def main() -> None:
         control_hz=args.control_hz,
         use_velocity_feedforward=args.use_velocity_feedforward,
         base_frame_rotation=args.base_frame_rotation,
+        external_wrench_sensor_to_wrist_yaw_degrees=(
+            args.external_wrench_sensor_to_wrist_yaw_degrees
+        ),
         ik_solver_type=args.ik_solver,
         robotiq_comport=gripper_addr,
         wuji_sn=args.wuji_sn,
