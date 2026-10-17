@@ -177,6 +177,21 @@ def test_advance_executes_each_stage_once_and_stages_candidate(tmp_path: Path) -
     assert adapter.executions == ["stage-0", "stage-1"]
 
 
+def test_in_flight_advance_retry_is_idempotent(tmp_path: Path) -> None:
+    manager, adapter, _ = _manager(tmp_path)
+    adapter.block = True
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    assert adapter.entered.wait(1.0)
+
+    retry = manager.advance("run-1", 0, "stage-0")
+
+    assert retry.state == "MOVING"
+    assert adapter.executions == ["stage-0"]
+    adapter.release.set()
+    _wait_state(manager, "READY_FOR_STAGE")
+
+
 def test_commit_applies_candidate_and_releases_robot(tmp_path: Path) -> None:
     manager, adapter, claim = _manager(tmp_path)
     manager.start("run-1", True)
@@ -189,6 +204,24 @@ def test_commit_applies_candidate_and_releases_robot(tmp_path: Path) -> None:
     assert len(adapter.installed) == 1
     assert claim.owned is False
     assert claim.releases == 1
+
+
+def test_commit_retry_is_idempotent(tmp_path: Path) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+    manager.advance("run-1", 1, "stage-1")
+    ready = _wait_state(manager, "READY_TO_APPLY")
+
+    first = manager.commit("run-1", ready.plan_sha256)
+    retry = manager.commit("run-1", ready.plan_sha256)
+
+    assert first.state == retry.state == "SUCCEEDED"
+    assert len(adapter.installed) == 1
+    assert claim.releases == 1
+    with pytest.raises(LifecycleError, match="stale Commit request"):
+        manager.commit("run-1", "wrong-plan")
 
 
 def test_commit_validates_runtime_candidate_before_durable_success(tmp_path: Path) -> None:
@@ -265,6 +298,34 @@ def test_transient_partial_commit_is_repaired_with_matching_runtime(
     assert claim.owned is False
 
 
+def test_failure_record_write_error_does_not_leave_robot_claimed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+
+    def fail_fit(_holds):
+        raise RuntimeError("fit failed")
+
+    original_write = lifecycle_module._atomic_write_json
+
+    def fail_terminal_write(path, value):
+        if path == manager.lifecycle.terminal_state_path:
+            raise OSError("terminal write failed")
+        return original_write(path, value)
+
+    adapter.fit = fail_fit
+    monkeypatch.setattr(lifecycle_module, "_atomic_write_json", fail_terminal_write)
+    manager.advance("run-1", 1, "stage-1")
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and claim.owned:
+        time.sleep(0.005)
+    assert claim.owned is False
+
+
 def test_cancel_stops_worker_returns_safe_and_releases(tmp_path: Path) -> None:
     manager, adapter, claim = _manager(tmp_path)
     adapter.block = True
@@ -329,6 +390,65 @@ def test_server_deadline_cancels_and_releases_without_status_poll(tmp_path: Path
         release_robot=claim.release,
     )
     manager.start("run-deadline", True)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and claim.owned:
+        time.sleep(0.005)
+    assert claim.owned is False
+    assert lifecycle.status().state == "CANCELLED"
+
+
+def test_completed_stage_retry_preserves_server_deadline(tmp_path: Path) -> None:
+    adapter = FakeAdapter()
+    claim = Claim()
+    lifecycle = ForceCalibrationLifecycle(
+        plan=_plan(tmp_path),
+        server_identity={"robot": "vega", "arm": "left"},
+        storage_directory=tmp_path / "retry-deadline-state",
+        calibration_kind="vega_wrist_ft_v1",
+        reference_point_id="sensor-origin",
+        command_timeout_seconds=0.05,
+    )
+    manager = VegaForceCalibrationManager(
+        lifecycle=lifecycle,
+        adapter=adapter,
+        claim_robot=claim.acquire,
+        release_robot=claim.release,
+    )
+    manager.start("run-retry", True)
+    manager.advance("run-retry", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+
+    retry = manager.advance("run-retry", 0, "stage-0")
+    assert retry.state == "READY_FOR_STAGE"
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and claim.owned:
+        time.sleep(0.005)
+    assert claim.owned is False
+    assert lifecycle.status().state == "CANCELLED"
+
+
+def test_early_deadline_callback_rearms_remaining_timeout(tmp_path: Path) -> None:
+    adapter = FakeAdapter()
+    claim = Claim()
+    lifecycle = ForceCalibrationLifecycle(
+        plan=_plan(tmp_path),
+        server_identity={"robot": "vega", "arm": "left"},
+        storage_directory=tmp_path / "early-deadline-state",
+        calibration_kind="vega_wrist_ft_v1",
+        reference_point_id="sensor-origin",
+        command_timeout_seconds=0.05,
+    )
+    manager = VegaForceCalibrationManager(
+        lifecycle=lifecycle,
+        adapter=adapter,
+        claim_robot=claim.acquire,
+        release_robot=claim.release,
+    )
+    manager.start("run-early", True)
+
+    manager._deadline_elapsed("run-early")
+
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline and claim.owned:
         time.sleep(0.005)

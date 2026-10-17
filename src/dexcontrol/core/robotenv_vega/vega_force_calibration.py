@@ -439,7 +439,14 @@ class VegaForceCalibrationManager:
             with self._lock:
                 if self.lifecycle.status().run_id != run_id:
                     return
-            self.expire_deadline()
+                status = self.lifecycle.expire_command_deadline()
+                if status.state == "CANCELLING":
+                    self.request_cancel(status.run_id)
+                elif status.state == "READY_FOR_STAGE":
+                    # threading.Timer is monotonic while the durable deadline is
+                    # wall-clock based.  If a callback wakes a little early,
+                    # preserve the server-owned timeout by arming the remainder.
+                    self._schedule_deadline_locked(status)
         except BaseException:
             LOGGER.exception("Vega force calibration deadline cleanup failed")
 
@@ -506,12 +513,10 @@ class VegaForceCalibrationManager:
 
     def advance(self, run_id: str, stage_index: int, stage_id: str) -> CalibrationStatusSnapshot:
         with self._lock:
-            if self._worker is not None and self._worker.is_alive():
-                raise LifecycleError("FAILED_PRECONDITION", "stage worker is already running")
             status, payload = self.lifecycle.advance(run_id, stage_index, stage_id)
-            self._cancel_deadline_locked()
             if payload is None:
                 return status
+            self._cancel_deadline_locked()
             worker = threading.Thread(
                 target=self._run_stage,
                 args=(run_id, stage_index, stage_id, deepcopy(payload)),
@@ -579,7 +584,12 @@ class VegaForceCalibrationManager:
                     self.lifecycle.fail(run_id, str(exc) or type(exc).__name__)
                 except LifecycleError:
                     pass
-                self._release_if_owned()
+                except BaseException:
+                    LOGGER.exception(
+                        "Vega force calibration failure state could not be persisted"
+                    )
+                finally:
+                    self._release_if_owned()
         finally:
             with self._lock:
                 if self._worker is threading.current_thread():
@@ -639,6 +649,11 @@ class VegaForceCalibrationManager:
 
     def commit(self, run_id: str, plan_sha256: str) -> CalibrationStatusSnapshot:
         with self._lock:
+            current = self.lifecycle.status()
+            if current.state == "SUCCEEDED":
+                status = self.lifecycle.commit(run_id, plan_sha256)
+                self._release_if_owned()
+                return status
             record = self.lifecycle.get_staged_candidate(run_id)
             parameters = self._candidate
             if parameters is None:
