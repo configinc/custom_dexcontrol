@@ -257,6 +257,7 @@ class ForceCalibrationLifecycle:
         reference_point_id: str,
         command_timeout_seconds: float = 30.0,
         now_us: Callable[[], int] = _unix_us,
+        validate_parameters: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         if not math.isfinite(command_timeout_seconds) or command_timeout_seconds <= 0:
             raise ValueError("command_timeout_seconds must be finite and positive")
@@ -267,6 +268,7 @@ class ForceCalibrationLifecycle:
         self.reference_point_id = _non_empty_string(reference_point_id, "reference_point_id")
         self.command_timeout_us = int(command_timeout_seconds * 1_000_000)
         self.now_us = now_us
+        self.validate_parameters = validate_parameters
         self.server_instance_id = uuid.uuid4().hex
         self._lock = threading.RLock()
         self._state = "IDLE"
@@ -403,6 +405,8 @@ class ForceCalibrationLifecycle:
         if require_current and now >= expires:
             raise ValueError("calibration cache expired")
         record["parameters"] = _strict_json_object(record.get("parameters"), "parameters")
+        if self.validate_parameters is not None:
+            self.validate_parameters(record["parameters"])
         record["quality"] = _strict_json_object(record.get("quality"), "quality")
         if record["quality"].get("passed") is not True:
             raise ValueError("calibration quality gate did not pass")
@@ -786,6 +790,8 @@ class ForceCalibrationLifecycle:
                 quality=checked_quality,
                 was_committed=False,
             )
+            if self.validate_parameters is not None:
+                self.validate_parameters(record["parameters"])
             _atomic_write_json(self.staged_candidate_path, record)
             self._state = "READY_TO_APPLY"
             self._deadline_us = 0
@@ -822,6 +828,34 @@ class ForceCalibrationLifecycle:
             self._message = message
             _durable_unlink(self.staged_candidate_path)
             return self.status()
+
+    def get_staged_candidate(self, run_id: str) -> dict[str, Any]:
+        """Return the validated current candidate used by Commit."""
+        run = _non_empty_string(run_id, "run_id")
+        with self._lock:
+            if run != self._run_id or self._state != "READY_TO_APPLY":
+                raise LifecycleError("FAILED_PRECONDITION", "candidate is not ready to apply")
+            try:
+                record = self._validate_record(
+                    _read_json(self.staged_candidate_path),
+                    require_current=False,
+                    allow_future_timestamp=True,
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise LifecycleError(
+                    "FAILED_PRECONDITION", "staged candidate is unavailable"
+                ) from exc
+            if record["run_id"] != run or record["was_committed"]:
+                raise LifecycleError("FAILED_PRECONDITION", "staged candidate mismatch")
+            return deepcopy(record)
+
+    def repair_partial_commit(self, run_id: str) -> CalibrationStatusSnapshot | None:
+        """Finish a commit whose authoritative active record reached disk."""
+        run = _non_empty_string(run_id, "run_id")
+        with self._lock:
+            if run != self._run_id:
+                raise LifecycleError("NOT_FOUND", "unknown calibration run_id")
+            return self.status() if self._repair_partial_commit(run) else None
 
     def request_cancel(self, run_id: str) -> CalibrationStatusSnapshot:
         run = _non_empty_string(run_id, "run_id")

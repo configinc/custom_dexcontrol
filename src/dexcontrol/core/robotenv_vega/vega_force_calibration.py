@@ -47,6 +47,8 @@ class CalibrationCancelled(RuntimeError):
 
 
 class CalibrationAdapter(Protocol):
+    def begin_run(self) -> None: ...
+
     def validate_start(self) -> None: ...
 
     def execute_stage(
@@ -79,11 +81,13 @@ def _minimum_jerk_rotation_steps(
     duration = 1.875 * np.degrees(np.linalg.norm(target)) / MAX_ROTATION_SPEED_DPS
     progress = np.linspace(0.0, 1.0, max(1, ceil(duration * hz)) + 1)
     blend = progress**3 * (10.0 - 15.0 * progress + 6.0 * progress**2)
-    # Vega's cartesian_delta boundary consumes additive xyz Euler deltas.
-    # Keep trajectory generation in that same representation; a rotation-vector
-    # delta is numerically similar only for small single-axis moves.
-    forward = np.diff(blend[:, None] * target, axis=0)
-    return tuple(forward), tuple(-forward[::-1])
+    rotations = Rotation.from_euler("xyz", blend[:, None] * target).as_matrix()
+    forward = rotations[1:] @ np.swapaxes(rotations[:-1], -1, -2)
+    reverse = rotations[:-1] @ np.swapaxes(rotations[1:], -1, -2)
+    return (
+        tuple(Rotation.from_matrix(forward).as_euler("xyz")),
+        tuple(Rotation.from_matrix(reverse[::-1]).as_euler("xyz")),
+    )
 
 
 def _settled_tail(
@@ -138,6 +142,10 @@ class VegaRobotCalibrationAdapter:
         self._start_joints: np.ndarray | None = None
         self._gripper_position = 0.0
 
+    def begin_run(self) -> None:
+        self._start_joints = None
+        self._gripper_position = 0.0
+
     def validate_start(self) -> None:
         if not str(self.service.gripper_type).lower().split("@", 1)[0].startswith(
             "robotiq"
@@ -163,7 +171,14 @@ class VegaRobotCalibrationAdapter:
             self._gripper_position,
         ]
         if self.service.R_world_to_robot is not None:
-            action = self.service._transform_action_to_robot_frame(action)
+            action[:3] = self.service.R_world_to_robot @ action[:3]
+            delta_world = Rotation.from_euler("xyz", action[3:6]).as_matrix()
+            delta_robot = (
+                self.service.R_world_to_robot
+                @ delta_world
+                @ self.service.R_robot_to_world
+            )
+            action[3:6] = Rotation.from_matrix(delta_robot).as_euler("xyz")
         self.service._robot.update_command(
             action,
             action_space="cartesian_delta",
@@ -199,6 +214,11 @@ class VegaRobotCalibrationAdapter:
         wrench_raw, sensor_timestamp_ns = sensor.get_wrench_sample()
         wrench = np.asarray(wrench_raw, dtype=np.float64)
         joints = np.asarray(state["joint_positions"], dtype=np.float64)
+        if "robot_timestamp_us" not in timestamps and not {
+            "robot_timestamp_seconds",
+            "robot_timestamp_nanos",
+        }.issubset(timestamps):
+            raise RuntimeError("Vega robot-state acquisition timestamp is unavailable")
         robot_timestamp_us = self.service._timestamp_us(timestamps)
         if wrench.shape != (6,) or not np.isfinite(wrench).all():
             raise RuntimeError("Vega wrist F/T sample is unavailable")
@@ -390,11 +410,38 @@ class VegaForceCalibrationManager:
         self._release_robot = release_robot
         self._lock = threading.RLock()
         self._worker: threading.Thread | None = None
+        self._deadline_timer: threading.Timer | None = None
         self._cancelled = threading.Event()
         self._holds: list[WristFtCalibrationHold] = []
         self._candidate: WristFtCalibrationParameters | None = None
         self._owns_robot = False
         self._restore_runtime_state()
+
+    def _cancel_deadline_locked(self) -> None:
+        if self._deadline_timer is not None:
+            self._deadline_timer.cancel()
+            self._deadline_timer = None
+
+    def _schedule_deadline_locked(self, status: CalibrationStatusSnapshot) -> None:
+        self._cancel_deadline_locked()
+        if status.state != "READY_FOR_STAGE" or not status.command_deadline_timestamp_us:
+            return
+        delay = max(
+            0.0, status.command_deadline_timestamp_us * 1e-6 - time.time()
+        )
+        timer = threading.Timer(delay, self._deadline_elapsed, args=(status.run_id,))
+        timer.daemon = True
+        self._deadline_timer = timer
+        timer.start()
+
+    def _deadline_elapsed(self, run_id: str) -> None:
+        try:
+            with self._lock:
+                if self.lifecycle.status().run_id != run_id:
+                    return
+            self.expire_deadline()
+        except BaseException:
+            LOGGER.exception("Vega force calibration deadline cleanup failed")
 
     def _restore_runtime_state(self) -> None:
         status = self.lifecycle.status()
@@ -402,6 +449,8 @@ class VegaForceCalibrationManager:
             self._owns_robot = self._claim_robot()
             if not self._owns_robot:
                 raise RuntimeError("recovered calibration candidate cannot claim robot")
+            record = self.lifecycle.get_staged_candidate(status.run_id)
+            self._candidate = wrist_ft_calibration_from_snapshot(record["parameters"])
         result = self.lifecycle.get_result("")
         if result.get("available"):
             parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
@@ -434,6 +483,7 @@ class VegaForceCalibrationManager:
                 )
             self._owns_robot = True
             try:
+                self.adapter.begin_run()
                 status = self.lifecycle.start(
                     run_id, force_recalibrate=force_recalibrate
                 )
@@ -447,6 +497,8 @@ class VegaForceCalibrationManager:
                         self.adapter.prepare_install(parameters)
                     )
                     self._release_if_owned()
+                else:
+                    self._schedule_deadline_locked(status)
                 return status
             except BaseException:
                 self._release_if_owned()
@@ -454,11 +506,12 @@ class VegaForceCalibrationManager:
 
     def advance(self, run_id: str, stage_index: int, stage_id: str) -> CalibrationStatusSnapshot:
         with self._lock:
-            status, payload = self.lifecycle.advance(run_id, stage_index, stage_id)
-            if payload is None:
-                return status
             if self._worker is not None and self._worker.is_alive():
                 raise LifecycleError("FAILED_PRECONDITION", "stage worker is already running")
+            status, payload = self.lifecycle.advance(run_id, stage_index, stage_id)
+            self._cancel_deadline_locked()
+            if payload is None:
+                return status
             worker = threading.Thread(
                 target=self._run_stage,
                 args=(run_id, stage_index, stage_id, deepcopy(payload)),
@@ -477,7 +530,12 @@ class VegaForceCalibrationManager:
         payload: Mapping[str, Any],
     ) -> None:
         def set_phase(state: str, message: str) -> None:
-            self.lifecycle.set_phase(run_id, state, message)
+            try:
+                self.lifecycle.set_phase(run_id, state, message)
+            except LifecycleError:
+                if self._cancelled.is_set():
+                    raise CalibrationCancelled("force calibration cancelled")
+                raise
 
         try:
             hold = self.adapter.execute_stage(
@@ -487,46 +545,68 @@ class VegaForceCalibrationManager:
                 raise CalibrationCancelled("force calibration cancelled")
             if hold is not None:
                 self._holds.append(hold)
-            status = self.lifecycle.complete_stage(run_id, stage_index)
+            with self._lock:
+                status = self.lifecycle.complete_stage(run_id, stage_index)
+                if status.state == "READY_FOR_STAGE":
+                    self._worker = None
+                    self._schedule_deadline_locked(status)
             if status.state == "FITTING":
                 parameters = self.adapter.fit(tuple(self._holds))
                 if self._cancelled.is_set():
                     raise CalibrationCancelled("force calibration cancelled")
                 self._candidate = parameters
-                self.lifecycle.stage_candidate(
-                    run_id,
-                    parameters=parameters.as_parameters(),
-                    quality=dict(parameters.quality),
-                )
+                with self._lock:
+                    if self._cancelled.is_set():
+                        raise CalibrationCancelled("force calibration cancelled")
+                    self.lifecycle.stage_candidate(
+                        run_id,
+                        parameters=parameters.as_parameters(),
+                        quality=dict(parameters.quality),
+                    )
         except CalibrationCancelled:
             self._finish_cancel_safely(run_id)
         except BaseException as exc:
+            if self._cancelled.is_set():
+                self._finish_cancel_safely(run_id)
+                return
             LOGGER.exception("Vega force calibration stage failed: %s", exc)
             try:
                 self.adapter.safe_return()
             except BaseException as return_exc:
                 exc = RuntimeError(f"{exc}; safe return failed: {return_exc}")
-            try:
-                self.lifecycle.fail(run_id, str(exc) or type(exc).__name__)
-            except LifecycleError:
-                pass
-            self._release_if_owned()
+            with self._lock:
+                try:
+                    self.lifecycle.fail(run_id, str(exc) or type(exc).__name__)
+                except LifecycleError:
+                    pass
+                self._release_if_owned()
+        finally:
+            with self._lock:
+                if self._worker is threading.current_thread():
+                    self._worker = None
 
     def _finish_cancel_safely(self, run_id: str) -> None:
         message = "force calibration cancelled"
+        return_failed = False
         try:
             self.adapter.safe_return()
         except BaseException as exc:
             message = f"force calibration cancelled; safe return failed: {exc}"
-        try:
-            self.lifecycle.finish_cancel(run_id, message=message)
-        except LifecycleError:
-            pass
-        self._release_if_owned()
+            return_failed = True
+        with self._lock:
+            try:
+                if return_failed:
+                    self.lifecycle.fail(run_id, message)
+                else:
+                    self.lifecycle.finish_cancel(run_id, message=message)
+            except LifecycleError:
+                pass
+            self._release_if_owned()
 
     def request_cancel(self, run_id: str) -> CalibrationStatusSnapshot:
         with self._lock:
             status = self.lifecycle.request_cancel(run_id)
+            self._cancel_deadline_locked()
             if status.state == "CANCELLING":
                 self._cancelled.set()
                 if self._worker is None or not self._worker.is_alive():
@@ -538,35 +618,51 @@ class VegaForceCalibrationManager:
                     )
                     self._worker.start()
             elif status.state in {"CANCELLED", "FAILED", "SUCCEEDED"}:
+                if status.state == "SUCCEEDED":
+                    self._install_committed_result(run_id)
                 self._release_if_owned()
             return status
 
     def expire_deadline(self) -> CalibrationStatusSnapshot:
-        status = self.lifecycle.expire_command_deadline()
-        if status.state == "CANCELLING":
-            return self.request_cancel(status.run_id)
-        return status
+        with self._lock:
+            status = self.lifecycle.expire_command_deadline()
+            if status.state == "CANCELLING":
+                return self.request_cancel(status.run_id)
+            return status
+
+    def _install_committed_result(self, run_id: str) -> None:
+        result = self.lifecycle.get_result(run_id)
+        if not result.get("available"):
+            raise RuntimeError("committed calibration result is unavailable")
+        parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
+        self.adapter.install_prepared(self.adapter.prepare_install(parameters))
 
     def commit(self, run_id: str, plan_sha256: str) -> CalibrationStatusSnapshot:
         with self._lock:
-            result = self.lifecycle.get_result("")
-            parameters = (
-                self._candidate
-                if self._candidate is not None
-                else wrist_ft_calibration_from_snapshot(result["parameters"])
-            )
+            record = self.lifecycle.get_staged_candidate(run_id)
+            parameters = self._candidate
+            if parameters is None:
+                parameters = wrist_ft_calibration_from_snapshot(record["parameters"])
             prepared = self.adapter.prepare_install(parameters)
-            status = self.adapter.commit_install(
-                prepared, lambda: self.lifecycle.commit(run_id, plan_sha256)
-            )
+            try:
+                status = self.adapter.commit_install(
+                    prepared, lambda: self.lifecycle.commit(run_id, plan_sha256)
+                )
+            except BaseException:
+                repaired = self.lifecycle.repair_partial_commit(run_id)
+                if repaired is None:
+                    raise
+                self.adapter.install_prepared(prepared)
+                status = repaired
             self._release_if_owned()
             return status
 
     def status(self, run_id: str = "") -> CalibrationStatusSnapshot:
-        status = self.expire_deadline()
-        if run_id and run_id != status.run_id:
-            raise LifecycleError("NOT_FOUND", "unknown calibration run_id")
-        return status
+        with self._lock:
+            status = self.expire_deadline()
+            if run_id and run_id != status.run_id:
+                raise LifecycleError("NOT_FOUND", "unknown calibration run_id")
+            return status
 
     def result(self, run_id: str = "") -> dict[str, Any]:
         return self.lifecycle.get_result(run_id)

@@ -7,7 +7,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
+import dexcontrol.core.robotenv_vega.force_calibration_lifecycle as lifecycle_module
+import dexcontrol.core.robotenv_vega.vega_force_calibration as manager_module
 from dexcontrol.core.robotenv_vega.force_calibration import WristFtCalibrationHold
 from dexcontrol.core.robotenv_vega.force_calibration_lifecycle import (
     BilateralCalibrationPlan,
@@ -70,6 +73,10 @@ class FakeAdapter:
         self.entered = threading.Event()
         self.release = threading.Event()
         self.block = False
+        self.safe_return_error = None
+
+    def begin_run(self):
+        return None
 
     def execute_stage(self, stage_id, payload, cancelled, set_phase):
         self.executions.append(stage_id)
@@ -88,6 +95,8 @@ class FakeAdapter:
 
     def safe_return(self, cancelled=None):
         self.safe_returns += 1
+        if self.safe_return_error is not None:
+            raise self.safe_return_error
 
     def fit(self, holds):
         assert len(holds) == 2
@@ -200,6 +209,62 @@ def test_commit_validates_runtime_candidate_before_durable_success(tmp_path: Pat
     assert claim.owned is True
 
 
+def test_restarted_ready_candidate_commits_staged_not_active_parameters(
+    tmp_path: Path, monkeypatch
+) -> None:
+    lifecycle = _lifecycle(tmp_path)
+    lifecycle.start("run-1", force_recalibrate=True)
+    for index in range(2):
+        lifecycle.advance("run-1", index, f"stage-{index}")
+        lifecycle.set_phase("run-1", "COLLECTING")
+        lifecycle.complete_stage("run-1", index)
+    lifecycle.stage_candidate(
+        "run-1", parameters={"tag": "new"}, quality={"passed": True}
+    )
+    monkeypatch.setattr(
+        manager_module, "wrist_ft_calibration_from_snapshot", lambda value: value
+    )
+    adapter = FakeAdapter()
+    claim = Claim()
+    manager = VegaForceCalibrationManager(
+        lifecycle=_lifecycle(tmp_path),
+        adapter=adapter,
+        claim_robot=claim.acquire,
+        release_robot=claim.release,
+    )
+    ready = manager.status()
+    assert ready.state == "READY_TO_APPLY"
+    assert manager.commit("run-1", ready.plan_sha256).state == "SUCCEEDED"
+    assert adapter.installed[-1] == {"tag": "new"}
+    assert claim.owned is False
+
+
+def test_transient_partial_commit_is_repaired_with_matching_runtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+    manager.advance("run-1", 1, "stage-1")
+    ready = _wait_state(manager, "READY_TO_APPLY")
+    original_write = lifecycle_module._atomic_write_json
+    failed = False
+
+    def fail_history_once(path, value):
+        nonlocal failed
+        if path.parent.name == "results" and not failed:
+            failed = True
+            raise OSError("injected history failure")
+        return original_write(path, value)
+
+    monkeypatch.setattr(lifecycle_module, "_atomic_write_json", fail_history_once)
+    assert manager.commit("run-1", ready.plan_sha256).state == "SUCCEEDED"
+    assert adapter.installed[-1] is manager._candidate
+    assert manager.result("run-1")["available"] is True
+    assert claim.owned is False
+
+
 def test_cancel_stops_worker_returns_safe_and_releases(tmp_path: Path) -> None:
     manager, adapter, claim = _manager(tmp_path)
     adapter.block = True
@@ -210,6 +275,16 @@ def test_cancel_stops_worker_returns_safe_and_releases(tmp_path: Path) -> None:
     assert status.state == "CANCELLING"
     _wait_state(manager, "CANCELLED")
     assert adapter.safe_returns == 1
+    assert claim.owned is False
+
+
+def test_cancel_reports_failed_when_measured_safe_return_fails(tmp_path: Path) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    adapter.safe_return_error = RuntimeError("return target not reached")
+    manager.start("run-1", True)
+    manager.request_cancel("run-1")
+    status = _wait_state(manager, "FAILED")
+    assert "safe return failed" in status.message
     assert claim.owned is False
 
 
@@ -236,13 +311,49 @@ def test_cancel_during_fit_finishes_cancelled_not_failed(tmp_path: Path) -> None
     assert claim.owned is False
 
 
+def test_server_deadline_cancels_and_releases_without_status_poll(tmp_path: Path) -> None:
+    adapter = FakeAdapter()
+    claim = Claim()
+    lifecycle = ForceCalibrationLifecycle(
+        plan=_plan(tmp_path),
+        server_identity={"robot": "vega", "arm": "left"},
+        storage_directory=tmp_path / "deadline-state",
+        calibration_kind="vega_wrist_ft_v1",
+        reference_point_id="sensor-origin",
+        command_timeout_seconds=0.03,
+    )
+    manager = VegaForceCalibrationManager(
+        lifecycle=lifecycle,
+        adapter=adapter,
+        claim_robot=claim.acquire,
+        release_robot=claim.release,
+    )
+    manager.start("run-deadline", True)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and claim.owned:
+        time.sleep(0.005)
+    assert claim.owned is False
+    assert lifecycle.status().state == "CANCELLED"
+
+
+def test_begin_run_clears_previous_physical_safe_return_target() -> None:
+    adapter = _physical_adapter(_FakeService())
+    adapter._start_joints = np.ones(7)
+    adapter.begin_run()
+    assert adapter._start_joints is None
+
+
 def test_rotation_profile_uses_euler_deltas_and_returns_exactly() -> None:
     target = np.radians(np.array([25.0, -30.0, 40.0]))
     forward, reverse = _minimum_jerk_rotation_steps(target, 20.0)
-    np.testing.assert_allclose(np.sum(forward, axis=0), target, atol=1e-12)
-    np.testing.assert_allclose(
-        np.sum((*forward, *reverse), axis=0), np.zeros(3), atol=1e-12
-    )
+    current = Rotation.identity()
+    for delta in forward:
+        current = Rotation.from_euler("xyz", delta) * current
+    expected = Rotation.from_euler("xyz", target)
+    assert (current * expected.inv()).magnitude() < 1e-10
+    for delta in reverse:
+        current = Rotation.from_euler("xyz", delta) * current
+    assert current.magnitude() < 1e-10
 
 
 class _FakeSensor:
@@ -265,6 +376,7 @@ class _FakeArm:
 class _FakeRobot:
     def __init__(self, joints=None, sensor_timestamp_ns: int = 1_000_000_000) -> None:
         self.arm = _FakeArm(joints, sensor_timestamp_ns)
+        self.last_action = None
 
     def get_robot_state(self):
         return (
@@ -276,7 +388,8 @@ class _FakeRobot:
             {"robot_timestamp_us": 1_000_000},
         )
 
-    def update_command(self, *_args, **_kwargs):
+    def update_command(self, action, **_kwargs):
+        self.last_action = np.asarray(action, dtype=float)
         return None
 
 
@@ -304,6 +417,26 @@ def _physical_adapter(service: _FakeService) -> VegaRobotCalibrationAdapter:
     return VegaRobotCalibrationAdapter(service, 1.2, np.array([0.0, 0.0, 0.072]))
 
 
+def test_rotation_delta_is_exactly_conjugated_into_robot_frame() -> None:
+    service = _FakeService()
+    service.R_world_to_robot = Rotation.from_euler(
+        "xyz", [20.0, -15.0, 35.0], degrees=True
+    ).as_matrix()
+    service.R_robot_to_world = service.R_world_to_robot.T
+    adapter = _physical_adapter(service)
+    delta_world = np.radians(np.array([2.0, -3.0, 4.0]))
+    adapter._command_delta(delta_world)
+    actual_robot = Rotation.from_euler(
+        "xyz", service._robot.last_action[3:6]
+    ).as_matrix()
+    expected_robot = (
+        service.R_world_to_robot
+        @ Rotation.from_euler("xyz", delta_world).as_matrix()
+        @ service.R_robot_to_world
+    )
+    np.testing.assert_allclose(actual_robot, expected_robot, atol=1e-12)
+
+
 def test_sample_uses_sensor_timestamp_and_rejects_cross_stream_skew() -> None:
     adapter = _physical_adapter(_FakeService(sensor_timestamp_ns=1_000_000_000))
     assert adapter._sample()[3] == pytest.approx(1.0)
@@ -311,6 +444,12 @@ def test_sample_uses_sensor_timestamp_and_rejects_cross_stream_skew() -> None:
     stale = _physical_adapter(_FakeService(sensor_timestamp_ns=500_000_000))
     with pytest.raises(RuntimeError, match="not time aligned"):
         stale._sample()
+
+    missing = _FakeService()
+    original_state = missing._robot.get_robot_state
+    missing._robot.get_robot_state = lambda: (original_state()[0], {})
+    with pytest.raises(RuntimeError, match="robot-state acquisition timestamp"):
+        _physical_adapter(missing)._sample()
 
 
 def test_safe_return_verification_rejects_unreached_joint_target() -> None:

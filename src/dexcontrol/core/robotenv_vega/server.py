@@ -25,6 +25,9 @@ _this = Path(__file__).resolve()
 sys.path.insert(0, str(_this.parents[2]))  # src/dexcontrol/ -> "from core.vega..."
 sys.path.insert(0, str(_this.parents[4]))  # <repo>/          -> "from proto..."
 
+from core.robotenv_vega.force_calibration import (  # noqa: E402
+    wrist_ft_calibration_from_snapshot,
+)
 from core.robotenv_vega.force_calibration_lifecycle import (  # noqa: E402
     BilateralCalibrationPlan,
     ForceCalibrationLifecycle,
@@ -304,10 +307,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "gripper_type": self.gripper_type,
                 "frame_type": self.frame_type,
                 "sensor_to_wrist_yaw_degrees": 165.0,
+                "gripper_mass_kg": float(force_calibration_gripper_mass_kg),
+                "gripper_com_sensor_m": [
+                    float(value) for value in force_calibration_gripper_com_m
+                ],
             },
             storage_directory=calibration_storage,
             calibration_kind="vega_wrist_ft_v1",
             reference_point_id="physical_ft_sensor_measurement_origin",
+            validate_parameters=lambda value: wrist_ft_calibration_from_snapshot(value),
         )
         adapter = VegaRobotCalibrationAdapter(
             service=self,
@@ -830,6 +838,24 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     def Reset(self, request, context):
         mode = request.mode or "home"
         LOGGER.info("Reset requested: mode=%s arm=%s", mode, self.arm_side)
+        calibration_owner = getattr(self, "_force_calibration_owns_robot", None)
+        if (
+            mode == "current"
+            and calibration_owner is not None
+            and calibration_owner.is_set()
+        ):
+            try:
+                observation, timestamp_us = self._create_observation()
+                return robotenv_pb2.ResetResponse(
+                    observation=observation,
+                    status="SUCCESS",
+                    message="Reset to current",
+                    timestamp_us=timestamp_us,
+                )
+            except Exception as exc:
+                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_details(f"Reset failed: {exc}")
+                return robotenv_pb2.ResetResponse()
         rpc_cancelled = threading.Event()
         motion_cancelled = threading.Event()
 

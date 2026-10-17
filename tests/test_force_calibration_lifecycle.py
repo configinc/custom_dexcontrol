@@ -86,6 +86,30 @@ def test_prepare_stage_can_return_directly_from_moving(
     assert status.state == "RETURNING"
 
 
+def test_parameter_validator_rejects_cache_and_candidate_schema(
+    tmp_path: Path, plan: BilateralCalibrationPlan, clock: Clock
+) -> None:
+    def validate(value):
+        if value.get("method") != "accepted":
+            raise ValueError("unsupported parameter schema")
+
+    lifecycle = ForceCalibrationLifecycle(
+        plan=plan,
+        server_identity={"unit_id": "unit"},
+        storage_directory=tmp_path / "validated-cache",
+        calibration_kind="wrist_ft_bias",
+        reference_point_id="configured_tcp",
+        now_us=clock,
+        validate_parameters=validate,
+    )
+    lifecycle.start("run-invalid", force_recalibrate=True)
+    _collect_all(lifecycle, "run-invalid")
+    with pytest.raises(ValueError, match="unsupported parameter schema"):
+        lifecycle.stage_candidate(
+            "run-invalid", parameters={"method": "bad"}, quality={"passed": True}
+        )
+
+
 def test_plan_is_one_exact_bilateral_artifact(tmp_path: Path) -> None:
     path = tmp_path / "plan.json"
     _write_plan(path)

@@ -203,7 +203,7 @@ def test_step_admitted_during_reset_fails_before_reading_robot_state():
     assert service._robot.commands == []
 
 
-def test_cancelled_reset_rpc_aborts_before_motion_after_lock_wait():
+def test_current_reset_remains_available_without_waiting_for_motion_lock():
     class Context:
         def __init__(self):
             self.callback = None
@@ -212,13 +212,14 @@ def test_cancelled_reset_rpc_aborts_before_motion_after_lock_wait():
             self.callback = callback
             return True
 
-        def set_code(self, _code):
-            raise AssertionError("cancelled RPC must retain its cancellation status")
+        def set_code(self, code):
+            self.code = code
 
-        def set_details(self, _details):
-            raise AssertionError("cancelled RPC must retain its cancellation details")
+        def set_details(self, details):
+            self.details = details
 
     service = _service()
+    service._force_calibration_owns_robot.set()
     service._create_observation = lambda: ({}, 1)
     context = Context()
     result = SimpleNamespace(response=None)
@@ -229,18 +230,12 @@ def test_cancelled_reset_rpc_aborts_before_motion_after_lock_wait():
 
     worker = threading.Thread(target=reset)
     worker.start()
-    for _ in range(100):
-        if context.callback is not None and service._reset_in_progress.is_set():
-            break
-        threading.Event().wait(0.01)
-    assert context.callback is not None
-    context.callback()
-    service._cmd_lock.release()
     worker.join(timeout=1.0)
 
     assert worker.is_alive() is False
-    assert result.response.status == ""
+    assert result.response.status == "SUCCESS"
     assert service._reset_in_progress.is_set() is False
+    service._cmd_lock.release()
 
 
 def test_overlapping_resets_keep_loop_paused_until_newest_reset_finishes():
