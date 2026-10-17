@@ -587,6 +587,22 @@ def test_outer_gripper_worker_never_retries_after_outer_dispatch_failure():
     assert robot._prev_gripper_command_successful is False
 
 
+def test_normal_scalar_send_cannot_clear_outer_sticky_failure():
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.hand = type(
+        "Hand", (), {"set_joint_pos": lambda self, *_args, **_kwargs: None}
+    )()
+    robot._gripper_io_lock = threading.Lock()
+    robot._gripper_open_pos = np.array([0.085])
+    robot._gripper_close_pos = np.array([0.0])
+    robot._prev_gripper_command_successful = False
+
+    assert robot._execute_gripper_command(
+        0.5, wait_time=0.0, raise_on_error=True
+    ) is True
+    assert robot._prev_gripper_command_successful is False
+
+
 def test_reset_command_state_retains_restart_intent_after_adapter_failure():
     robot = VegaRobot.__new__(VegaRobot)
     worker = type("Worker", (), {"is_alive": lambda self: False})()

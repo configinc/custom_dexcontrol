@@ -694,7 +694,6 @@ class VegaRobot:
             # target into `_gripper_position` here. Conflating commanded
             # and measured produces logs/plots where state tracks the
             # action and snaps back to reality on contact stalls.
-            self._prev_gripper_command_successful = True
             return True
         except Exception:
             self._prev_gripper_command_successful = False
