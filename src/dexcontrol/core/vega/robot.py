@@ -247,6 +247,8 @@ class VegaRobot:
         self._gripper_command_queue: Queue[float] | None = None
         self._gripper_stop_event = threading.Event()
         self._gripper_worker: threading.Thread | None = None
+        self._hand_shutdown_completed = False
+        self._robot_shutdown_completed = False
         self._prev_command_successful = True
         self._prev_gripper_command_successful = True
         self._prev_controller_latency_ms = 0.0
@@ -1529,12 +1531,23 @@ class VegaRobot:
             self._vel_log_file.close()
             self._vel_log_file = None
         self._stop_gripper_worker()
-        if self.gripper_type in ("robotiq", "sr_gripper", "wuji_hand_v1", "wuji_hand_v2") and self.hand is not None:
+        errors = []
+        if (
+            not getattr(self, "_hand_shutdown_completed", False)
+            and self.gripper_type
+            in ("robotiq", "sr_gripper", "wuji_hand_v1", "wuji_hand_v2")
+            and self.hand is not None
+        ):
             try:
                 self.hand.shutdown()
-            except Exception:
-                pass
-        try:
-            self.robot.shutdown()
-        except Exception:
-            pass
+                self._hand_shutdown_completed = True
+            except Exception as exc:
+                errors.append(f"hand shutdown failed: {exc}")
+        if not getattr(self, "_robot_shutdown_completed", False):
+            try:
+                self.robot.shutdown()
+                self._robot_shutdown_completed = True
+            except Exception as exc:
+                errors.append(f"robot shutdown failed: {exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))

@@ -30,11 +30,14 @@ class _BlockingHand:
 
 
 class _Transport:
-    def __init__(self):
+    def __init__(self, failures=0):
         self.shutdown_calls = 0
+        self.failures = failures
 
     def shutdown(self):
         self.shutdown_calls += 1
+        if self.shutdown_calls <= self.failures:
+            raise RuntimeError("transport busy")
 
 
 def _robot_with_blocking_gripper():
@@ -53,6 +56,8 @@ def _robot_with_blocking_gripper():
     robot._gripper_open_pos = np.array([0.0])
     robot._gripper_close_pos = np.array([1.0])
     robot._prev_gripper_command_successful = True
+    robot._hand_shutdown_completed = False
+    robot._robot_shutdown_completed = False
     return robot
 
 
@@ -85,3 +90,22 @@ def test_close_keeps_live_gripper_worker_and_refuses_transport_teardown():
     assert robot._gripper_command_queue is None
     assert robot.hand.shutdown_calls == 1
     assert robot.robot.shutdown_calls == 1
+
+
+def test_close_reports_transport_failure_and_retries_only_incomplete_teardown():
+    robot = _robot_with_blocking_gripper()
+    robot.robot = _Transport(failures=1)
+
+    with pytest.raises(RuntimeError, match="robot shutdown failed: transport busy"):
+        robot.close()
+
+    assert robot.hand.shutdown_calls == 1
+    assert robot._hand_shutdown_completed is True
+    assert robot.robot.shutdown_calls == 1
+    assert robot._robot_shutdown_completed is False
+
+    robot.close()
+
+    assert robot.hand.shutdown_calls == 1
+    assert robot.robot.shutdown_calls == 2
+    assert robot._robot_shutdown_completed is True

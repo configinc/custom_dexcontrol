@@ -11,7 +11,10 @@ _base_arm_teleop = ModuleType("base_arm_teleop")
 _base_arm_teleop.BaseIKController = object
 sys.modules.setdefault("base_arm_teleop", _base_arm_teleop)
 
-from dexcontrol.core.robotenv_vega.server import VegaRobotEnvService  # noqa: E402
+from dexcontrol.core.robotenv_vega.server import (  # noqa: E402
+    VegaRobotEnvService,
+    _shutdown_service_until_safe,
+)
 
 
 class _Robot:
@@ -163,6 +166,24 @@ def test_shutdown_waits_for_admitted_current_reset_observation_before_close():
     assert reset_response["value"].status == "SUCCESS"
     assert service._robot.closed is True
     assert service._active_transport_rpcs == 0
+
+
+def test_shutdown_runner_retries_without_returning_after_fail_closed_error():
+    calls = []
+    sleeps = []
+
+    class Service:
+        def shutdown(self):
+            calls.append("shutdown")
+            if len(calls) == 1:
+                raise RuntimeError("worker still active")
+
+    _shutdown_service_until_safe(
+        Service(), retry_delay_s=0.25, sleep_fn=sleeps.append
+    )
+
+    assert calls == ["shutdown", "shutdown"]
+    assert sleeps == [0.25]
 
 
 def test_step_dispatch_uses_normal_path_when_no_reset_owns_robot():

@@ -1792,6 +1792,24 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self._shutdown_completed = True
 
 
+def _shutdown_service_until_safe(
+    service: "VegaRobotEnvService",
+    *,
+    retry_delay_s: float = 1.0,
+    sleep_fn=time.sleep,
+) -> None:
+    """Retry fail-closed shutdown without letting daemon I/O workers vanish."""
+    while True:
+        try:
+            service.shutdown()
+            return
+        except Exception:
+            LOGGER.exception(
+                "Vega shutdown is not yet safe; retrying while RPC admission remains closed"
+            )
+            sleep_fn(retry_delay_s)
+
+
 def serve(
     grpc_port: int = 50061,
     robot_model: str = "vega_1",
@@ -1913,13 +1931,7 @@ def serve(
         LOGGER.info("Shutting down Vega RobotEnv server")
         # Stop new transport admission before draining in-flight robot work.
         server.stop(grace=0)
-        try:
-            service.shutdown()
-        except Exception:
-            LOGGER.exception(
-                "Vega shutdown could not complete measured calibration return"
-            )
-            return
+        _shutdown_service_until_safe(service)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown_handler)
