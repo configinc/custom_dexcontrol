@@ -271,6 +271,13 @@ class Chassis(SubscriptionPolicyMixin):
     def shutdown(self) -> None:
         """Release every child acquired so far, including partial construction."""
         errors: list[str] = []
+        if (
+            getattr(self, "_initialization_complete", False)
+            and not getattr(self, "_robot_shutdown_stop_confirmed", False)
+        ):
+            # Preserve the public direct-shutdown contract. Robot.shutdown()
+            # records an already successful stop so it is not issued twice.
+            self.stop()
         children = (
             getattr(self, "drive_temperature_sensor", None),
             getattr(self, "steer_temperature_sensor", None),

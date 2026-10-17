@@ -1957,6 +1957,19 @@ def serve(
             _file_handler.close()
         raise
 
+    # A shutdown requested during logging/bootstrap must not be followed by
+    # hardware acquisition. Restore caller process state while the harmless
+    # deferring disposition is still installed, then exit cleanly.
+    pending_managed_signals = signal.sigpending().intersection(managed_signals)
+    if deferred_shutdown.is_set() or pending_managed_signals:
+        if _file_handler is not None:
+            logging.getLogger().removeHandler(_file_handler)
+            _file_handler.close()
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        for signum, previous_handler in previous_signal_handlers.items():
+            signal.signal(signum, previous_handler)
+        raise SystemExit(0)
+
     try:
         service = VegaRobotEnvService(
         robot_model=robot_model,

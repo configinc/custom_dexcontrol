@@ -1,5 +1,6 @@
 import sys
 import threading
+import logging
 from types import ModuleType, SimpleNamespace
 
 import grpc
@@ -54,6 +55,47 @@ def test_serve_defers_startup_signal_until_service_has_cleanup_owner(
         server_module.serve(arm_side="left")
 
     assert calls == ["service-created", "service-shutdown"]
+
+
+def test_serve_does_not_acquire_hardware_after_bootstrap_shutdown(
+    monkeypatch, tmp_path
+):
+    handlers = {}
+    calls = []
+
+    class Handler(logging.Handler):
+        def __init__(self, _path):
+            super().__init__()
+            handlers[server_module.signal.SIGTERM](server_module.signal.SIGTERM, None)
+
+    class Service:
+        def __init__(self, **_kwargs):
+            calls.append("service-created")
+
+    circular_module = sys.modules["core.robotenv_vega.circular_file_handler"]
+    monkeypatch.setattr(circular_module, "CircularFileHandler", Handler)
+    monkeypatch.setattr(server_module, "VegaRobotEnvService", Service)
+    monkeypatch.setattr(
+        server_module.signal, "getsignal", lambda signum: f"old-{signum}"
+    )
+    monkeypatch.setattr(
+        server_module.signal,
+        "signal",
+        lambda signum, handler: handlers.__setitem__(signum, handler),
+    )
+    monkeypatch.setattr(
+        server_module.signal, "pthread_sigmask", lambda *_args: set()
+    )
+    monkeypatch.setattr(
+        server_module.os.path,
+        "expanduser",
+        lambda _path: str(tmp_path / "robotenv_vega.log"),
+    )
+
+    with pytest.raises(SystemExit):
+        server_module.serve(arm_side="left")
+
+    assert calls == []
 
 
 class _Robot:

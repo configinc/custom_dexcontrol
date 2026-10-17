@@ -885,6 +885,7 @@ class Robot(RobotQueryInterface):
                     if hasattr(component, "stop") and callable(component.stop):
                         component.stop()
                     stopped_ids.add(component_id)
+                    component._robot_shutdown_stop_confirmed = True
                 except Exception as e:  # pylint: disable=broad-except
                     logger.error(
                         f"Error stopping component {component.__class__.__name__}: {e}"

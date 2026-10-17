@@ -394,6 +394,28 @@ def test_mapped_component_shutdown_is_safe_before_base_init(component_class):
     component_class.__new__(component_class).shutdown()
 
 
+def test_managed_component_retries_failed_partial_transport_shutdown():
+    class Subscriber:
+        def __init__(self):
+            self.calls = 0
+
+        def shutdown(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("status subscriber busy")
+
+    subscriber = Subscriber()
+    head = Head.__new__(Head)
+    head._motion_status_subscriber = subscriber
+
+    with pytest.raises(RuntimeError, match="status subscriber busy"):
+        head.shutdown()
+    head.shutdown()
+
+    assert subscriber.calls == 2
+    assert head._motion_status_subscriber is None
+
+
 def test_sensor_constructor_retries_partial_cleanup_before_raising(monkeypatch):
     calls = []
 
