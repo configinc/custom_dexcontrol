@@ -624,6 +624,48 @@ def test_reset_does_not_commit_if_restarted_hand_worker_fails_during_observation
     assert context.code == grpc.StatusCode.INTERNAL
 
 
+def test_reset_clear_cannot_erase_failure_registered_during_commit():
+    class Context:
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    class FailingClearEvent:
+        def __init__(self, robot):
+            self._set = True
+            self._robot = robot
+
+        def is_set(self):
+            return self._set
+
+        def set(self):
+            self._set = True
+
+        def clear(self):
+            self._set = False
+            self._robot._prev_gripper_command_successful = False
+
+    service = _service()
+    service._robot.hand_command_path_healthy = lambda: True
+    service._robot._prev_gripper_command_successful = True
+    service._command_recovery_required = FailingClearEvent(service._robot)
+    service._create_observation = lambda: ({}, 1)
+    context = Context()
+
+    response = service.Reset(
+        SimpleNamespace(mode="current", params={}), context
+    )
+
+    assert response.status == ""
+    assert service._command_recovery_required.is_set()
+    assert context.code == grpc.StatusCode.INTERNAL
+
+
 def test_control_loop_dispatch_failure_latches_recovery_and_stops_dispatch():
     service = _service()
     service._control_loop_hz = 1000

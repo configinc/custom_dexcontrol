@@ -556,6 +556,37 @@ def test_outer_gripper_worker_drops_buffered_target_after_adapter_failure():
     assert robot._prev_gripper_command_successful is False
 
 
+def test_outer_gripper_worker_never_retries_after_outer_dispatch_failure():
+    robot = VegaRobot.__new__(VegaRobot)
+    robot._gripper_stop_event = threading.Event()
+    robot._gripper_command_queue = Queue(maxsize=1)
+    robot._gripper_command_queue.put(0.1)
+    robot._gripper_poll_interval_s = 0.001
+    robot._prev_gripper_command_successful = True
+    robot.hand_command_path_healthy = lambda: True
+    attempts = []
+    refreshes = []
+
+    def execute(target, **_kwargs):
+        attempts.append(target)
+        robot._prev_gripper_command_successful = False
+        robot._gripper_command_queue.put(0.9)
+        return False
+
+    def refresh():
+        refreshes.append(True)
+        if len(refreshes) >= 2:
+            robot._gripper_stop_event.set()
+        return True
+
+    robot._execute_gripper_command = execute
+    robot._refresh_gripper_state = refresh
+    robot._gripper_worker_loop()
+
+    assert attempts == [0.1]
+    assert robot._prev_gripper_command_successful is False
+
+
 def test_reset_command_state_retains_restart_intent_after_adapter_failure():
     robot = VegaRobot.__new__(VegaRobot)
     worker = type("Worker", (), {"is_alive": lambda self: False})()

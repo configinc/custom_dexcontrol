@@ -624,7 +624,10 @@ class VegaRobot:
             if latest_target is not None:
                 if self._gripper_stop_event.is_set():
                     break
-                if not self.hand_command_path_healthy():
+                if (
+                    not self._prev_gripper_command_successful
+                    or not self.hand_command_path_healthy()
+                ):
                     # A sticky adapter failure is a command boundary.  Do not
                     # allow an already-dequeued target to reach the adapter
                     # after the server has entered recovery; only the strict
@@ -673,7 +676,6 @@ class VegaRobot:
         raise_on_error: bool,
     ) -> bool:
         if self.hand is None:
-            self._prev_gripper_command_successful = True
             return True
         if not np.isfinite(target):
             raise ValueError("Refusing to send non-finite scalar hand target")
@@ -840,7 +842,6 @@ class VegaRobot:
             wait_time = (1.0 / max(1, tick_hz)) if blocking else 0.0
             with self._gripper_io_lock:
                 self.hand.set_joint_pos(target, wait_time=wait_time)
-            self._prev_gripper_command_successful = True
         except Exception:
             self._prev_gripper_command_successful = False
             raise
@@ -896,13 +897,11 @@ class VegaRobot:
                 )
             else:
                 self._enqueue_gripper_target(float(target[0]))
-                self._prev_gripper_command_successful = True
             return
         wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
         try:
             with self._gripper_io_lock:
                 self.hand.set_joint_pos(target, wait_time=wait_time)
-            self._prev_gripper_command_successful = True
         except Exception:
             self._prev_gripper_command_successful = False
             raise
@@ -1501,7 +1500,6 @@ class VegaRobot:
             return
 
         self._enqueue_gripper_target(target)
-        self._prev_gripper_command_successful = True
 
     def get_robot_state(self) -> tuple[dict[str, Any], dict[str, int]]:
         joint_positions = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)

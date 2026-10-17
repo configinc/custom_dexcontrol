@@ -270,7 +270,7 @@ class SrGripperAdapter:
         that the per-send `_clear_error_latch` SDO write does not cycle
         the motion-done state machine into the unresponsive wedge.
         """
-        if not self._last_sent_packet:
+        if self._command_failed.is_set() or not self._last_sent_packet:
             return
         now = time.time()
         if (now - self._last_send_t) < _FORCE_RESEND_PERIOD_S:
@@ -353,6 +353,10 @@ class SrGripperAdapter:
                 0 = open, stroke = closed.
             wait_time: Seconds to sleep after sending the command.
         """
+        if self._command_failed.is_set():
+            raise RuntimeError(
+                "SR gripper command path is latched failed; Reset is required"
+            )
         pos_m = float(np.asarray(joint_pos, dtype=np.float64).flat[0])
         pos_m = float(np.clip(pos_m, 0.0, _STROKE_M))
 

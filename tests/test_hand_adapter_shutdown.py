@@ -572,6 +572,22 @@ def test_sr_set_joint_pos_latches_commit_failure():
     assert adapter.command_path_healthy is False
 
 
+def test_sr_set_joint_pos_refuses_physical_send_while_failure_is_latched():
+    adapter = SrGripperAdapter.__new__(SrGripperAdapter)
+    adapter._state_lock = threading.Lock()
+    adapter._cached_pos = 0.03
+    adapter._last_slew_target = None
+    adapter._command_failed = threading.Event()
+    adapter._command_failed.set()
+    commits = []
+    adapter._commit_target = lambda *args: commits.append(args)
+
+    with pytest.raises(RuntimeError, match="Reset is required"):
+        adapter.set_joint_pos(np.array([0.04]))
+
+    assert commits == []
+
+
 def test_sr_worker_latches_failed_state_readback():
     adapter = SrGripperAdapter.__new__(SrGripperAdapter)
     adapter._stop_event = threading.Event()
