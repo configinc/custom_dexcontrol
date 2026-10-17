@@ -11,10 +11,49 @@ _base_arm_teleop = ModuleType("base_arm_teleop")
 _base_arm_teleop.BaseIKController = object
 sys.modules.setdefault("base_arm_teleop", _base_arm_teleop)
 
+import dexcontrol.core.robotenv_vega.server as server_module  # noqa: E402
 from dexcontrol.core.robotenv_vega.server import (  # noqa: E402
     VegaRobotEnvService,
     _shutdown_service_until_safe,
 )
+
+
+def test_serve_defers_startup_signal_until_service_has_cleanup_owner(
+    monkeypatch, tmp_path
+):
+    handlers = {}
+    calls = []
+
+    class Service:
+        def __init__(self, **_kwargs):
+            calls.append("service-created")
+            handlers[server_module.signal.SIGTERM](server_module.signal.SIGTERM, None)
+
+        def shutdown(self):
+            calls.append("service-shutdown")
+
+    monkeypatch.setattr(server_module, "VegaRobotEnvService", Service)
+    monkeypatch.setattr(
+        server_module.signal, "getsignal", lambda signum: f"old-{signum}"
+    )
+    monkeypatch.setattr(
+        server_module.signal,
+        "signal",
+        lambda signum, handler: handlers.__setitem__(signum, handler),
+    )
+    monkeypatch.setattr(
+        server_module.signal, "pthread_sigmask", lambda *_args: set()
+    )
+    monkeypatch.setattr(
+        server_module.os.path,
+        "expanduser",
+        lambda _path: str(tmp_path / "robotenv_vega.log"),
+    )
+
+    with pytest.raises(SystemExit):
+        server_module.serve(arm_side="left")
+
+    assert calls == ["service-created", "service-shutdown"]
 
 
 class _Robot:

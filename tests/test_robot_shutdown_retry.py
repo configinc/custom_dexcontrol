@@ -9,6 +9,7 @@ import dexcontrol.core.robot_query_interface as query_module
 from dexcontrol.core.robot_query_interface import RobotQueryInterface
 from dexcontrol.robot import Robot
 from dexcontrol.sensors.manager import Sensors
+from dexcontrol.core.chassis import Chassis
 
 
 class _Component:
@@ -291,6 +292,56 @@ def test_partial_component_creation_is_immediately_owned_for_rollback(monkeypatc
     assert [component.name for component in robot._components] == ["first", "second"]
 
 
+def test_partial_component_shutdown_runs_even_when_graceful_stop_fails():
+    class PartialComponent:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def stop(self):
+            raise AttributeError("later constructor field is missing")
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    component = PartialComponent()
+    robot = Robot.__new__(Robot)
+    robot._shutdown_called = False
+    robot._shutdown_lock = threading.RLock()
+    robot._components = [component]
+    robot.sensors = None
+    robot._node_released = True
+    robot._node_owner_released = True
+    robot._node_session_cleanup_required = False
+    robot._node_release_lock = threading.Lock()
+
+    with pytest.raises(RuntimeError, match="later constructor field is missing"):
+        robot.shutdown()
+
+    assert component.shutdown_calls == 1
+
+
+def test_partial_chassis_releases_first_child_when_second_child_init_failed():
+    class Child:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    steer = Child()
+    chassis = Chassis.__new__(Chassis)
+    chassis.chassis_steer = steer
+    chassis.chassis_drive = None
+    chassis.steer_temperature_sensor = None
+    chassis.drive_temperature_sensor = None
+    chassis._shutdown_child_ids = set()
+    chassis._initialization_complete = False
+
+    chassis.shutdown()
+
+    assert steer.shutdown_calls == 1
+
+
 def test_sensor_constructor_retries_partial_cleanup_before_raising(monkeypatch):
     calls = []
 
@@ -345,6 +396,34 @@ def test_sensor_start_failure_cleans_the_not_yet_published_sensor(monkeypatch):
         Sensors({"sensor": Config()})
 
     assert Sensor.instance.shutdown_calls == 1
+
+
+def test_sensor_init_failure_cleans_the_partially_constructed_sensor(monkeypatch):
+    class Config:
+        enabled = True
+
+    class Sensor:
+        instance = None
+
+        def __init__(self, **_kwargs):
+            self.resource = object()
+            self.shutdown_calls = 0
+            Sensor.instance = self
+            raise RuntimeError("later stream failed")
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+            self.resource = None
+
+    monkeypatch.setattr(
+        "dexcontrol.core.config.get_sensor_mapping", lambda: {Config: Sensor}
+    )
+
+    with pytest.raises(RuntimeError, match="later stream failed"):
+        Sensors({"sensor": Config()})
+
+    assert Sensor.instance.shutdown_calls == 1
+    assert Sensor.instance.resource is None
 
 
 def test_concurrent_robot_shutdown_runs_component_teardown_once():

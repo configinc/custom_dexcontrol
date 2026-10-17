@@ -54,7 +54,10 @@ class ChassisIMUSensor(SubscriptionPolicyMixin):
 
     def shutdown(self) -> None:
         """Shutdown the chassis IMU sensor."""
-        self._subscriber.shutdown()
+        subscriber = getattr(self, "_subscriber", None)
+        if subscriber is not None:
+            subscriber.shutdown()
+            self._subscriber = None
 
     def is_active(self) -> bool:
         """Check if the chassis IMU sensor is actively receiving data.

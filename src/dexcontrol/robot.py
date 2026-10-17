@@ -904,12 +904,17 @@ class Robot(RobotQueryInterface):
             component_id = id(component)
             if (
                 component is not None
-                and component_id in stopped_ids
                 and component_id not in shutdown_ids
             ):
                 try:
+                    # Resource release is independent from a graceful stop.
+                    # A constructor can fail after acquiring only part of a
+                    # composite component; its operational stop() may then be
+                    # unavailable, but shutdown() must still get a chance to
+                    # release the resources that do exist.
                     component.shutdown()
                     shutdown_ids.add(component_id)
+                    stopped_ids.add(component_id)
                 except Exception as e:  # pylint: disable=broad-except
                     logger.error(
                         f"Error shutting down component {component.__class__.__name__}: {e}"

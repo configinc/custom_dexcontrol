@@ -107,7 +107,7 @@ class RobotQueryInterface:
                 response_decoder=None,
                 timeout=5.0,
             )
-        except Exception:
+        except BaseException:
             # A constructor that acquired ownership but never returned cannot
             # be closed by its caller.  Finish the release transaction here,
             # retrying a last-owner Node teardown until it is actually safe.
@@ -115,7 +115,7 @@ class RobotQueryInterface:
                 try:
                     self._close_shared_resources()
                     break
-                except Exception as cleanup_exc:  # pylint: disable=broad-except
+                except BaseException as cleanup_exc:  # pylint: disable=broad-except
                     logger.error(
                         "RobotQueryInterface constructor cleanup is not yet safe; "
                         "retrying: {}",

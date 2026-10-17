@@ -253,13 +253,19 @@ class RobotJointComponent(RobotComponent):
 
     def shutdown(self) -> None:
         """Cleans up the raw control publisher (and the inherited subscriber)."""
-        super().shutdown()
+        errors: list[str] = []
+        try:
+            super().shutdown()
+        except Exception as e:
+            errors.append(f"subscriber: {e}")
         try:
             if hasattr(self, "_publisher") and self._publisher:
                 self._publisher.shutdown()
         except Exception as e:
-            logger.warning(
-                f"Error shutting down publisher for {self.__class__.__name__}: {e}"
+            errors.append(f"publisher: {e}")
+        if errors:
+            raise RuntimeError(
+                f"{self.__class__.__name__} shutdown failed: " + "; ".join(errors)
             )
 
     @property

@@ -162,19 +162,32 @@ class Chassis(SubscriptionPolicyMixin):
             robot_info: Robot information object used to retrieve chassis configuration
                 and kinematic parameters.
         """
+        # Establish a partial-construction-safe teardown state before the first
+        # child acquires a subscriber or publisher.
+        self.chassis_steer: ChassisSteer | None = None
+        self.chassis_drive: ChassisDrive | None = None
+        self.steer_temperature_sensor: TemperatureSensor | None = None
+        self.drive_temperature_sensor: TemperatureSensor | None = None
+        self._shutdown_child_ids: set[int] = set()
+        self._subcomponents: dict[str, Any] = {}
+        self._initialization_complete = False
+
         config = robot_info.get_component_config(name)
         config = cast(Vega1ChassisConfig, config)
-        self.chassis_steer = ChassisSteer(f"{name}_steer", robot_info, config)
-        self.chassis_drive = ChassisDrive(f"{name}_drive", robot_info, config)
+        self.chassis_steer = ChassisSteer.__new__(ChassisSteer)
+        self._subcomponents["steer"] = self.chassis_steer
+        ChassisSteer.__init__(
+            self.chassis_steer, f"{name}_steer", robot_info, config
+        )
+        self.chassis_drive = ChassisDrive.__new__(ChassisDrive)
+        self._subcomponents["drive"] = self.chassis_drive
+        ChassisDrive.__init__(
+            self.chassis_drive, f"{name}_drive", robot_info, config
+        )
         # Chassis has no own subscriber — policy delegates to children
         self._policy_manager = None
-        self._subcomponents: dict[str, Any] = {
-            "steer": self.chassis_steer,
-            "drive": self.chassis_drive,
-        }
 
         # Initialize temperature sensors for steer and drive
-        self.steer_temperature_sensor: TemperatureSensor | None = None
         if config.steer_temperature_sub_topic:
             self.steer_temperature_sensor = TemperatureSensor(
                 f"{name}_steer_temperature", config.steer_temperature_sub_topic
@@ -183,7 +196,6 @@ class Chassis(SubscriptionPolicyMixin):
                 self.steer_temperature_sensor
             )
 
-        self.drive_temperature_sensor: TemperatureSensor | None = None
         if config.drive_temperature_sub_topic:
             self.drive_temperature_sensor = TemperatureSensor(
                 f"{name}_drive_temperature", config.drive_temperature_sub_topic
@@ -226,6 +238,7 @@ class Chassis(SubscriptionPolicyMixin):
 
         # Constants for steering angle constraints
         self._min_velocity_threshold = _MIN_VELOCITY_THRESHOLD
+        self._initialization_complete = True
 
     def set_subscription_policy(
         self,
@@ -250,14 +263,32 @@ class Chassis(SubscriptionPolicyMixin):
         )
 
     def shutdown(self) -> None:
-        """Shutdown the base by stopping all motion."""
-        self.stop()
-        self.chassis_steer.shutdown()
-        self.chassis_drive.shutdown()
-        if self.steer_temperature_sensor is not None:
-            self.steer_temperature_sensor.shutdown()
-        if self.drive_temperature_sensor is not None:
-            self.drive_temperature_sensor.shutdown()
+        """Release every child acquired so far, including partial construction."""
+        errors: list[str] = []
+        try:
+            if getattr(self, "_initialization_complete", False):
+                self.stop()
+        except Exception as exc:  # best effort before mandatory resource release
+            errors.append(f"stop failed: {exc}")
+
+        children = (
+            getattr(self, "drive_temperature_sensor", None),
+            getattr(self, "steer_temperature_sensor", None),
+            getattr(self, "chassis_drive", None),
+            getattr(self, "chassis_steer", None),
+        )
+        completed = getattr(self, "_shutdown_child_ids", set())
+        self._shutdown_child_ids = completed
+        for child in children:
+            if child is None or id(child) in completed:
+                continue
+            try:
+                child.shutdown()
+                completed.add(id(child))
+            except Exception as exc:
+                errors.append(f"{child.__class__.__name__} shutdown failed: {exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
     @property
     def steering_angle(self) -> np.ndarray:

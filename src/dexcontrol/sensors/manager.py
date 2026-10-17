@@ -71,7 +71,8 @@ class Sensors:
                 sensor = self._create_sensor(sensor_config, str(sensor_name))
                 if sensor is not None:
                     setattr(self, str(sensor_name), sensor)
-                    self._sensors.append(sensor)
+                    if not any(existing is sensor for existing in self._sensors):
+                        self._sensors.append(sensor)
         except BaseException:
             while True:
                 try:
@@ -146,27 +147,41 @@ class Sensors:
             return None
 
         sensor_class = sensor_mapping[type(config)]
-        sensor = sensor_class(name=name, configs=config)
+        # Retain ownership before __init__. Multi-stream sensors can acquire an
+        # early subscriber and then fail while creating a later one.
+        sensor = sensor_class.__new__(sensor_class)
+        self._sensors.append(sensor)
+        try:
+            sensor_class.__init__(sensor, name=name, configs=config)
+        except BaseException:
+            self._shutdown_sensor_until_safe(sensor)
+            self._sensors.remove(sensor)
+            raise
 
         try:
             if hasattr(sensor, "start"):
                 sensor.start()
         except BaseException:
-            shutdown = getattr(sensor, "shutdown", None)
-            if callable(shutdown):
-                while True:
-                    try:
-                        shutdown()
-                        break
-                    except BaseException as cleanup_exc:
-                        logger.error(
-                            "Sensor start rollback is not yet safe; retrying: {}",
-                            cleanup_exc,
-                        )
-                        time.sleep(0.1)
+            self._shutdown_sensor_until_safe(sensor)
+            self._sensors.remove(sensor)
             raise
 
         return sensor
+
+    @staticmethod
+    def _shutdown_sensor_until_safe(sensor: Any) -> None:
+        shutdown = getattr(sensor, "shutdown", None)
+        if not callable(shutdown):
+            return
+        while True:
+            try:
+                shutdown()
+                return
+            except BaseException as cleanup_exc:
+                logger.error(
+                    "Sensor rollback is not yet safe; retrying: {}", cleanup_exc
+                )
+                time.sleep(0.1)
 
     def shutdown(self) -> None:
         """Shuts down all active sensors."""

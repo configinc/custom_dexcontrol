@@ -1928,6 +1928,17 @@ def serve(
     previous_signal_handlers = {
         signum: signal.getsignal(signum) for signum in managed_signals
     }
+    deferred_shutdown = threading.Event()
+
+    def defer_shutdown_signal(signum, frame):
+        del signum, frame
+        deferred_shutdown.set()
+
+    # pthread_sigmask only protects the calling thread. Install a process-wide
+    # non-destructive disposition first so an existing native/daemon thread
+    # cannot receive SIGTERM with SIG_DFL while hardware is being acquired.
+    for signum in managed_signals:
+        signal.signal(signum, defer_shutdown_signal)
     previous_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, managed_signals)
     signals_unblocked = False
     try:
@@ -1971,12 +1982,44 @@ def serve(
         force_calibration_storage_directory=force_calibration_storage_directory,
         )
     except BaseException:
+        for signum, previous_handler in previous_signal_handlers.items():
+            signal.signal(signum, previous_handler)
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        logging.getLogger().removeHandler(_file_handler)
+        _file_handler.close()
         raise
 
     server = None
     service_shutdown_completed = False
+    shutdown_signal_lock = threading.Lock()
+
+    def shutdown_handler(signum, frame):
+        nonlocal service_shutdown_completed
+        del signum, frame
+        if not shutdown_signal_lock.acquire(blocking=False):
+            LOGGER.warning(
+                "Vega shutdown already in progress; ignoring repeated signal"
+            )
+            return
+        LOGGER.info("Shutting down Vega RobotEnv server")
+        try:
+            if server is not None:
+                server.stop(grace=0)
+        finally:
+            _shutdown_service_until_safe(service)
+            service_shutdown_completed = True
+        raise SystemExit(0)
+
     try:
+        for signum in managed_signals:
+            signal.signal(signum, shutdown_handler)
+        # If another thread received a termination signal while the service
+        # constructor owned hardware, honor it now under the full safe handler.
+        if deferred_shutdown.is_set():
+            shutdown_handler(signal.SIGTERM, None)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        signals_unblocked = True
+
         server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
         robotenv_pb2_grpc.add_RobotEnvServicer_to_server(service, server)
 
@@ -1993,30 +2036,6 @@ def serve(
             robot_model,
         )
 
-        shutdown_signal_lock = threading.Lock()
-
-        def shutdown_handler(signum, frame):
-            nonlocal service_shutdown_completed
-            del signum, frame
-            if not shutdown_signal_lock.acquire(blocking=False):
-                LOGGER.warning(
-                    "Vega shutdown already in progress; ignoring repeated signal"
-                )
-                return
-            LOGGER.info("Shutting down Vega RobotEnv server")
-            try:
-                server.stop(grace=0)
-            finally:
-                _shutdown_service_until_safe(service)
-                service_shutdown_completed = True
-            raise SystemExit(0)
-
-        signal.signal(signal.SIGINT, shutdown_handler)
-        signal.signal(signal.SIGTERM, shutdown_handler)
-        # Signals that arrived during construction are delivered only after
-        # the safe handler and full cleanup ownership are installed.
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
-        signals_unblocked = True
         server.wait_for_termination()
     finally:
         try:
@@ -2035,6 +2054,8 @@ def serve(
                     signal.pthread_sigmask(
                         signal.SIG_SETMASK, previous_signal_mask
                     )
+                logging.getLogger().removeHandler(_file_handler)
+                _file_handler.close()
 
 
 def main() -> None:
