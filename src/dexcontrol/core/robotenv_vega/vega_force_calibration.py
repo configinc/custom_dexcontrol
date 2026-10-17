@@ -616,12 +616,10 @@ class VegaForceCalibrationManager:
                 self._candidate = None
                 self._pending_terminal = None
                 if status.state == "SUCCEEDED":
-                    result = self.lifecycle.get_result("")
-                    parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
-                    self.adapter.install_prepared(
-                        self.adapter.prepare_install(parameters)
-                    )
-                    self._release_if_owned()
+                    try:
+                        self._install_current_result_if_available(run_id)
+                    finally:
+                        self._release_if_owned()
                 else:
                     self._schedule_deadline_locked(status)
                 return status
@@ -816,6 +814,20 @@ class VegaForceCalibrationManager:
         self._runtime_install_pending_run_id = None
         return True
 
+    def _install_prepared_if_current(self, run_id: str, prepared: Any) -> bool:
+        result = self.lifecycle.get_result("")
+        if not result.get("available") or result.get("run_id") != run_id:
+            if self._runtime_install_pending_run_id == run_id:
+                self._runtime_install_pending_run_id = None
+            return False
+        try:
+            self.adapter.install_prepared(prepared)
+        except BaseException:
+            self._runtime_install_pending_run_id = run_id
+            raise
+        self._runtime_install_pending_run_id = None
+        return True
+
     def _install_current_result_and_release(self, run_id: str) -> bool:
         try:
             return self._install_current_result_if_available(run_id)
@@ -844,24 +856,15 @@ class VegaForceCalibrationManager:
                 parameters = wrist_ft_calibration_from_snapshot(record["parameters"])
             prepared = self.adapter.prepare_install(parameters)
             try:
-                status = self.adapter.commit_install(
-                    prepared, lambda: self.lifecycle.commit(run_id, plan_sha256)
-                )
+                status = self.lifecycle.commit(run_id, plan_sha256)
             except BaseException:
                 repaired = self.lifecycle.repair_partial_commit(run_id)
                 if repaired is None:
                     raise
-                try:
-                    try:
-                        self.adapter.install_prepared(prepared)
-                    except BaseException:
-                        self._runtime_install_pending_run_id = run_id
-                        raise
-                    self._runtime_install_pending_run_id = None
-                finally:
-                    self._release_if_owned()
                 status = repaired
-            else:
+            try:
+                self._install_prepared_if_current(run_id, prepared)
+            finally:
                 self._release_if_owned()
             return status
 
@@ -877,6 +880,9 @@ class VegaForceCalibrationManager:
                 self._install_current_result_and_release(status.run_id)
             elif status.state in {"CANCELLED", "FAILED"}:
                 self._release_if_owned()
+            pending_runtime = self._runtime_install_pending_run_id
+            if pending_runtime is not None and pending_runtime != status.run_id:
+                self._install_current_result_if_available(pending_runtime)
             if self._pending_terminal is not None:
                 self._schedule_terminal_retry_locked()
             return status
@@ -891,6 +897,9 @@ class VegaForceCalibrationManager:
                 self._install_current_result_and_release(status.run_id)
             elif status.state in {"CANCELLED", "FAILED"}:
                 self._release_if_owned()
+            pending_runtime = self._runtime_install_pending_run_id
+            if pending_runtime is not None and pending_runtime != status.run_id:
+                self._install_current_result_if_available(pending_runtime)
             if self._pending_terminal is not None:
                 self._schedule_terminal_retry_locked()
             return self.lifecycle.get_result(run_id)
