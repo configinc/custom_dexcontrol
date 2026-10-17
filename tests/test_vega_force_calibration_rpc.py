@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from types import ModuleType
 
 import grpc
@@ -98,6 +99,7 @@ class Manager:
 def _service(manager=None):
     service = VegaRobotEnvService.__new__(VegaRobotEnvService)
     service._force_calibration_manager = manager or Manager()
+    service._shutdown_started = threading.Event()
     return service
 
 
@@ -159,4 +161,31 @@ def test_empty_cancel_is_not_found_without_touching_manager() -> None:
     )
     assert response == robotenv_pb2.ForceCalibrationStatus()
     assert context.code == grpc.StatusCode.NOT_FOUND
+    assert manager.calls == []
+
+
+def test_shutdown_barrier_rejects_mutating_calibration_rpcs() -> None:
+    manager = Manager()
+    service = _service(manager)
+    service._shutdown_started.set()
+
+    requests = (
+        (service.StartForceCalibration, robotenv_pb2.StartForceCalibrationRequest(run_id="r")),
+        (
+            service.AdvanceForceCalibration,
+            robotenv_pb2.AdvanceForceCalibrationRequest(
+                run_id="r", stage_index=0, stage_id="stage-0"
+            ),
+        ),
+        (
+            service.CommitForceCalibration,
+            robotenv_pb2.CommitForceCalibrationRequest(run_id="r", plan_sha256="a" * 64),
+        ),
+    )
+    for method, request in requests:
+        context = Context()
+        assert method(request, context) == robotenv_pb2.ForceCalibrationStatus()
+        assert context.code == grpc.StatusCode.UNAVAILABLE
+        assert context.details == "robot server is shutting down"
+
     assert manager.calls == []

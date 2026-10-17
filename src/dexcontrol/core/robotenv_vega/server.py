@@ -210,15 +210,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._control_loop_hz = control_loop_hz if control_loop_hz > 0 else 0
         self._control_loop_thread: Optional[threading.Thread] = None
         self._control_loop_stop = threading.Event()
-        if self._robot.interpolation_enabled and self._control_loop_hz > 0:
-            self._start_control_loop()
-            LOGGER.info(
-                "Control loop thread started: %d Hz (input≈%d Hz → control=%d Hz)",
-                self._control_loop_hz,
-                control_hz,
-                self._control_loop_hz,
-            )
-
         # Override home position with per-arm init joints.
         self.reset_joints = _INIT_JOINTS[arm_side].copy()
         self.reset_middle_joints = _RESET_MIDDLE_JOINTS[arm_side].copy()
@@ -246,6 +237,17 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._active_reset_count = 0
         self._active_reset_cancel = None
         self._reset_restart_control_loop = False
+        self._shutdown_started = threading.Event()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_completed = False
+        if self._robot.interpolation_enabled and self._control_loop_hz > 0:
+            self._start_control_loop()
+            LOGGER.info(
+                "Control loop thread started: %d Hz (input≈%d Hz → control=%d Hz)",
+                self._control_loop_hz,
+                control_hz,
+                self._control_loop_hz,
+            )
         LOGGER.info(
             "Initialized VegaRobotEnvService model=%s arm=%s gripper=%s frame=%s hz=%s",
             robot_model,
@@ -348,6 +350,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         """Start the background control-loop thread."""
         if self._control_loop_thread is not None:
             if self._control_loop_thread.is_alive():
+                if self._control_loop_stop.is_set():
+                    raise RuntimeError("Vega control loop is still stopping")
                 return
             self._control_loop_thread = None
         self._control_loop_stop.clear()
@@ -389,6 +393,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
     def _claim_robot_for_force_calibration(self) -> bool:
         with self._force_calibration_owner_lock:
+            if self._shutdown_started.is_set():
+                return False
             if self._force_calibration_owns_robot.is_set() or self._reset_in_progress.is_set():
                 return False
             if not self._cmd_lock.acquire(blocking=False):
@@ -418,11 +424,20 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self._force_calibration_owns_robot.clear()
             if getattr(self, "_force_calibration_restart_control_loop", False):
                 self._force_calibration_restart_control_loop = False
-                self._start_control_loop()
+                if not self._shutdown_started.is_set():
+                    self._start_control_loop()
 
     def _set_force_calibration_applier(self, applier) -> None:
         with self._force_calibration_applier_lock:
             self._force_calibration_applier = applier
+
+    def _reject_if_shutting_down(self, context) -> bool:
+        shutting_down = getattr(self, "_shutdown_started", None)
+        if shutting_down is None or not shutting_down.is_set():
+            return False
+        context.set_code(grpc.StatusCode.UNAVAILABLE)
+        context.set_details("robot server is shutting down")
+        return True
 
     @staticmethod
     def _compute_cartesian_delta_limits(
@@ -779,6 +794,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         context.set_details(str(exc) or type(exc).__name__)
 
     def StartForceCalibration(self, request, context):
+        if self._reject_if_shutting_down(context):
+            return robotenv_pb2.ForceCalibrationStatus()
         try:
             status = self._force_calibration_manager.start(
                 request.run_id, bool(request.force_recalibrate)
@@ -790,6 +807,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             return robotenv_pb2.ForceCalibrationStatus()
 
     def AdvanceForceCalibration(self, request, context):
+        if self._reject_if_shutting_down(context):
+            return robotenv_pb2.ForceCalibrationStatus()
         try:
             status = self._force_calibration_manager.advance(
                 request.run_id, int(request.stage_index), request.stage_id
@@ -801,6 +820,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             return robotenv_pb2.ForceCalibrationStatus()
 
     def CommitForceCalibration(self, request, context):
+        if self._reject_if_shutting_down(context):
+            return robotenv_pb2.ForceCalibrationStatus()
         try:
             status = self._force_calibration_manager.commit(
                 request.run_id, request.plan_sha256
@@ -865,6 +886,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             return robotenv_pb2.ForceCalibrationResult()
 
     def Reset(self, request, context):
+        if self._reject_if_shutting_down(context):
+            return robotenv_pb2.ResetResponse()
         mode = request.mode or "home"
         LOGGER.info("Reset requested: mode=%s arm=%s", mode, self.arm_side)
         calibration_owner = getattr(self, "_force_calibration_owns_robot", None)
@@ -922,6 +945,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         was_running = False
         try:
             with self._cmd_lock:
+                if self._shutdown_started.is_set():
+                    raise RuntimeError("Reset was cancelled because the robot server is shutting down")
                 if motion_cancelled.is_set():
                     raise RuntimeError("Reset was cancelled before robot motion started")
                 calibration_cancellable = bool(
@@ -1001,10 +1026,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     self._reset_in_progress.clear()
                     restart_control_loop = self._reset_restart_control_loop
                     self._reset_restart_control_loop = False
-            if restart_control_loop:
-                self._start_control_loop()
+            if restart_control_loop and not self._shutdown_started.is_set():
+                try:
+                    self._start_control_loop()
+                except RuntimeError:
+                    # A timed-out old loop still owns the handle.  Keep the
+                    # restart intent so the next Step can recover after it exits.
+                    with self._reset_state_lock:
+                        self._reset_restart_control_loop = True
 
     def Step(self, request, context):
+        if self._reject_if_shutting_down(context):
+            return robotenv_pb2.StepResponse()
         calibration_owner = getattr(self, "_force_calibration_owns_robot", None)
         if calibration_owner is not None and calibration_owner.is_set():
             context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
@@ -1184,9 +1217,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     getattr(self, "_force_calibration_owns_robot", None) is not None
                     and self._force_calibration_owns_robot.is_set()
                 )
+                or self._shutdown_started.is_set()
             ):
-                raise RuntimeError("Step was superseded by reset or force calibration")
+                raise RuntimeError(
+                    "Step was superseded by reset, force calibration, or shutdown"
+                )
             if self._robot.interpolation_enabled and self._control_loop_hz > 0:
+                if self._control_loop_thread is None or not self._control_loop_thread.is_alive():
+                    self._start_control_loop()
+                    with self._reset_state_lock:
+                        self._reset_restart_control_loop = False
+                elif self._control_loop_stop.is_set():
+                    raise RuntimeError("Vega control loop is still stopping")
                 self._robot.add_command_point(
                     action,
                     action_space=action_space,
@@ -1691,11 +1733,27 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
     def shutdown(self) -> None:
         """Safely stop calibration, command loops, and the robot transport."""
-        manager = getattr(self, "_force_calibration_manager", None)
-        if manager is not None:
-            manager.shutdown()
-        self._stop_control_loop()
-        self._robot.close()
+        with self._shutdown_lock:
+            if self._shutdown_completed:
+                return
+            # Close admission before inspecting any owner.  In-flight RPCs
+            # either observe this flag before physical dispatch or are drained
+            # by the ownership barriers below.
+            self._shutdown_started.set()
+            with self._command_epoch_lock:
+                self._command_epoch += 1
+            with self._reset_state_lock:
+                if self._active_reset_cancel is not None:
+                    self._active_reset_cancel.set()
+            manager = getattr(self, "_force_calibration_manager", None)
+            if manager is not None:
+                manager.shutdown()
+            # Reset and Step perform physical dispatch while holding this lock.
+            # Acquiring it here proves that every admitted command has unwound.
+            with self._cmd_lock:
+                self._stop_control_loop()
+                self._robot.close()
+            self._shutdown_completed = True
 
 
 def serve(
@@ -1817,6 +1875,8 @@ def serve(
     def shutdown_handler(signum, frame):
         del signum, frame
         LOGGER.info("Shutting down Vega RobotEnv server")
+        # Stop new transport admission before draining in-flight robot work.
+        server.stop(grace=0)
         try:
             service.shutdown()
         except Exception:
@@ -1824,7 +1884,6 @@ def serve(
                 "Vega shutdown could not complete measured calibration return"
             )
             return
-        server.stop(grace=5)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown_handler)

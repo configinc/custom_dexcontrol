@@ -19,9 +19,13 @@ class _Robot:
 
     def __init__(self):
         self.commands = []
+        self.closed = False
 
     def update_command(self, action, **kwargs):
         self.commands.append((np.asarray(action).copy(), kwargs))
+
+    def close(self):
+        self.closed = True
 
 
 def _service():
@@ -35,6 +39,9 @@ def _service():
     service._active_reset_count = 0
     service._active_reset_cancel = None
     service._reset_restart_control_loop = False
+    service._shutdown_started = threading.Event()
+    service._shutdown_lock = threading.Lock()
+    service._shutdown_completed = False
     service._control_loop_hz = 0
     service._robot = _Robot()
     service._control_loop_thread = None
@@ -78,6 +85,31 @@ def test_force_calibration_claim_rolls_back_if_control_loop_does_not_stop():
 
     assert service._force_calibration_owns_robot.is_set() is False
     assert service._force_calibration_restart_control_loop is False
+
+
+def test_shutdown_closes_admission_before_draining_and_rejects_motion_rpcs():
+    service = _service()
+    service._control_loop_stop = threading.Event()
+    manager_calls = []
+    service._force_calibration_manager = SimpleNamespace(
+        shutdown=lambda: manager_calls.append(service._shutdown_started.is_set())
+    )
+    context = SimpleNamespace(code=None, details="")
+    context.set_code = lambda code: setattr(context, "code", code)
+    context.set_details = lambda details: setattr(context, "details", details)
+
+    service.shutdown()
+
+    assert manager_calls == [True]
+    assert service._shutdown_completed is True
+    assert service._robot.closed is True
+    assert service._claim_robot_for_force_calibration() is False
+
+    assert service.Reset(SimpleNamespace(mode="home", params={}), context).status == ""
+    assert context.code == grpc.StatusCode.UNAVAILABLE
+    context.code = None
+    assert service.Step(SimpleNamespace(), context).status == ""
+    assert context.code == grpc.StatusCode.UNAVAILABLE
 
 
 def test_step_dispatch_uses_normal_path_when_no_reset_owns_robot():
