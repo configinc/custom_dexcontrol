@@ -338,6 +338,20 @@ def test_force_calibration_claim_rolls_back_if_control_loop_does_not_stop():
     assert service._force_calibration_restart_control_loop is False
 
 
+def test_cancelled_reset_clears_buffered_commands_before_return():
+    service = _service()
+    calls = []
+    service._robot.reset_filter_state = lambda: calls.append("cleared")
+    cancelled = threading.Event()
+    cancelled.set()
+
+    service._execute_reset_sequence(
+        np.zeros(7), cancelled=cancelled, interruptible_gripper=True
+    )
+
+    assert calls == ["cleared"]
+
+
 def test_shutdown_closes_admission_before_draining_and_rejects_motion_rpcs():
     service = _service()
     service._control_loop_stop = threading.Event()

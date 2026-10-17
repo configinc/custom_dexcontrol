@@ -129,7 +129,18 @@ def _resample_smoothing_alpha(
     return float((omega * target_dt) / (1.0 + omega * target_dt))
 
 
+def _resample_first_order_alpha(
+    alpha: float, source_hz: float, target_hz: float
+) -> float:
+    """Preserve first-order EMA wall-clock decay across tick rates."""
+    clipped = float(np.clip(alpha, 0.0, 1.0))
+    if clipped <= 0.0 or clipped >= 1.0 or source_hz == target_hz:
+        return clipped
+    return float(1.0 - (1.0 - clipped) ** (float(source_hz) / float(target_hz)))
+
+
 class VegaRobot:
+    _FEEDFORWARD_MAX_AGE_INPUT_PERIODS = 2.0
     """Thin wrapper around dexcontrol Robot for single-arm control."""
 
     @staticmethod
@@ -335,9 +346,19 @@ class VegaRobot:
         self._prev_controller_latency_ms = 0.0
         self._prev_joint_vel: np.ndarray | None = None
         self._vel_smoothing_alpha = float(np.clip(config["vel_smoothing_alpha"], 0.0, 1.0))
+        self._interpolation_vel_smoothing_alpha = _resample_first_order_alpha(
+            self._vel_smoothing_alpha,
+            float(control_hz),
+            float(config["interpolation_control_hz"]),
+        )
         self._last_cmd_joint_pos: np.ndarray | None = None
         self._prev_cmd_delta: np.ndarray | None = None
         self._HW_CORRECTION_ALPHA = float(np.clip(config["hw_correction_alpha"], 0.0, 1.0))
+        self._INTERPOLATION_HW_CORRECTION_ALPHA = _resample_first_order_alpha(
+            self._HW_CORRECTION_ALPHA,
+            float(control_hz),
+            float(config["interpolation_control_hz"]),
+        )
         self._HW_CORRECTION_OUTLIER_THRESH = 0.5
         self._max_delta_scale = float(max(0.1, config["max_delta_scale"]))
         self._MOTOR_MAX_JERK_RAD = float(max(0.0, config["max_jerk"]))
@@ -378,7 +399,11 @@ class VegaRobot:
                     order=config["filter_order"],
                 )
             elif filter_type == "ema":
-                filter_cfg["default"]["alpha"] = config["filter_ema_alpha"]
+                filter_cfg["default"]["alpha"] = _resample_first_order_alpha(
+                    config["filter_ema_alpha"],
+                    float(control_hz),
+                    float(config["interpolation_control_hz"]),
+                )
             self._output_filter = MultiChannelFilter(
                 filter_config=filter_cfg,
                 control_rate=float(config["interpolation_control_hz"]),
@@ -388,6 +413,7 @@ class VegaRobot:
 
         self._latest_target_joint_pos: np.ndarray | None = None
         self._latest_arm_feedforward_velocity: np.ndarray | None = None
+        self._latest_command_monotonic: float | None = None
         self._latest_gripper_action = 0.0
         self._latest_hand_action: np.ndarray | None = None
         self._latest_gripper_action_space = "position"
@@ -476,6 +502,7 @@ class VegaRobot:
             self._output_filter.reset()
         self._latest_target_joint_pos = None
         self._latest_arm_feedforward_velocity = None
+        self._latest_command_monotonic = None
         self._latest_hand_action = None
         self._latest_gripper_action = 0.0
         self._latest_gripper_action_space = "position"
@@ -861,25 +888,25 @@ class VegaRobot:
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
             arm_feedforward_velocity = None
 
-        timestamp = _time.perf_counter()
         with self._interp_lock:
-            self._interpolator.add_point(timestamp, target_joint_pos)
-            self._latest_target_joint_pos = target_joint_pos.copy()
-            self._latest_arm_feedforward_velocity = (
-                None
-                if arm_feedforward_velocity is None
-                else np.asarray(arm_feedforward_velocity, dtype=np.float64).copy()
-            )
             resolved_hand_action = np.asarray(
                 hand_action, dtype=np.float64
             ).copy()
             if not np.isfinite(resolved_hand_action).all():
                 raise ValueError("Hand action contains non-finite values")
+            if not np.isfinite(target_joint_pos).all():
+                raise ValueError("Arm target contains non-finite values")
+            hand = getattr(self, "hand", None)
+            is_wuji = getattr(hand, "model", None) in (
+                "wuji_hand_v1",
+                "wuji_hand_v2",
+            )
             resolved_gripper_action_space = gripper_action_space
             if gripper_action_space == "velocity":
                 previous_target = self._latest_hand_action
                 if (
-                    previous_target is None
+                    is_wuji
+                    or previous_target is None
                     or self._latest_gripper_action_space != "position"
                     or np.asarray(previous_target).size != resolved_hand_action.size
                 ):
@@ -887,10 +914,10 @@ class VegaRobot:
                         previous_target = np.array(
                             [self.get_cached_gripper_position()], dtype=np.float64
                         )
-                    elif self.hand is not None:
+                    elif hand is not None:
                         with self._gripper_io_lock:
                             previous_target = np.asarray(
-                                self.hand.get_joint_pos(), dtype=np.float64
+                                hand.get_joint_pos(), dtype=np.float64
                             ).reshape(-1)
                     else:
                         previous_target = np.zeros_like(resolved_hand_action)
@@ -901,14 +928,23 @@ class VegaRobot:
                 resolved_gripper_action_space = "position"
             if resolved_hand_action.size <= 1:
                 resolved_hand_action = np.clip(resolved_hand_action, 0.0, 1.0)
-            elif self.hand is not None:
-                limits = getattr(self.hand, "joint_limits", None)
+            elif hand is not None and not is_wuji:
+                limits = getattr(hand, "joint_limits", None)
                 if np.asarray(limits).shape == (resolved_hand_action.size, 2):
                     limits = np.asarray(limits, dtype=np.float64)
                     resolved_hand_action = np.clip(
                         resolved_hand_action, limits[:, 0], limits[:, 1]
                     )
-            # Store the full end-effector action (1 scalar gripper, or N-DoF hand).
+            # Publish arm and hand together only after all fallible preparation.
+            timestamp = _time.perf_counter()
+            self._interpolator.add_point(timestamp, target_joint_pos)
+            self._latest_target_joint_pos = target_joint_pos.copy()
+            self._latest_command_monotonic = timestamp
+            self._latest_arm_feedforward_velocity = (
+                None
+                if arm_feedforward_velocity is None
+                else np.asarray(arm_feedforward_velocity, dtype=np.float64).copy()
+            )
             self._latest_hand_action = resolved_hand_action
             self._latest_gripper_action = (
                 float(resolved_hand_action.reshape(-1)[0])
@@ -929,7 +965,11 @@ class VegaRobot:
                 return False
 
             now = _time.perf_counter()
-            pos, vel = self._interpolator.interpolate(now, compute_velocity=self.use_velocity_feedforward)
+            query_time = now - (1.0 / max(1, self.control_hz))
+            pos, vel = self._interpolator.interpolate(
+                query_time,
+                compute_velocity=self.use_velocity_feedforward,
+            )
 
             if pos is None:
                 # Not enough data for interpolation — use latest raw target.
@@ -937,7 +977,25 @@ class VegaRobot:
                 vel = None
 
             hand_action = self._latest_hand_action
-            arm_feedforward_velocity = self._latest_arm_feedforward_velocity
+            arm_feedforward_velocity = (
+                None
+                if vel is None
+                else np.asarray(vel, dtype=np.float64).copy()
+            )
+            latest_command_monotonic = self._latest_command_monotonic
+            if (
+                arm_feedforward_velocity is None
+                and self._latest_arm_feedforward_velocity is not None
+                and latest_command_monotonic is not None
+                and now - latest_command_monotonic
+                <= self._FEEDFORWARD_MAX_AGE_INPUT_PERIODS
+                / max(1, self.control_hz)
+            ):
+                arm_feedforward_velocity = self._latest_arm_feedforward_velocity.copy()
+            if arm_feedforward_velocity is None:
+                arm_feedforward_velocity = np.zeros_like(
+                    self._latest_target_joint_pos
+                )
             if hand_action is None:
                 hand_action = np.array([self._latest_gripper_action], dtype=np.float64)
             else:
@@ -1024,6 +1082,8 @@ class VegaRobot:
     ) -> None:
         run_id = f"joint-diagnostics-{self.arm_side}"
         tick_hz = self.control_hz if execution_hz is None else execution_hz
+        interpolation_tick = execution_hz is not None
+        rate_ratio = float(self.control_hz) / float(tick_hz)
         target_joint_pos = np.asarray(joint_pos_command, dtype=np.float64)
         if velocity:
             dt = 1.0 / max(1, tick_hz)
@@ -1079,15 +1139,21 @@ class VegaRobot:
             # hw feedback jumps beyond threshold (e.g. glitchy readings).
             outlier_mask = np.abs(raw_error) > self._HW_CORRECTION_OUTLIER_THRESH
             raw_error[outlier_mask] = 0.0
-            current = self._last_cmd_joint_pos + raw_error * self._HW_CORRECTION_ALPHA
+            correction_alpha = (
+                self._INTERPOLATION_HW_CORRECTION_ALPHA
+                if interpolation_tick
+                else self._HW_CORRECTION_ALPHA
+            )
+            current = self._last_cmd_joint_pos + raw_error * correction_alpha
         else:
             current = hw_pos
         diff = target_joint_pos - current
         raw_diff = diff.copy()
-        clipped_mask = np.abs(diff) > self._MOTOR_MAX_DELTA_RAD
+        max_delta = self._MOTOR_MAX_DELTA_RAD * rate_ratio
+        clipped_mask = np.abs(diff) > max_delta
         clipped_count = int(np.count_nonzero(clipped_mask))
         if np.any(clipped_mask):
-            clipped = np.clip(diff, -self._MOTOR_MAX_DELTA_RAD, self._MOTOR_MAX_DELTA_RAD)
+            clipped = np.clip(diff, -max_delta, max_delta)
             clipped_indices = np.where(clipped_mask)[0]
             # #region agent log
             self._agent_debug_log(
@@ -1099,7 +1165,7 @@ class VegaRobot:
                     "arm_side": self.arm_side,
                     "indices": clipped_indices.tolist(),
                     "raw_delta": np.round(diff[clipped_mask], 6).tolist(),
-                    "clip_limit": self._MOTOR_MAX_DELTA_RAD[clipped_mask].tolist(),
+                    "clip_limit": max_delta[clipped_mask].tolist(),
                 },
             )
             # #endregion
@@ -1107,7 +1173,7 @@ class VegaRobot:
                 "[DeltaClip] joints=%s raw=%s limit=%s",
                 clipped_indices.tolist(),
                 np.round(diff[clipped_mask], 4).tolist(),
-                self._MOTOR_MAX_DELTA_RAD[clipped_mask].tolist(),
+                max_delta[clipped_mask].tolist(),
             )
             target_joint_pos = current + clipped
             diff = clipped
@@ -1118,7 +1184,7 @@ class VegaRobot:
         jerk_count = 0
         if self._prev_cmd_delta is not None and self._MOTOR_MAX_JERK_RAD > 0:
             accel = diff - self._prev_cmd_delta
-            jerk_limit = self._MOTOR_MAX_JERK_RAD
+            jerk_limit = self._MOTOR_MAX_JERK_RAD * rate_ratio * rate_ratio
             jerk_mask = np.abs(accel) > jerk_limit
             jerk_count = int(np.count_nonzero(jerk_mask))
             if np.any(jerk_mask):
@@ -1152,13 +1218,29 @@ class VegaRobot:
 
         if self.use_velocity_feedforward and not blocking:
             dt = 1.0 / max(1, tick_hz)
-            raw_vel = (
-                np.asarray(feedforward_velocity, dtype=np.float64)
-                if feedforward_velocity is not None
-                else (target_joint_pos - current) / dt
-            )
+            dispatched_velocity = (target_joint_pos - current) / dt
+            if feedforward_velocity is None:
+                raw_vel = dispatched_velocity
+            else:
+                requested_velocity = np.asarray(
+                    feedforward_velocity, dtype=np.float64
+                )
+                same_direction = requested_velocity * dispatched_velocity > 0.0
+                raw_vel = np.where(
+                    same_direction,
+                    np.sign(requested_velocity)
+                    * np.minimum(
+                        np.abs(requested_velocity),
+                        np.abs(dispatched_velocity),
+                    ),
+                    0.0,
+                )
             if self._prev_joint_vel is not None:
-                a = self._vel_smoothing_alpha
+                a = (
+                    self._interpolation_vel_smoothing_alpha
+                    if interpolation_tick
+                    else self._vel_smoothing_alpha
+                )
                 target_joint_vel = a * raw_vel + (1.0 - a) * self._prev_joint_vel
             else:
                 target_joint_vel = raw_vel

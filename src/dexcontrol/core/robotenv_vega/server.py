@@ -1686,6 +1686,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         interruptible_gripper: bool = False,
     ) -> None:
         t0 = time.time()
+        # Reset owns the command path at this point. Clear all buffered targets
+        # before any cancellable wait so a cancelled reset cannot restart the
+        # previous interpolation/feedforward command.
+        self._robot.reset_filter_state()
         if cancelled is not None and cancelled.is_set():
             return
         LOGGER.info("Reset[%s]: starting gripper open", self.arm_side)
@@ -1707,8 +1711,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         if cancelled is not None and cancelled.is_set():
             return
         LOGGER.info("Reset[%s]: gripper done (%.2fs), starting reset motion", self.arm_side, time.time() - t0)
-        self._robot.reset_filter_state()
-
         # Move to middle waypoint to avoid collisions.
         middle_f64 = np.asarray(self.reset_middle_joints, dtype=np.float64)
         LOGGER.info("Reset[%s]: moving to middle waypoint", self.arm_side)
