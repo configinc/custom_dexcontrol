@@ -279,12 +279,16 @@ class SrGripperAdapter:
         """
         while not self._stop_event.is_set():
             time.sleep(_RESTREAM_PERIOD_S)
+            if self._stop_event.is_set():
+                break
             try:
                 self._resend_active()
             except Exception as e:
                 logger.warning("SR worker re-stream error: {}", e)
 
             try:
+                if self._stop_event.is_set():
+                    break
                 with self._gripper_io_lock:
                     status_ok = self._gripper.getStatus()
                 if status_ok:
@@ -401,10 +405,9 @@ class SrGripperAdapter:
         self._stop_event.set()
         if self._worker is not None and self._worker.is_alive():
             self._worker.join(timeout=2.0)
-        try:
-            self._gripper.shutdown()
-        except Exception:
-            pass
+            if self._worker.is_alive():
+                raise RuntimeError("SR gripper worker did not stop within 2 seconds")
+        self._gripper.shutdown()
 
         self._bringup(calibrate=False)
 
@@ -417,7 +420,6 @@ class SrGripperAdapter:
         self._stop_event.set()
         if self._worker is not None and self._worker.is_alive():
             self._worker.join(timeout=2.0)
-        try:
-            self._gripper.shutdown()
-        except Exception:
-            pass
+            if self._worker.is_alive():
+                raise RuntimeError("SR gripper worker did not stop within 2 seconds")
+        self._gripper.shutdown()

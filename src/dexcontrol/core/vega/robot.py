@@ -1543,7 +1543,18 @@ class VegaRobot:
                 self._hand_shutdown_completed = True
             except Exception as exc:
                 errors.append(f"hand shutdown failed: {exc}")
-        if not getattr(self, "_robot_shutdown_completed", False):
+        # The hand adapters share lower-level process/device resources with the
+        # robot runtime.  Never close the base transport until required hand
+        # teardown has succeeded; otherwise a retry cannot finish the hand.
+        hand_shutdown_required = (
+            self.gripper_type
+            in ("robotiq", "sr_gripper", "wuji_hand_v1", "wuji_hand_v2")
+            and self.hand is not None
+        )
+        if (
+            (not hand_shutdown_required or self._hand_shutdown_completed)
+            and not getattr(self, "_robot_shutdown_completed", False)
+        ):
             try:
                 self.robot.shutdown()
                 self._robot_shutdown_completed = True

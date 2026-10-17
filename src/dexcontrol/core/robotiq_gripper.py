@@ -125,6 +125,8 @@ class RobotiqGripper:
 
             # Execute command
             if latest_cmd is not None:
+                if self._stop_event.is_set():
+                    break
                 pos_m, vel, force = latest_cmd
                 try:
                     with self._gripper_io_lock:
@@ -133,6 +135,8 @@ class RobotiqGripper:
                 except Exception as e:
                     logger.warning("Robotiq worker command error: {}", e)
 
+            if self._stop_event.is_set():
+                break
             # Refresh cached state from real Modbus read
             try:
                 with self._gripper_io_lock:
@@ -217,9 +221,13 @@ class RobotiqGripper:
     def shutdown(self) -> None:
         """Stop worker thread and disconnect from the gripper."""
         self._stop_event.set()
+        while True:
+            try:
+                self._command_queue.get_nowait()
+            except Empty:
+                break
         if self._worker.is_alive():
             self._worker.join(timeout=2.0)
-        try:
-            self._gripper.shutdown()
-        except Exception:
-            pass
+            if self._worker.is_alive():
+                raise RuntimeError("Robotiq worker did not stop within 2 seconds")
+        self._gripper.shutdown()

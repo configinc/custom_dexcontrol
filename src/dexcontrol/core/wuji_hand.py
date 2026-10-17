@@ -947,6 +947,8 @@ class WujiHandAdapter:
                     target = self._command_queue.get_nowait()
             except Empty:
                 pass
+            if self._stop_event.is_set():
+                break
             if target is not None:
                 self._latest_target = target
 
@@ -955,7 +957,11 @@ class WujiHandAdapter:
             # seeds from the measured pose, so a command must never be computed
             # from a pre-state or non-finite cache.
             self._refresh_state()
+            if self._stop_event.is_set():
+                break
             self._refresh_tactile()
+            if self._stop_event.is_set():
+                break
             _now = time.monotonic()
             self._check_watchdog(_now)
             self._maybe_reconnect(_now)
@@ -1433,8 +1439,15 @@ class WujiHandAdapter:
     def shutdown(self) -> None:
         """Stop the worker, close channels, and disable the motors."""
         self._stop_event.set()
+        while True:
+            try:
+                self._command_queue.get_nowait()
+            except Empty:
+                break
         if self._worker.is_alive():
             self._worker.join(timeout=2.0)
+            if self._worker.is_alive():
+                raise RuntimeError("Wuji hand worker did not stop within 2 seconds")
         self._teardown_channels()
         try:
             self._hand.disable()
