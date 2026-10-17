@@ -448,8 +448,15 @@ class VegaRobot:
 
     def _stop_gripper_worker(self) -> None:
         self._gripper_stop_event.set()
-        if self._gripper_worker is not None and self._gripper_worker.is_alive():
-            self._gripper_worker.join(timeout=1.0)
+        self._clear_gripper_command_queue()
+        worker = self._gripper_worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=1.0)
+            if worker.is_alive():
+                # Preserve the handle and queue so a later shutdown retry can
+                # prove the worker has exited.  Closing the hand transport
+                # underneath an in-flight command is unsafe.
+                raise RuntimeError("Vega gripper worker did not stop within 1 second")
         self._gripper_worker = None
         self._gripper_command_queue = None
 
@@ -467,10 +474,14 @@ class VegaRobot:
                     pass
 
             if latest_target is not None:
+                if self._gripper_stop_event.is_set():
+                    break
                 self._execute_gripper_command(
                     latest_target, wait_time=0.0, raise_on_error=False
                 )
 
+            if self._gripper_stop_event.is_set():
+                break
             self._refresh_gripper_state()
 
     def _clear_gripper_command_queue(self) -> None:
