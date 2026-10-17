@@ -83,6 +83,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     """RobotEnv service implementation for one Vega arm."""
 
     _WRENCH_WARNING_INTERVAL_SECONDS = 10.0
+    _WRENCH_ROBOT_MAX_SKEW_SECONDS = 0.25
+    _WRENCH_SAMPLE_MAX_STALL_SECONDS = 0.25
 
     def __init__(
         self,
@@ -278,9 +280,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         else:
             LOGGER.info("Smoothing: disabled (alpha=0.0)")
 
-        # Move to init position on startup.
-        LOGGER.info("Moving to init position on startup (arm=%s)", arm_side)
-        self._execute_reset_sequence(self.reset_joints)
+        # Startup is deliberately motionless.  A single arm may restart while
+        # its peer is still in a coordinated calibration pose; moving here
+        # would bypass the bilateral RCI barrier.  The coordinator performs an
+        # explicit paired Reset before teleoperation or recalibration.
+        LOGGER.info(
+            "Startup leaves arm at its measured pose; waiting for an explicit "
+            "coordinated Reset (arm=%s)",
+            arm_side,
+        )
 
         # Fetch and cache robot firmware version once at startup.
         self._firmware_version = self._fetch_firmware_version()
@@ -306,6 +314,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "arm_side": self.arm_side,
                 "gripper_type": self.gripper_type,
                 "frame_type": self.frame_type,
+                "firmware_version": self._firmware_version,
                 "sensor_to_wrist_yaw_degrees": 165.0,
                 "gripper_mass_kg": float(force_calibration_gripper_mass_kg),
                 "gripper_com_sensor_m": [
@@ -338,7 +347,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     def _start_control_loop(self) -> None:
         """Start the background control-loop thread."""
         if self._control_loop_thread is not None:
-            return
+            if self._control_loop_thread.is_alive():
+                return
+            self._control_loop_thread = None
         self._control_loop_stop.clear()
         self._control_loop_thread = threading.Thread(
             target=self._control_loop_run,
@@ -350,8 +361,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     def _stop_control_loop(self) -> None:
         """Stop the background control-loop thread."""
         self._control_loop_stop.set()
-        if self._control_loop_thread is not None and self._control_loop_thread.is_alive():
-            self._control_loop_thread.join(timeout=2.0)
+        thread = self._control_loop_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                raise RuntimeError("Vega control loop did not stop within 2 seconds")
         self._control_loop_thread = None
 
     def _control_loop_run(self) -> None:
@@ -387,10 +401,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     self._command_epoch += 1
                 self._force_calibration_restart_control_loop = bool(
                     self._control_loop_thread is not None
-                    and self._control_loop_thread.is_alive()
                 )
                 if self._force_calibration_restart_control_loop:
-                    self._stop_control_loop()
+                    try:
+                        self._stop_control_loop()
+                    except Exception:
+                        self._force_calibration_restart_control_loop = False
+                        self._force_calibration_owns_robot.clear()
+                        raise
                 return True
             finally:
                 self._cmd_lock.release()
@@ -550,6 +568,17 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 shape=[],
                 required=False,
                 description="Physical reference point of external_wrench_sensor_raw",
+            )
+        )
+        spec.fields["external_wrench_sensor_raw_timestamp_ns"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="int64",
+                shape=[],
+                required=False,
+                description=(
+                    "Acquisition timestamp from the same source message as "
+                    "external_wrench_sensor_raw"
+                ),
             )
         )
         for field_name, description in (
@@ -1296,12 +1325,19 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         wrench_sensor = getattr(getattr(self._robot, "arm", None), "wrench_sensor", None)
         if wrench_sensor is not None:
             try:
-                sensor_wrench = np.asarray(
-                    wrench_sensor.get_wrench_state(),
-                    dtype=np.float64,
+                sensor_wrench_raw, sensor_timestamp_ns = (
+                    wrench_sensor.get_wrench_sample()
                 )
+                sensor_wrench = np.asarray(sensor_wrench_raw, dtype=np.float64)
                 if sensor_wrench.shape != (6,) or not np.all(np.isfinite(sensor_wrench)):
                     raise ValueError("sensor wrench must contain six finite values")
+                if (
+                    isinstance(sensor_timestamp_ns, bool)
+                    or not isinstance(sensor_timestamp_ns, (int, np.integer))
+                    or int(sensor_timestamp_ns) <= 0
+                ):
+                    raise ValueError("sensor wrench timestamp must be a positive integer")
+                sensor_timestamp_ns = int(sensor_timestamp_ns)
             except Exception as exc:
                 now = time.monotonic()
                 last_warning = getattr(
@@ -1327,13 +1363,49 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                         string_value=reference_point
                     )
                 )
-                try:
-                    wrist_from_sensor, world_from_sensor = vega_wrench_frame_rotations(
-                        cartesian_position, gripper_type=self.gripper_type
-                    )
-                except ValueError as exc:
-                    LOGGER.warning("Omitting unsupported wrench frame rotations: %s", exc)
+                observation["external_wrench_sensor_raw_timestamp_ns"] = (
+                    robotenv_pb2.Value(int_value=sensor_timestamp_ns)
+                )
+                robot_timestamp_ns = int(timestamp_us) * 1_000
+                sample_pair = (sensor_timestamp_ns, robot_timestamp_ns)
+                now_monotonic = time.monotonic()
+                if getattr(self, "_last_wrench_sample_pair", None) != sample_pair:
+                    self._last_wrench_sample_pair = sample_pair
+                    self._last_wrench_sample_progress_monotonic = now_monotonic
+                stalled_for = now_monotonic - getattr(
+                    self,
+                    "_last_wrench_sample_progress_monotonic",
+                    now_monotonic,
+                )
+                timing_valid = (
+                    robot_timestamp_ns > 0
+                    and abs(sensor_timestamp_ns - robot_timestamp_ns)
+                    <= int(self._WRENCH_ROBOT_MAX_SKEW_SECONDS * 1_000_000_000)
+                    and stalled_for <= self._WRENCH_SAMPLE_MAX_STALL_SECONDS
+                )
+                if not timing_valid:
+                    if now_monotonic - getattr(
+                        self, "_last_wrench_timing_warning_monotonic", float("-inf")
+                    ) >= self._WRENCH_WARNING_INTERVAL_SECONDS:
+                        LOGGER.warning(
+                            "Omitting calibrated external wrench because source and "
+                            "robot-state timestamps are stale or misaligned"
+                        )
+                        self._last_wrench_timing_warning_monotonic = now_monotonic
+                    continue_wrench_processing = False
                 else:
+                    continue_wrench_processing = True
+                if not continue_wrench_processing:
+                    wrist_from_sensor = world_from_sensor = None
+                else:
+                    try:
+                        wrist_from_sensor, world_from_sensor = vega_wrench_frame_rotations(
+                            cartesian_position, gripper_type=self.gripper_type
+                        )
+                    except ValueError as exc:
+                        LOGGER.warning("Omitting unsupported wrench frame rotations: %s", exc)
+                        wrist_from_sensor = world_from_sensor = None
+                if wrist_from_sensor is not None and world_from_sensor is not None:
                     observation["external_wrench_wrist_from_sensor_rotation"] = (
                         robotenv_pb2.Value(
                             float_array=robotenv_pb2.FloatArray(
@@ -1351,46 +1423,43 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     applier_lock = getattr(
                         self, "_force_calibration_applier_lock", None
                     )
-                    if applier_lock is not None:
-                        with applier_lock:
-                            applier = self._force_calibration_applier
-                    else:
-                        applier = None
-                    if applier is not None:
-                        try:
-                            wrist_wrench = (
-                                applier.measured_sensor_raw_to_calibrated_wrist(
-                                    sensor_wrench,
-                                    world_from_sensor,
-                                    wrist_from_sensor,
-                                    reference_point=reference_point,
-                                )
-                            )
-                            world_wrench = (
-                                applier.measured_sensor_raw_to_calibrated_world(
-                                    sensor_wrench,
-                                    world_from_sensor,
-                                    reference_point=reference_point,
-                                )
-                            )
-                        except (TypeError, ValueError, np.linalg.LinAlgError) as exc:
-                            LOGGER.warning(
-                                "Omitting calibrated external wrench: %s", exc
-                            )
-                        else:
-                            anchor = "configured TCP anchor (rotation only)"
-                            for name, values in (
-                                ("external_wrench_wrist", wrist_wrench),
-                                ("external_wrench_world", world_wrench),
-                            ):
-                                observation[name] = robotenv_pb2.Value(
-                                    float_array=robotenv_pb2.FloatArray(
-                                        values=values.tolist()
+                    with applier_lock if applier_lock is not None else nullcontext():
+                        applier = getattr(self, "_force_calibration_applier", None)
+                        if applier is not None:
+                            try:
+                                wrist_wrench = (
+                                    applier.measured_sensor_raw_to_calibrated_wrist(
+                                        sensor_wrench,
+                                        world_from_sensor,
+                                        wrist_from_sensor,
+                                        reference_point=reference_point,
                                     )
                                 )
-                                observation[f"{name}_reference_point"] = (
-                                    robotenv_pb2.Value(string_value=anchor)
+                                world_wrench = (
+                                    applier.measured_sensor_raw_to_calibrated_world(
+                                        sensor_wrench,
+                                        world_from_sensor,
+                                        reference_point=reference_point,
+                                    )
                                 )
+                            except (TypeError, ValueError, np.linalg.LinAlgError) as exc:
+                                LOGGER.warning(
+                                    "Omitting calibrated external wrench: %s", exc
+                                )
+                            else:
+                                anchor = "configured TCP anchor (rotation only)"
+                                for name, values in (
+                                    ("external_wrench_wrist", wrist_wrench),
+                                    ("external_wrench_world", world_wrench),
+                                ):
+                                    observation[name] = robotenv_pb2.Value(
+                                        float_array=robotenv_pb2.FloatArray(
+                                            values=values.tolist()
+                                        )
+                                    )
+                                    observation[f"{name}_reference_point"] = (
+                                        robotenv_pb2.Value(string_value=anchor)
+                                    )
         for field_name in ("torso_joint_positions", "head_joint_positions"):
             if field_name in state_dict:
                 observation[field_name] = robotenv_pb2.Value(
@@ -1620,6 +1689,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         state[3:6] = (R_base * R_state).as_euler("xyz")
         return state
 
+    def shutdown(self) -> None:
+        """Safely stop calibration, command loops, and the robot transport."""
+        manager = getattr(self, "_force_calibration_manager", None)
+        if manager is not None:
+            manager.shutdown()
+        self._stop_control_loop()
+        self._robot.close()
+
 
 def serve(
     grpc_port: int = 50061,
@@ -1741,13 +1818,12 @@ def serve(
         del signum, frame
         LOGGER.info("Shutting down Vega RobotEnv server")
         try:
-            service._stop_control_loop()
+            service.shutdown()
         except Exception:
-            pass
-        try:
-            service._robot.close()
-        except Exception:
-            pass
+            LOGGER.exception(
+                "Vega shutdown could not complete measured calibration return"
+            )
+            return
         server.stop(grace=5)
         sys.exit(0)
 

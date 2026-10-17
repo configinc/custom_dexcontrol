@@ -12,7 +12,9 @@ sys.modules.setdefault("base_arm_teleop", _base_arm_teleop)
 
 from dexcontrol.core.arm import ArmWrenchSensor  # noqa: E402
 from dexcontrol.core.component import RobotComponent  # noqa: E402
+import dexcontrol.core.robotenv_vega.server as server_module  # noqa: E402
 from dexcontrol.core.robotenv_vega.server import VegaRobotEnvService  # noqa: E402
+from dexcontrol.core.robot_env_client import RobotEnvClient  # noqa: E402
 from dexcontrol.core.robotenv_vega.wrench_contract import (  # noqa: E402
     sensor_frame_wrench_to_wrist,
 )
@@ -56,6 +58,7 @@ def test_observation_contract_exposes_raw_and_optional_calibrated_wrenches() -> 
     assert "wrench_state" not in spec.fields
     assert list(spec.fields["external_wrench_sensor_raw"].shape) == [6]
     assert spec.fields["external_wrench_sensor_raw_reference_point"].dtype == "string"
+    assert spec.fields["external_wrench_sensor_raw_timestamp_ns"].dtype == "int64"
     assert list(spec.fields["external_wrench_wrist_from_sensor_rotation"].shape) == [9]
     assert list(spec.fields["external_wrench_world_from_sensor_rotation"].shape) == [9]
     assert spec.fields["external_wrench_wrist"].required is False
@@ -79,6 +82,27 @@ def test_sensor_boundary_preserves_source_wrench_order_and_sign(monkeypatch) -> 
     )
     _, timestamp_ns = sensor.get_wrench_sample()
     assert timestamp_ns == 123
+
+
+def test_local_robotenv_client_preserves_external_wrench_contract_fields() -> None:
+    client = RobotEnvClient.__new__(RobotEnvClient)
+    raw = np.arange(6.0)
+    calibrated = np.arange(6.0) + 10.0
+    state = client._build_robot_state(
+        {
+            "external_wrench_sensor_raw": raw,
+            "external_wrench_sensor_raw_timestamp_ns": 123_000,
+            "external_wrench_sensor_raw_reference_point": "sensor-origin",
+            "external_wrench_world": calibrated,
+            "external_wrench_world_reference_point": "tcp-anchor",
+        }
+    )
+
+    assert state["external_wrench_sensor_raw"] == raw.tolist()
+    assert state["external_wrench_sensor_raw_timestamp_ns"] == 123_000
+    assert state["external_wrench_sensor_raw_reference_point"] == "sensor-origin"
+    assert state["external_wrench_world"] == calibrated.tolist()
+    assert state["external_wrench_world_reference_point"] == "tcp-anchor"
 
 
 def test_sensor_to_wrist_yaw_rotates_force_and_torque() -> None:
@@ -106,7 +130,9 @@ def test_observation_keeps_configured_rotation_out_of_canonical_fields() -> None
     service._robot = SimpleNamespace(
         get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
         arm=SimpleNamespace(
-            wrench_sensor=SimpleNamespace(get_wrench_state=lambda: source.copy())
+            wrench_sensor=SimpleNamespace(
+                get_wrench_sample=lambda: (source.copy(), 123_000)
+            )
         ),
     )
 
@@ -119,6 +145,7 @@ def test_observation_keeps_configured_rotation_out_of_canonical_fields() -> None
         source,
         atol=1e-12,
     )
+    assert observation["external_wrench_sensor_raw_timestamp_ns"].int_value == 123_000
     assert (
         observation["external_wrench_sensor_raw_reference_point"].string_value
         == "physical F/T sensor measurement origin"
@@ -154,10 +181,12 @@ def test_observation_publishes_both_calibrated_frames_only_with_active_applier()
 
     class Applier:
         def measured_sensor_raw_to_calibrated_wrist(self, *args, **kwargs):
+            assert service._force_calibration_applier_lock.locked()
             assert kwargs["reference_point"] == "physical F/T sensor measurement origin"
             return np.ones(6)
 
         def measured_sensor_raw_to_calibrated_world(self, *args, **kwargs):
+            assert service._force_calibration_applier_lock.locked()
             return np.full(6, 2.0)
 
     service = _service()
@@ -166,7 +195,9 @@ def test_observation_publishes_both_calibrated_frames_only_with_active_applier()
     service._robot = SimpleNamespace(
         get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
         arm=SimpleNamespace(
-            wrench_sensor=SimpleNamespace(get_wrench_state=lambda: source.copy())
+            wrench_sensor=SimpleNamespace(
+                get_wrench_sample=lambda: (source.copy(), 123_000)
+            )
         ),
     )
 
@@ -184,6 +215,77 @@ def test_observation_publishes_both_calibrated_frames_only_with_active_applier()
     )
 
 
+def test_misaligned_sample_keeps_raw_but_omits_pose_dependent_wrench() -> None:
+    state = {
+        "joint_positions": np.zeros(7),
+        "joint_velocities": np.zeros(7),
+        "joint_torques_computed": np.zeros(7),
+        "gripper_position": 0.0,
+        "cartesian_position": np.zeros(6),
+    }
+    service = _service()
+    service._force_calibration_applier_lock = threading.Lock()
+    service._force_calibration_applier = SimpleNamespace()
+    service._robot = SimpleNamespace(
+        get_robot_state=lambda: (state, {"robot_timestamp_us": 1_000_000}),
+        arm=SimpleNamespace(
+            wrench_sensor=SimpleNamespace(
+                get_wrench_sample=lambda: (np.arange(6.0), 500_000_000)
+            )
+        ),
+    )
+
+    observation, _ = service._create_observation()
+
+    np.testing.assert_array_equal(
+        observation["external_wrench_sensor_raw"].float_array.values,
+        np.arange(6.0),
+    )
+    assert observation["external_wrench_sensor_raw_timestamp_ns"].int_value == 500_000_000
+    assert "external_wrench_world_from_sensor_rotation" not in observation
+    assert "external_wrench_world" not in observation
+    assert "external_wrench_wrist" not in observation
+
+
+def test_stalled_sample_pair_stops_canonical_publication(monkeypatch) -> None:
+    state = {
+        "joint_positions": np.zeros(7),
+        "joint_velocities": np.zeros(7),
+        "joint_torques_computed": np.zeros(7),
+        "gripper_position": 0.0,
+        "cartesian_position": np.zeros(6),
+    }
+
+    class Applier:
+        def measured_sensor_raw_to_calibrated_wrist(self, *args, **kwargs):
+            return np.ones(6)
+
+        def measured_sensor_raw_to_calibrated_world(self, *args, **kwargs):
+            return np.ones(6)
+
+    service = _service()
+    service._force_calibration_applier_lock = threading.Lock()
+    service._force_calibration_applier = Applier()
+    service._robot = SimpleNamespace(
+        get_robot_state=lambda: (state, {"robot_timestamp_us": 1_000_000}),
+        arm=SimpleNamespace(
+            wrench_sensor=SimpleNamespace(
+                get_wrench_sample=lambda: (np.arange(6.0), 1_000_000_000)
+            )
+        ),
+    )
+    monotonic_values = iter((10.0, 10.3))
+    monkeypatch.setattr(server_module.time, "monotonic", lambda: next(monotonic_values))
+
+    fresh, _ = service._create_observation()
+    stalled, _ = service._create_observation()
+
+    assert "external_wrench_world" in fresh
+    assert "external_wrench_sensor_raw" in stalled
+    assert "external_wrench_world" not in stalled
+    assert "external_wrench_wrist" not in stalled
+
+
 def test_robot_state_does_not_read_or_leak_source_wrench() -> None:
     robot = VegaRobot.__new__(VegaRobot)
     robot.arm = SimpleNamespace(
@@ -194,7 +296,10 @@ def test_robot_state_does_not_read_or_leak_source_wrench() -> None:
         wrench_sensor=SimpleNamespace(
             get_wrench_state=lambda: (_ for _ in ()).throw(
                 AssertionError("robot state must not read optional F/T sensor")
-            )
+            ),
+            get_wrench_sample=lambda: (_ for _ in ()).throw(
+                AssertionError("robot state must not read optional F/T sensor")
+            ),
         ),
     )
     robot.hand = None
@@ -223,7 +328,9 @@ def test_unconfigured_yaw_preserves_raw_sensor_and_omits_wrist_wrench() -> None:
     service._robot = SimpleNamespace(
         get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
         arm=SimpleNamespace(
-            wrench_sensor=SimpleNamespace(get_wrench_state=lambda: np.arange(6.0))
+            wrench_sensor=SimpleNamespace(
+                get_wrench_sample=lambda: (np.arange(6.0), 123_000)
+            )
         ),
     )
 
@@ -254,7 +361,9 @@ def test_malformed_source_wrench_omits_optional_wrist_wrench() -> None:
     service._robot = SimpleNamespace(
         get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
         arm=SimpleNamespace(
-            wrench_sensor=SimpleNamespace(get_wrench_state=lambda: np.ones(5))
+            wrench_sensor=SimpleNamespace(
+                get_wrench_sample=lambda: (np.ones(5), 123_000)
+            )
         ),
     )
 
@@ -280,7 +389,7 @@ def test_silent_sensor_omits_wrench_without_breaking_observation() -> None:
         get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
         arm=SimpleNamespace(
             wrench_sensor=SimpleNamespace(
-                get_wrench_state=lambda: (_ for _ in ()).throw(
+                get_wrench_sample=lambda: (_ for _ in ()).throw(
                     ServiceUnavailableError("no sensor sample")
                 )
             )
@@ -309,7 +418,7 @@ def test_sensor_payload_missing_wrench_omits_only_optional_signal() -> None:
         get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
         arm=SimpleNamespace(
             wrench_sensor=SimpleNamespace(
-                get_wrench_state=lambda: (_ for _ in ()).throw(KeyError("wrench"))
+                get_wrench_sample=lambda: (_ for _ in ()).throw(KeyError("wrench"))
             )
         ),
     )
@@ -336,7 +445,7 @@ def test_unexpected_sensor_failure_omits_only_optional_signal() -> None:
         get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
         arm=SimpleNamespace(
             wrench_sensor=SimpleNamespace(
-                get_wrench_state=lambda: (_ for _ in ()).throw(
+                get_wrench_sample=lambda: (_ for _ in ()).throw(
                     RuntimeError("sensor transport failed")
                 )
             )
@@ -365,7 +474,7 @@ def test_unavailable_sensor_warning_is_rate_limited(caplog) -> None:
         get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
         arm=SimpleNamespace(
             wrench_sensor=SimpleNamespace(
-                get_wrench_state=lambda: (_ for _ in ()).throw(
+                get_wrench_sample=lambda: (_ for _ in ()).throw(
                     ServiceUnavailableError("no sensor sample")
                 )
             )

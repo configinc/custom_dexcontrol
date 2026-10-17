@@ -1283,6 +1283,25 @@ def test_second_start_is_rejected_while_first_run_owns_robot(tmp_path: Path) -> 
         manager.start("run-2", True)
 
 
+def test_shutdown_cancels_active_stage_waits_for_safe_return_and_releases_robot(
+    tmp_path: Path,
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    adapter.block = True
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    assert adapter.entered.wait(timeout=1.0)
+
+    shutdown = threading.Thread(target=manager.shutdown)
+    shutdown.start()
+    shutdown.join(timeout=2.0)
+
+    assert shutdown.is_alive() is False
+    assert manager.status().state == "CANCELLED"
+    assert adapter.safe_returns == 1
+    assert claim.owned is False
+
+
 def test_packaged_plan_has_shared_stage_ids_and_mirrored_arm_payloads() -> None:
     plan_path = (
         Path(__file__).resolve().parents[1]

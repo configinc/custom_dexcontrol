@@ -550,6 +550,15 @@ class RobotEnvClient:
             val = obs["hand_tactile"]
             state["hand_tactile"] = val.tolist() if isinstance(val, np.ndarray) else list(val)
 
+        # Preserve the server-owned external-wrench contract verbatim.  These
+        # optional fields carry distinct raw/calibrated frames, reference
+        # points, rotations, and the source acquisition timestamp; rebuilding
+        # only the historical joint state would silently discard them.
+        for key, val in obs.items():
+            if not key.startswith("external_wrench_"):
+                continue
+            state[key] = val.tolist() if isinstance(val, np.ndarray) else val
+
         return state
 
     def _parse_observation(self, obs_proto: Dict) -> Dict[str, Any]:

@@ -908,6 +908,32 @@ class VegaForceCalibrationManager:
                 self._schedule_terminal_retry_locked()
             return self.lifecycle.get_result(run_id)
 
+    def shutdown(self) -> None:
+        """Cancel active calibration and wait for measured safe return.
+
+        Process shutdown must not close the robot transport while a calibration
+        worker still owns or moves the arm.  This intentionally has no short
+        timeout: the adapter's own bounded motion checks decide failure, persist
+        a terminal state, and release command ownership before shutdown returns.
+        """
+        with self._lock:
+            self._cancel_deadline_locked()
+            status = self.lifecycle.status()
+            if status.state in ACTIVE_CALIBRATION_STATES:
+                self.request_cancel(status.run_id)
+            worker = self._worker
+
+        while worker is not None and worker.is_alive():
+            worker.join(timeout=0.1)
+            with self._lock:
+                worker = self._worker
+
+        with self._lock:
+            if self._pending_terminal is not None:
+                self._persist_pending_terminal_locked()
+            self._clear_terminal_retry_locked()
+            self._release_if_owned()
+
 
 def parameters_json(result: Mapping[str, Any]) -> str:
     return json.dumps(result.get("parameters", {}), allow_nan=False, sort_keys=True)

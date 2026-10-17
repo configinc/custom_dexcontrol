@@ -43,6 +43,43 @@ def _service():
     return service
 
 
+class _UnstoppableThread:
+    def __init__(self):
+        self.join_calls = []
+
+    def is_alive(self):
+        return True
+
+    def join(self, timeout=None):
+        self.join_calls.append(timeout)
+
+
+def test_control_loop_stop_keeps_live_thread_handle_and_fails_closed():
+    service = _service()
+    service._control_loop_stop = threading.Event()
+    thread = _UnstoppableThread()
+    service._control_loop_thread = thread
+
+    with pytest.raises(RuntimeError, match="did not stop"):
+        service._stop_control_loop()
+
+    assert service._control_loop_thread is thread
+    assert service._control_loop_stop.is_set()
+    assert thread.join_calls == [2.0]
+
+
+def test_force_calibration_claim_rolls_back_if_control_loop_does_not_stop():
+    service = _service()
+    service._control_loop_stop = threading.Event()
+    service._control_loop_thread = _UnstoppableThread()
+
+    with pytest.raises(RuntimeError, match="did not stop"):
+        service._claim_robot_for_force_calibration()
+
+    assert service._force_calibration_owns_robot.is_set() is False
+    assert service._force_calibration_restart_control_loop is False
+
+
 def test_step_dispatch_uses_normal_path_when_no_reset_owns_robot():
     service = _service()
 
