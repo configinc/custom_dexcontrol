@@ -218,10 +218,12 @@ def test_wuji_command_boundary_discards_queue_and_holds_measured(monkeypatch):
     adapter._handedness = "left"
     adapter._connected = True
     adapter._state_seen_mask = np.ones(20, dtype=bool)
+    adapter._state_generation = 4
     adapter._last_state_time = time.monotonic()
     def refresh_state():
         with adapter._state_lock:
             adapter._cached_pos = fresh.copy()
+            adapter._state_generation += 1
         adapter._last_state_time = time.monotonic()
 
     adapter._refresh_state = refresh_state
@@ -248,6 +250,7 @@ def test_wuji_command_boundary_rejects_unobserved_joint_state(monkeypatch):
     adapter._state_lock = threading.Lock()
     adapter._cached_pos = np.zeros(20)
     adapter._state_seen_mask = np.zeros(20, dtype=bool)
+    adapter._state_generation = 0
     adapter._latest_target = np.ones(20)
     adapter._cmd_pos = np.ones(20)
     adapter._last_send_time = None
@@ -259,6 +262,67 @@ def test_wuji_command_boundary_rejects_unobserved_joint_state(monkeypatch):
 
     with pytest.raises(RuntimeError, match="measured hold is unavailable"):
         adapter.reset_command_state()
+
+
+def test_wuji_command_boundary_requires_post_drain_state_frame(monkeypatch):
+    adapter = WujiHandAdapter.__new__(WujiHandAdapter)
+    adapter._stop_event = threading.Event()
+    adapter._command_queue = Queue(maxsize=1)
+    adapter._worker = _StoppedWorker()
+    adapter._state_lock = threading.Lock()
+    adapter._cached_pos = np.linspace(0.0, 0.19, 20)
+    adapter._state_seen_mask = np.ones(20, dtype=bool)
+    adapter._state_generation = 7
+    adapter._latest_target = np.ones(20)
+    adapter._cmd_pos = np.ones(20)
+    adapter._last_send_time = None
+    adapter._last_state_time = time.monotonic()
+    adapter._handedness = "left"
+    adapter._connected = True
+    adapter._refresh_state = lambda: None
+    adapter._send = lambda _target: pytest.fail("stale hold reached the wire")
+    monkeypatch.setattr(wuji_module.threading, "Thread", _NewWorker)
+
+    with pytest.raises(RuntimeError, match="post-boundary"):
+        adapter.reset_command_state()
+
+
+def test_wuji_command_boundary_recovers_disconnected_link_from_new_frame(monkeypatch):
+    adapter = WujiHandAdapter.__new__(WujiHandAdapter)
+    adapter._stop_event = threading.Event()
+    adapter._command_queue = Queue(maxsize=1)
+    adapter._worker = _StoppedWorker()
+    adapter._state_lock = threading.Lock()
+    measured = np.linspace(0.0, 0.19, 20)
+    adapter._cached_pos = np.zeros(20)
+    adapter._state_seen_mask = np.ones(20, dtype=bool)
+    adapter._state_generation = 2
+    adapter._latest_target = None
+    adapter._cmd_pos = None
+    adapter._last_send_time = None
+    adapter._last_state_time = 0.0
+    adapter._handedness = "left"
+    adapter._connected = False
+    adapter._disconnected_since = time.monotonic()
+
+    def refresh_state():
+        with adapter._state_lock:
+            adapter._cached_pos = measured.copy()
+            adapter._state_generation += 1
+        adapter._last_state_time = time.monotonic()
+
+    adapter._refresh_state = refresh_state
+    holds = []
+    adapter._send = lambda target: holds.append(np.asarray(target).copy())
+    monkeypatch.setattr(wuji_module.threading, "Thread", _NewWorker)
+
+    adapter.reset_command_state()
+
+    assert adapter._connected is True
+    assert adapter._disconnected_since is None
+    assert len(holds) == 1
+    assert holds[0] == pytest.approx(measured)
+    assert adapter._worker.started
 
 
 def test_wuji_worker_does_not_send_after_shutdown_during_reconnect():

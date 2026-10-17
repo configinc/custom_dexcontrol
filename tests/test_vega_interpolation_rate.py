@@ -79,6 +79,78 @@ def test_interpolated_tick_passes_execution_rate_to_arm_and_hand():
     assert calls[1][1]["execution_hz"] == 100
 
 
+def test_interpolated_tick_propagates_physical_dispatch_failure():
+    robot = VegaRobot.__new__(VegaRobot)
+    robot._interp_lock = threading.Lock()
+    robot._latest_target_joint_pos = np.ones(7)
+    robot.control_hz = 20
+    robot._latest_arm_feedforward_velocity = np.zeros(7)
+    robot._latest_command_monotonic = 1.0
+    robot._latest_hand_action = np.array([0.0])
+    robot._latest_gripper_action = 0.0
+    robot._latest_gripper_action_space = "position"
+    robot._interpolator = type(
+        "Interpolator",
+        (),
+        {"interpolate": lambda self, *_args, **_kwargs: (None, None)},
+    )()
+    robot.use_velocity_feedforward = True
+    robot._output_filter = None
+    robot._interpolation_ema_alpha = 0.0
+    robot.interpolation_control_hz = 100
+    robot._prev_command_successful = True
+    robot.update_joints = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("transport failed")
+    )
+    robot._apply_hand_action = lambda *_args, **_kwargs: None
+
+    with pytest.raises(RuntimeError, match="transport failed"):
+        robot.execute_interpolated_tick()
+
+    assert robot._prev_command_successful is False
+
+
+def test_direct_command_rejects_nonfinite_before_read_or_dispatch():
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.get_robot_state = lambda: pytest.fail("state read after invalid command")
+
+    with pytest.raises(ValueError, match="non-finite"):
+        robot.update_command(
+            np.concatenate([np.zeros(7), [np.nan]]),
+            action_space="joint_position",
+        )
+
+
+def test_joint_dispatch_rejects_nonfinite_before_hardware():
+    sent = []
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.arm_side = "left"
+    robot.arm = type(
+        "Arm",
+        (),
+        {
+            "joint_pos_limit": None,
+            "get_joint_pos": lambda self: np.zeros(7),
+            "_send_position_command": lambda self, value: sent.append(value),
+        },
+    )()
+    robot.control_hz = 20
+
+    with pytest.raises(ValueError, match="finite"):
+        robot.update_joints(np.full(7, np.nan))
+
+    assert sent == []
+
+
+def test_scalar_hand_dispatch_rejects_nonfinite_before_hardware():
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.hand = object()
+    robot._prev_gripper_command_successful = True
+
+    with pytest.raises(ValueError, match="non-finite"):
+        robot._execute_gripper_command(np.nan, wait_time=0.0, raise_on_error=True)
+
+
 def test_joint_velocity_feedforward_uses_interpolation_tick_rate():
     sent = []
     arm = type(
@@ -323,6 +395,7 @@ def test_reset_command_state_drains_gripper_worker_before_clearing_targets():
     robot._gripper_worker = type(
         "Worker", (), {"is_alive": lambda self: True}
     )()
+    robot._gripper_worker_restart_required = False
     robot._stop_gripper_worker = lambda: calls.append("stop")
     robot.reset_filter_state = lambda: calls.append("clear")
     robot._start_gripper_worker = lambda: calls.append("start")
@@ -338,6 +411,7 @@ def test_reset_command_state_restarts_retained_worker_after_timeout_recovery():
     robot._gripper_worker = type(
         "Worker", (), {"is_alive": lambda self: False}
     )()
+    robot._gripper_worker_restart_required = False
     robot._stop_gripper_worker = lambda: calls.append("finalize")
     robot.reset_filter_state = lambda: calls.append("clear")
     robot._start_gripper_worker = lambda: calls.append("restart")
@@ -352,6 +426,7 @@ def test_reset_command_state_surfaces_transient_drain_and_is_retryable():
     robot._gripper_worker = type(
         "Worker", (), {"is_alive": lambda self: True}
     )()
+    robot._gripper_worker_restart_required = False
     attempts = []
 
     def stop():
@@ -381,6 +456,7 @@ def test_reset_command_state_reseeds_outer_gripper_cache_from_hold():
     robot = VegaRobot.__new__(VegaRobot)
     robot.hand = hand
     robot._gripper_worker = None
+    robot._gripper_worker_restart_required = False
     robot._gripper_command_queue = None
     robot._gripper_io_lock = threading.Lock()
     robot._gripper_state_lock = threading.Lock()
@@ -394,6 +470,46 @@ def test_reset_command_state_reseeds_outer_gripper_cache_from_hold():
 
     assert robot._gripper_joint_pos == pytest.approx([0.085])
     assert robot._gripper_position == pytest.approx(0.0)
+
+
+def test_reset_command_state_retains_restart_intent_after_adapter_failure():
+    robot = VegaRobot.__new__(VegaRobot)
+    worker = type("Worker", (), {"is_alive": lambda self: False})()
+    robot._gripper_worker = worker
+    robot._gripper_worker_restart_required = False
+    calls = []
+
+    def stop():
+        calls.append("stop")
+        robot._gripper_worker = None
+        robot._gripper_command_queue = None
+
+    failures = [True, False]
+    hand = type(
+        "Hand",
+        (),
+        {
+            "reset_command_state": lambda self: (
+                (_ for _ in ()).throw(RuntimeError("adapter failed"))
+                if failures.pop(0)
+                else None
+            )
+        },
+    )()
+    robot.hand = hand
+    robot._stop_gripper_worker = stop
+    robot._clear_gripper_command_queue = lambda: None
+    robot._refresh_gripper_state = lambda: True
+    robot.reset_filter_state = lambda: None
+    robot._start_gripper_worker = lambda: calls.append("start")
+
+    with pytest.raises(RuntimeError, match="adapter failed"):
+        robot.reset_command_state()
+    assert robot._gripper_worker_restart_required
+
+    robot.reset_command_state()
+    assert calls == ["stop", "start"]
+    assert robot._gripper_worker_restart_required is False
 
 
 def test_interpolated_hand_velocity_rejects_nonfinite_before_storage():

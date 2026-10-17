@@ -406,6 +406,11 @@ class WujiHandAdapter:
         # motor. Joints never reported are seeded from the target since
         # nothing drives them anyway.
         self._state_seen_mask = np.zeros(_N_JOINTS, dtype=bool)
+        # Monotonic count of state frames actually consumed from the SDK.
+        # Ownership boundaries use this to prove their hold is based on a
+        # post-drain measurement, not merely a recently cached pre-command
+        # sample.
+        self._state_generation = 0
         # Per-joint time of the last FINITE measurement (anchored at the
         # joint's first report). The link watchdog is judged per joint over
         # the reported joints, so one healthy joint can never mask another
@@ -1272,6 +1277,8 @@ class WujiHandAdapter:
             # not a live link, and must pause the command stream like silence.
             if any_valid:
                 self._last_state_time = now
+            with self._state_lock:
+                self._state_generation += 1
             if self._is_hand2 and getattr(self, "_current_summary", None) is not None:
                 # Observe the existing subscription only; never connect a second
                 # SDK client or change stream rates while teleop owns the hand.
@@ -1442,19 +1449,28 @@ class WujiHandAdapter:
             self._worker.join(timeout=2.0)
             if self._worker.is_alive():
                 raise RuntimeError("Wuji hand worker did not stop within 2 seconds")
-        if not self._connected:
-            raise RuntimeError("Wuji hand is disconnected; measured hold unavailable")
+        with self._state_lock:
+            generation_before = self._state_generation
         self._refresh_state()
         with self._state_lock:
             measured = self._cached_pos.copy()
             all_joints_observed = bool(self._state_seen_mask.all())
+            generation_after = self._state_generation
         measured_is_finite = bool(np.isfinite(measured).all())
         if (
-            not all_joints_observed
+            generation_after <= generation_before
+            or not all_joints_observed
             or not measured_is_finite
             or time.monotonic() - self._last_state_time > self._STALE_S
         ):
-            raise RuntimeError("Wuji fresh finite measured hold is unavailable")
+            raise RuntimeError(
+                "Wuji fresh post-boundary finite measured hold is unavailable"
+            )
+        # A valid frame received after the old worker stopped is authoritative
+        # recovery evidence even when the watchdog had previously marked the
+        # link disconnected. Do this only after the complete-state checks.
+        self._connected = True
+        self._disconnected_since = None
         self._latest_target = measured if measured_is_finite else None
         self._cmd_pos = measured.copy() if measured_is_finite else None
         self._last_send_time = None

@@ -141,6 +141,7 @@ def _service():
     service._force_calibration_owner_lock = threading.Lock()
     service._force_calibration_owns_robot = threading.Event()
     service._command_recovery_required = threading.Event()
+    service._command_recovery_error = ""
     return service
 
 
@@ -312,6 +313,10 @@ def test_service_rejects_invalid_ema_alpha_before_robot_creation(
         ("max_jerk", 0.251),
         ("rot_sensitivity", 2.01),
         ("head_init_pos", [float("nan"), 0.0, 0.0]),
+        ("head_init_pos", [1e308, 0.0, 0.0]),
+        ("head_init_pos", [1.484, 0.0, 0.0]),
+        ("head_init_pos", [0.0, 2.793, 0.0]),
+        ("head_init_pos", [0.0, 0.0, -1.379]),
         ("wuji_effort_limit", float("inf")),
         ("wuji_effort_limit", 1.71),
         ("interpolation_history", 1),
@@ -511,6 +516,38 @@ def test_command_recovery_interlock_clears_only_after_successful_retry():
 
     service._reset_robot_command_state()
     assert service._command_recovery_required.is_set() is False
+
+
+def test_control_loop_dispatch_failure_latches_recovery_and_stops_dispatch():
+    service = _service()
+    service._control_loop_hz = 1000
+    service._control_loop_stop = threading.Event()
+    calls = []
+
+    def fail_once():
+        calls.append(True)
+        service._control_loop_stop.set()
+        raise RuntimeError("arm transport failed")
+
+    service._robot.execute_interpolated_tick = fail_once
+    service._control_loop_run()
+
+    assert calls == [True]
+    assert service._command_recovery_required.is_set()
+    assert "arm transport failed" in service._command_recovery_error
+
+
+def test_health_check_reports_command_recovery_interlock():
+    service = _service()
+    service._robot.get_robot_state = lambda: ({}, {})
+    service._load_version_info = lambda: {"tag": "test"}
+    service._command_recovery_error = "interpolated dispatch failed"
+    service._command_recovery_required.set()
+
+    response = service.HealthCheck(None, SimpleNamespace())
+
+    assert response.status == "UNHEALTHY"
+    assert "command recovery required" in response.message
 
 
 def test_cancelled_reset_clears_buffered_commands_before_return():

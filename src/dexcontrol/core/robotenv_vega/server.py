@@ -147,7 +147,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         rot_sensitivity: float = 1.0,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
-        head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),  # head_j1 limit: ±1.483 rad
+        head_init_pos: tuple[float, ...] | list[float] = (1.48, 0.0, -0.3),
         force_calibration_gripper_mass_kg: float = 1.2,
         force_calibration_gripper_com_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.072),
         force_calibration_storage_directory: str | None = None,
@@ -208,6 +208,19 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             or not np.isfinite(normalized_head_init_pos).all()
         ):
             raise ValueError("head_init_pos must contain three finite values")
+        with np.errstate(over="ignore", invalid="ignore"):
+            head_init_pos_float32 = normalized_head_init_pos.astype(np.float32)
+        if not np.isfinite(head_init_pos_float32).all():
+            raise ValueError("head_init_pos must remain finite in the hardware float32 format")
+        # Vega 1 URDF head_j1..j3 limits, in radians. Validate before any
+        # hardware object exists because the custom startup pose is dispatched
+        # during the base Robot constructor.
+        head_lower = np.array([-1.483, -2.792, -1.378], dtype=np.float64)
+        head_upper = np.array([1.483, 2.792, 1.483], dtype=np.float64)
+        if np.any(normalized_head_init_pos < head_lower) or np.any(
+            normalized_head_init_pos > head_upper
+        ):
+            raise ValueError("head_init_pos exceeds Vega head joint limits")
         normalized_wuji_effort_limit = None
         if wuji_effort_limit is not None:
             normalized_wuji_effort_limit = _finite_float(
@@ -406,6 +419,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self._force_calibration_owner_lock = threading.Lock()
             self._force_calibration_owns_robot = threading.Event()
             self._command_recovery_required = threading.Event()
+            self._command_recovery_error = ""
             self._force_calibration_applier_lock = threading.Lock()
             self._force_calibration_applier = None
             self._command_epoch = 0
@@ -599,6 +613,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     self._robot.execute_interpolated_tick()
             except Exception as exc:
                 LOGGER.error("Control loop tick error: %s", exc)
+                self._command_recovery_error = f"interpolated dispatch failed: {exc}"
+                self._command_recovery_required.set()
             elapsed = time.perf_counter() - t0
             sleep_time = dt - elapsed
             if sleep_time > 0:
@@ -666,8 +682,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         try:
             self._robot.reset_command_state()
         except BaseException:
+            self._command_recovery_error = "command-boundary recovery failed"
             self._command_recovery_required.set()
             raise
+        self._command_recovery_error = ""
         self._command_recovery_required.clear()
 
     def _set_force_calibration_applier(self, applier) -> None:
@@ -1496,6 +1514,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     and self._force_calibration_owns_robot.is_set()
                 )
                 or self._shutdown_started.is_set()
+                or self._command_recovery_required.is_set()
             ):
                 raise RuntimeError(
                     "Step was superseded by reset, force calibration, or shutdown"
@@ -1527,6 +1546,19 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self._robot.get_robot_state()
             version_info = self._load_version_info()
             version_str = version_info.get("tag", "1.0.0-vega")
+            if self._command_recovery_required.is_set():
+                return robotenv_pb2.HealthCheckResponse(
+                    status="UNHEALTHY",
+                    message=(
+                        "robot command recovery required"
+                        + (
+                            f": {self._command_recovery_error}"
+                            if self._command_recovery_error
+                            else ""
+                        )
+                    ),
+                    version=version_str,
+                )
             return robotenv_pb2.HealthCheckResponse(
                 status="HEALTHY",
                 message=f"Vega {self.arm_side} arm operational",

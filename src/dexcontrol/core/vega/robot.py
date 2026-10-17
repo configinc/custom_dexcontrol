@@ -198,7 +198,7 @@ class VegaRobot:
         max_jerk: float = 0.25,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
-        head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
+        head_init_pos: tuple[float, ...] | list[float] = (1.48, 0.0, -0.3),
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -246,10 +246,26 @@ class VegaRobot:
         self.gripper_type = gripper_type
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
 
+        prepared_head_init_pos = None
+        if head_init_pos is not None:
+            head64 = np.asarray(head_init_pos, dtype=np.float64)
+            head_lower = np.array([-1.483, -2.792, -1.378], dtype=np.float64)
+            head_upper = np.array([1.483, 2.792, 1.483], dtype=np.float64)
+            if (
+                head64.shape != (3,)
+                or not np.isfinite(head64).all()
+                or np.any(head64 < head_lower)
+                or np.any(head64 > head_upper)
+            ):
+                raise ValueError("head_init_pos exceeds Vega head joint limits")
+            prepared_head_init_pos = head64.astype(np.float32)
+            if not np.isfinite(prepared_head_init_pos).all():
+                raise ValueError("head_init_pos is not finite in hardware format")
+
         configs = get_robot_config(robot_model)
         self.robot = _RobotWithCustomHeadPose(
             configs=configs,
-            head_init_pos=np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None,
+            head_init_pos=prepared_head_init_pos,
         )
         custom_hand = None
         try:
@@ -339,6 +355,7 @@ class VegaRobot:
         self._gripper_command_queue: Queue[float] | None = None
         self._gripper_stop_event = threading.Event()
         self._gripper_worker: threading.Thread | None = None
+        self._gripper_worker_restart_required = False
         self._hand_shutdown_completed = False
         self._robot_shutdown_completed = False
         self._prev_command_successful = True
@@ -521,8 +538,12 @@ class VegaRobot:
         # out and is now retryable. Finalize that stale worker/queue through
         # the same stop path, then restore a fresh worker as originally
         # intended.
-        restart_worker = worker is not None
-        if restart_worker:
+        restart_worker = bool(
+            getattr(self, "_gripper_worker_restart_required", False)
+            or worker is not None
+        )
+        if worker is not None:
+            self._gripper_worker_restart_required = True
             self._stop_gripper_worker()
         else:
             self._clear_gripper_command_queue()
@@ -536,6 +557,7 @@ class VegaRobot:
         self.reset_filter_state()
         if restart_worker:
             self._start_gripper_worker()
+            self._gripper_worker_restart_required = False
 
     def launch_robot(self) -> None:
         """Validate robot readiness and default control mode."""
@@ -619,6 +641,7 @@ class VegaRobot:
             with self._gripper_state_lock:
                 self._gripper_joint_pos = hand_joint_pos.copy()
                 self._gripper_position = gripper_position
+            self._prev_gripper_command_successful = True
             return True
         except Exception:
             self._prev_gripper_command_successful = False
@@ -633,6 +656,8 @@ class VegaRobot:
         if self.hand is None:
             self._prev_gripper_command_successful = True
             return True
+        if not np.isfinite(target):
+            raise ValueError("Refusing to send non-finite scalar hand target")
         target = float(np.clip(target, 0.0, 1.0))
         target_joint_pos = self._gripper_target_to_joint_pos(target)
         try:
@@ -657,6 +682,8 @@ class VegaRobot:
             return False
 
     def _enqueue_gripper_target(self, target: float) -> None:
+        if not np.isfinite(target):
+            raise ValueError("Refusing to enqueue non-finite scalar hand target")
         target = float(np.clip(target, 0.0, 1.0))
         if self._gripper_command_queue is None:
             self._execute_gripper_command(target, wait_time=0.0, raise_on_error=False)
@@ -791,10 +818,56 @@ class VegaRobot:
             self._prev_gripper_command_successful = True
         except Exception:
             self._prev_gripper_command_successful = False
-            # Parity with the scalar path: blocking callers (Reset, blocking
-            # update_command) must see the failure, not just a status flag.
-            if blocking:
-                raise
+            raise
+
+    def _prepare_direct_hand_action(
+        self, hand_action: np.ndarray, gripper_action_space: str
+    ) -> tuple[str, np.ndarray]:
+        """Resolve and validate a direct-path hand target before arm dispatch."""
+        command = np.asarray(hand_action, dtype=np.float64).reshape(-1)
+        if not np.isfinite(command).all():
+            raise ValueError("Hand command contains non-finite values")
+        if self.hand is None:
+            return "none", command
+        if command.size <= 1:
+            value = float(command[0]) if command.size else 0.0
+            if gripper_action_space == "velocity":
+                current = self.get_cached_gripper_position()
+                if not np.isfinite(current):
+                    raise ValueError("Scalar hand state is non-finite")
+                value = current + value / max(1, self.control_hz)
+            target = np.array([np.clip(value, 0.0, 1.0)], dtype=np.float64)
+            return "scalar", target
+
+        target = command.copy()
+        if gripper_action_space == "velocity":
+            current = np.asarray(self.hand.get_joint_pos(), dtype=np.float64).reshape(-1)
+            if current.size != target.size or not np.isfinite(current).all():
+                raise ValueError("Multi-DoF hand state is invalid")
+            target = current + target / max(1, self.control_hz)
+        if not np.isfinite(target).all():
+            raise ValueError("Resolved hand target contains non-finite values")
+        limits = getattr(self.hand, "joint_limits", None)
+        is_wuji = getattr(self.hand, "model", None) in ("wuji_hand_v1", "wuji_hand_v2")
+        if not is_wuji and limits is not None and np.asarray(limits).shape == (target.size, 2):
+            limits = np.asarray(limits, dtype=np.float64)
+            if not np.isfinite(limits).all():
+                raise ValueError("Hand joint limits contain non-finite values")
+            target = np.clip(target, limits[:, 0], limits[:, 1])
+        return "multi", target
+
+    def _dispatch_prepared_direct_hand_action(
+        self, kind: str, target: np.ndarray, blocking: bool
+    ) -> None:
+        if kind == "none":
+            return
+        if kind == "scalar":
+            self.update_gripper(float(target[0]), velocity=False, blocking=blocking)
+            return
+        wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
+        with self._gripper_io_lock:
+            self.hand.set_joint_pos(target, wait_time=wait_time)
+        self._prev_gripper_command_successful = True
 
     def update_command(
         self,
@@ -809,9 +882,13 @@ class VegaRobot:
             raise ValueError(f"Unsupported gripper_action_space '{gripper_action_space}'")
 
         action = np.asarray(command, dtype=np.float64).reshape(-1)
+        if not np.isfinite(action).all():
+            raise ValueError("Command contains non-finite values")
         dt = 1.0 / max(1, self.control_hz)
         state_dict, _ = self.get_robot_state()
         current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
+        if current_joint_pos.shape != (7,) or not np.isfinite(current_joint_pos).all():
+            raise ValueError("Measured arm joint state is invalid")
 
         arm_dof = 7 if action_space.startswith("joint") else 6
         arm_action, hand_action = self._split_arm_hand_action(action, arm_dof, action_space)
@@ -826,6 +903,12 @@ class VegaRobot:
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3] * dt, arm_action[3:6] * dt)
         else:  # cartesian_delta
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
+        target_joint_pos = np.asarray(target_joint_pos, dtype=np.float64)
+        if target_joint_pos.shape != (7,) or not np.isfinite(target_joint_pos).all():
+            raise ValueError("Resolved arm target is invalid")
+        prepared_hand_kind, prepared_hand_target = self._prepare_direct_hand_action(
+            hand_action, gripper_action_space
+        )
 
         # Log per-joint delta from IK (before smoothing/clipping)
         ik_delta = target_joint_pos - current_joint_pos
@@ -860,7 +943,9 @@ class VegaRobot:
 
         try:
             self.update_joints(target_joint_pos, velocity=False, blocking=blocking)
-            self._apply_hand_action(hand_action, gripper_action_space, blocking=blocking)
+            self._dispatch_prepared_direct_hand_action(
+                prepared_hand_kind, prepared_hand_target, blocking
+            )
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
             self._prev_command_successful = False
@@ -1002,6 +1087,10 @@ class VegaRobot:
         thread.  Returns ``True`` if a command was sent, ``False`` if
         there is no data yet.
         """
+        if getattr(self, "hand", None) is not None and not self._prev_gripper_command_successful:
+            raise CommunicationFailedError(
+                "previous asynchronous hand dispatch or state refresh failed"
+            )
         with self._interp_lock:
             if self._latest_target_joint_pos is None:
                 return False
@@ -1093,9 +1182,11 @@ class VegaRobot:
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
             self._prev_command_successful = False
+            raise
         except Exception as exc:
             self._prev_command_successful = False
             _logger.error("Interpolated tick failed: %s", exc)
+            raise
 
         return True
 
@@ -1140,9 +1231,13 @@ class VegaRobot:
         interpolation_tick = execution_hz is not None
         rate_ratio = float(self.control_hz) / float(tick_hz)
         target_joint_pos = np.asarray(joint_pos_command, dtype=np.float64)
+        if target_joint_pos.shape != (7,) or not np.isfinite(target_joint_pos).all():
+            raise ValueError("Joint command must contain seven finite values")
         if velocity:
             dt = 1.0 / max(1, tick_hz)
             current_joint_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+            if current_joint_pos.shape != (7,) or not np.isfinite(current_joint_pos).all():
+                raise ValueError("Measured arm joint state is invalid")
             target_joint_pos = current_joint_pos + target_joint_pos * dt
 
         # Clip small IK numerical errors within tolerance before hard validation
@@ -1188,6 +1283,8 @@ class VegaRobot:
         # clipping, blending a fraction of hw feedback error each step to
         # prevent drift without causing discontinuous jumps.
         hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        if hw_pos.shape != (7,) or not np.isfinite(hw_pos).all():
+            raise ValueError("Measured arm joint state is invalid")
         if self._last_cmd_joint_pos is not None:
             raw_error = hw_pos - self._last_cmd_joint_pos
             # Per-joint outlier rejection: skip correction for joints where
@@ -1271,6 +1368,8 @@ class VegaRobot:
         )
         # #endregion
 
+        if not np.isfinite(target_joint_pos).all():
+            raise ValueError("Refusing to send non-finite joint position to hardware")
         if self.use_velocity_feedforward and not blocking:
             dt = 1.0 / max(1, tick_hz)
             dispatched_velocity = (target_joint_pos - current) / dt
@@ -1337,6 +1436,8 @@ class VegaRobot:
             self._prev_gripper_command_successful = True
             return
         current = self.get_cached_gripper_position()
+        if not np.isfinite(command) or not np.isfinite(current):
+            raise ValueError("Scalar hand command/state must be finite")
         tick_hz = self.control_hz if execution_hz is None else execution_hz
         if velocity:
             target = current + float(command) * (1.0 / max(1, tick_hz))
@@ -1429,10 +1530,12 @@ class VegaRobot:
         return state_dict, timestamp_dict
 
     def validate_joint_limits(self, target_joint_pos: np.ndarray) -> None:
+        target_joint_pos = np.asarray(target_joint_pos, dtype=np.float64)
+        if target_joint_pos.shape != (7,) or not np.isfinite(target_joint_pos).all():
+            raise ValueError("Joint target must contain seven finite values")
         limits = self.arm.joint_pos_limit
         if limits is None:
             return
-        target_joint_pos = np.asarray(target_joint_pos, dtype=np.float64)
         low = limits[:, 0].astype(np.float64)
         high = limits[:, 1].astype(np.float64)
         violates = np.logical_or(target_joint_pos < low, target_joint_pos > high)
