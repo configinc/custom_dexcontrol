@@ -37,6 +37,7 @@ def test_interpolated_tick_passes_execution_rate_to_arm_and_hand():
     robot = VegaRobot.__new__(VegaRobot)
     robot._interp_lock = threading.Lock()
     robot._latest_target_joint_pos = np.ones(7)
+    robot._latest_arm_feedforward_velocity = np.ones(7)
     robot._latest_hand_action = np.array([1.0])
     robot._latest_gripper_action = 1.0
     robot._latest_gripper_action_space = "velocity"
@@ -93,11 +94,15 @@ def test_joint_velocity_feedforward_uses_interpolation_tick_rate():
     robot.sync_motion_manager_with_arm = lambda target: None
 
     target = np.full(7, 0.001)
-    robot.update_joints(target, execution_hz=100)
+    robot.update_joints(
+        target,
+        execution_hz=100,
+        feedforward_velocity=np.full(7, 0.2),
+    )
 
     assert len(sent) == 1
     assert sent[0][0] == pytest.approx(target)
-    assert sent[0][1] == pytest.approx(np.full(7, 0.1))
+    assert sent[0][1] == pytest.approx(np.full(7, 0.2))
 
 
 def test_scalar_gripper_velocity_uses_interpolation_tick_rate():
@@ -151,6 +156,7 @@ def test_interpolated_scalar_gripper_velocity_resolves_once_per_input_step():
     robot._interp_lock = threading.Lock()
     robot.control_hz = 20
     robot._latest_target_joint_pos = None
+    robot._latest_arm_feedforward_velocity = None
     robot._latest_hand_action = None
     robot._latest_gripper_action = 0.0
     robot._latest_gripper_action_space = "position"
@@ -188,9 +194,11 @@ def test_interpolated_multi_hand_velocity_resolves_once_per_input_step():
     robot._interp_lock = threading.Lock()
     robot.control_hz = 20
     robot._latest_target_joint_pos = None
+    robot._latest_arm_feedforward_velocity = None
     robot._latest_hand_action = None
     robot._latest_gripper_action = 0.0
     robot._latest_gripper_action_space = "position"
+    robot._gripper_io_lock = threading.Lock()
     robot.get_robot_state = lambda: ({"joint_positions": np.zeros(7)}, {})
     robot._hand_dof = lambda: 3
 
@@ -200,3 +208,107 @@ def test_interpolated_multi_hand_velocity_resolves_once_per_input_step():
     )
     assert robot._latest_hand_action == pytest.approx(np.full(3, 0.15))
     assert robot._latest_gripper_action_space == "position"
+
+
+def test_interpolated_joint_velocity_keeps_requested_feedforward():
+    class Interpolator:
+        def add_point(self, timestamp, target):
+            self.target = np.asarray(target)
+
+    robot = VegaRobot.__new__(VegaRobot)
+    robot._interpolator = Interpolator()
+    robot._interp_lock = threading.Lock()
+    robot.control_hz = 20
+    robot._latest_target_joint_pos = None
+    robot._latest_arm_feedforward_velocity = None
+    robot._latest_hand_action = None
+    robot._latest_gripper_action = 0.0
+    robot._latest_gripper_action_space = "position"
+    robot.get_robot_state = lambda: ({"joint_positions": np.zeros(7)}, {})
+    robot._hand_dof = lambda: 1
+    robot.get_cached_gripper_position = lambda: 0.0
+
+    command = np.concatenate([np.ones(7), [0.0]])
+    robot.add_command_point(command, "joint_velocity")
+
+    assert robot._latest_target_joint_pos == pytest.approx(np.full(7, 0.05))
+    assert robot._latest_arm_feedforward_velocity == pytest.approx(np.ones(7))
+
+
+def test_hand_velocity_accumulator_clips_and_reverses_without_windup():
+    class Interpolator:
+        def add_point(self, timestamp, target):
+            pass
+
+    robot = VegaRobot.__new__(VegaRobot)
+    robot._interpolator = Interpolator()
+    robot._interp_lock = threading.Lock()
+    robot.control_hz = 20
+    robot._latest_target_joint_pos = None
+    robot._latest_arm_feedforward_velocity = None
+    robot._latest_hand_action = None
+    robot._latest_gripper_action = 0.0
+    robot._latest_gripper_action_space = "position"
+    robot.get_robot_state = lambda: ({"joint_positions": np.zeros(7)}, {})
+    robot._hand_dof = lambda: 1
+    robot.get_cached_gripper_position = lambda: 0.99
+
+    positive = np.concatenate([np.zeros(7), [1.0]])
+    for _ in range(20):
+        robot.add_command_point(
+            positive, "joint_position", gripper_action_space="velocity"
+        )
+    assert robot._latest_hand_action == pytest.approx([1.0])
+
+    negative = np.concatenate([np.zeros(7), [-1.0]])
+    robot.add_command_point(
+        negative, "joint_position", gripper_action_space="velocity"
+    )
+    assert robot._latest_hand_action == pytest.approx([0.95])
+
+
+def test_reset_filter_state_discards_persistent_hand_and_arm_targets():
+    robot = VegaRobot.__new__(VegaRobot)
+    robot._filter_pos = np.ones(7)
+    robot._filter_vel = np.ones(7)
+    robot._last_cmd_joint_pos = np.ones(7)
+    robot._prev_cmd_delta = np.ones(7)
+    robot._prev_joint_vel = np.ones(7)
+    robot._latest_target_joint_pos = np.ones(7)
+    robot._latest_arm_feedforward_velocity = np.ones(7)
+    robot._latest_hand_action = np.ones(3)
+    robot._latest_gripper_action = 1.0
+    robot._latest_gripper_action_space = "velocity"
+    robot._interpolator = None
+    robot._output_filter = None
+
+    robot.reset_filter_state()
+
+    assert robot._latest_target_joint_pos is None
+    assert robot._prev_joint_vel is None
+    assert robot._latest_arm_feedforward_velocity is None
+    assert robot._latest_hand_action is None
+    assert robot._latest_gripper_action == 0.0
+    assert robot._latest_gripper_action_space == "position"
+
+
+def test_interpolated_hand_velocity_rejects_nonfinite_before_storage():
+    robot = VegaRobot.__new__(VegaRobot)
+    robot._interpolator = type(
+        "Interpolator", (), {"add_point": lambda self, timestamp, target: None}
+    )()
+    robot._interp_lock = threading.Lock()
+    robot.control_hz = 20
+    robot._latest_target_joint_pos = None
+    robot._latest_arm_feedforward_velocity = None
+    robot._latest_hand_action = None
+    robot._latest_gripper_action = 0.0
+    robot._latest_gripper_action_space = "position"
+    robot.get_robot_state = lambda: ({"joint_positions": np.zeros(7)}, {})
+    robot._hand_dof = lambda: 1
+
+    command = np.concatenate([np.zeros(7), [np.nan]])
+    with pytest.raises(ValueError, match="non-finite"):
+        robot.add_command_point(
+            command, "joint_position", gripper_action_space="velocity"
+        )
