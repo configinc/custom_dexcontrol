@@ -278,6 +278,7 @@ class Chassis(SubscriptionPolicyMixin):
             # Preserve the public direct-shutdown contract. Robot.shutdown()
             # records an already successful stop so it is not issued twice.
             self.stop()
+            self._robot_shutdown_stop_confirmed = True
         children = (
             getattr(self, "drive_temperature_sensor", None),
             getattr(self, "steer_temperature_sensor", None),

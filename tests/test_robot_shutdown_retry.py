@@ -386,6 +386,36 @@ def test_partial_chassis_releases_first_child_when_second_child_init_failed():
     assert steer.shutdown_calls == 1
 
 
+def test_direct_chassis_shutdown_does_not_repeat_stop_after_child_retry():
+    class Child:
+        def __init__(self, fail_once=False):
+            self.calls = 0
+            self.fail_once = fail_once
+
+        def shutdown(self):
+            self.calls += 1
+            if self.fail_once and self.calls == 1:
+                raise RuntimeError("child busy")
+
+    chassis = Chassis.__new__(Chassis)
+    chassis.chassis_steer = Child()
+    chassis.chassis_drive = Child(fail_once=True)
+    chassis.steer_temperature_sensor = None
+    chassis.drive_temperature_sensor = None
+    chassis._shutdown_child_ids = set()
+    chassis._initialization_complete = True
+    stop_calls = []
+    chassis.stop = lambda: stop_calls.append("stop")
+
+    with pytest.raises(RuntimeError, match="child busy"):
+        chassis.shutdown()
+    chassis.shutdown()
+
+    assert stop_calls == ["stop"]
+    assert chassis.chassis_drive.calls == 2
+    assert chassis.chassis_steer.calls == 1
+
+
 @pytest.mark.parametrize(
     "component_class",
     [Arm, Head, Torso, HandF5D6V2, Battery, EStop, Heartbeat],
