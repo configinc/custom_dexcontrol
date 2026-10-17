@@ -1468,6 +1468,24 @@ class VegaRobot:
                 raise ValueError(
                     "Refusing to send non-finite joint velocity to hardware"
                 )
+            # EMA carries momentum across direction reversals.  Reconcile the
+            # final (post-EMA, post-ratio) feedforward with the position that
+            # will actually be dispatched so stale outward velocity cannot
+            # oppose an inward/braking position command near a joint limit.
+            coherent_direction = target_joint_vel * dispatched_velocity > 0.0
+            target_joint_vel = np.where(
+                coherent_direction,
+                np.sign(target_joint_vel)
+                * np.minimum(
+                    np.abs(target_joint_vel),
+                    np.abs(dispatched_velocity),
+                ),
+                0.0,
+            )
+            if not np.isfinite(target_joint_vel).all():
+                raise ValueError(
+                    "Refusing to send non-finite joint velocity to hardware"
+                )
             self._prev_joint_vel = target_joint_vel.copy()
             if self._vel_log_file is not None:
                 self._vel_log_file.write(

@@ -879,6 +879,52 @@ def test_jerk_shaped_target_is_revalidated_before_hardware_dispatch():
     assert sends == []
 
 
+@pytest.mark.parametrize("execution_hz", [None, 200])
+def test_velocity_ema_cannot_push_opposite_dispatched_position(execution_hz):
+    sends = []
+    limits = np.column_stack((np.full(7, -1.0), np.full(7, 1.0)))
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.arm_side = "left"
+    robot.arm = type(
+        "Arm",
+        (),
+        {
+            "joint_pos_limit": limits,
+            "get_joint_pos": lambda self: np.full(7, 0.99),
+            "set_joint_pos_vel": lambda self, pos, vel, relative: sends.append(
+                (np.asarray(pos), np.asarray(vel))
+            ),
+        },
+    )()
+    robot.control_hz = 20
+    robot._last_cmd_joint_pos = np.full(7, 0.99)
+    robot._max_delta_scale = 1.0
+    robot._MOTOR_MAX_JERK_RAD = 0.0
+    robot._prev_cmd_delta = None
+    robot._HW_CORRECTION_OUTLIER_THRESH = 0.5
+    robot._HW_CORRECTION_ALPHA = 0.7
+    robot._INTERPOLATION_HW_CORRECTION_ALPHA = 0.7
+    robot.use_velocity_feedforward = True
+    robot._prev_joint_vel = np.ones(7)
+    robot._vel_smoothing_alpha = 0.3
+    robot._interpolation_vel_smoothing_alpha = 0.03
+    robot._vel_damp_thresh = 0.05
+    robot._vel_ratio = 1.0
+    robot._vel_log_file = None
+    robot._agent_debug_log = lambda **kwargs: None
+    robot.sync_motion_manager_with_arm = lambda target: None
+
+    robot.update_joints(
+        np.full(7, 0.98),
+        execution_hz=execution_hz,
+        feedforward_velocity=np.full(7, -1.0),
+    )
+
+    sent_pos, sent_vel = sends[-1]
+    assert sent_pos == pytest.approx(np.full(7, 0.98))
+    assert sent_vel == pytest.approx(np.zeros(7))
+
+
 def test_wuji_velocity_uses_measured_anchor_without_host_clipping():
     class Interpolator:
         def add_point(self, timestamp, target):
