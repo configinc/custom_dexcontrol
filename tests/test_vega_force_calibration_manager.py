@@ -163,6 +163,50 @@ def test_start_claims_robot_without_motion(tmp_path: Path) -> None:
     assert claim.owned is True
 
 
+def test_same_run_start_retry_reclaims_robot_and_rearms_deadline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _, claim = _manager(tmp_path)
+    original_start = manager_module.threading.Timer.start
+    failed = False
+
+    def fail_timer_start_once(timer):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("timer thread unavailable")
+        return original_start(timer)
+
+    monkeypatch.setattr(manager_module.threading.Timer, "start", fail_timer_start_once)
+    with pytest.raises(RuntimeError, match="timer thread unavailable"):
+        manager.start("run-1", True)
+    assert manager.lifecycle.status().state == "READY_FOR_STAGE"
+    assert claim.owned is False
+
+    retry = manager.start("run-1", True)
+
+    assert retry.state == "READY_FOR_STAGE"
+    assert claim.owned is True
+    assert manager._deadline_timer is not None
+    manager.request_cancel("run-1")
+    _wait_state(manager, "CANCELLED")
+
+
+def test_new_run_rejection_does_not_flap_robot_claim(tmp_path: Path) -> None:
+    manager, _, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    claims = claim.claims
+    releases = claim.releases
+
+    with pytest.raises(LifecycleError, match="busy"):
+        manager.start("run-2", True)
+
+    assert claim.claims == claims
+    assert claim.releases == releases
+    manager.request_cancel("run-1")
+    _wait_state(manager, "CANCELLED")
+
+
 def test_advance_executes_each_stage_once_and_stages_candidate(tmp_path: Path) -> None:
     manager, adapter, _ = _manager(tmp_path)
     manager.start("run-1", True)
@@ -301,6 +345,41 @@ def test_transient_partial_commit_is_repaired_with_matching_runtime(
     assert claim.owned is False
 
 
+def test_partial_commit_retry_rejects_wrong_plan_before_repair(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+    manager.advance("run-1", 1, "stage-1")
+    ready = _wait_state(manager, "READY_TO_APPLY")
+    original_write = lifecycle_module._atomic_write_json
+    fail_history = True
+
+    def controlled_history_failure(path, value):
+        if path.parent.name == "results" and fail_history:
+            raise OSError("history unavailable")
+        return original_write(path, value)
+
+    monkeypatch.setattr(
+        lifecycle_module, "_atomic_write_json", controlled_history_failure
+    )
+    with pytest.raises(OSError, match="history unavailable"):
+        manager.commit("run-1", ready.plan_sha256)
+    assert manager.lifecycle.status().state == "READY_TO_APPLY"
+
+    fail_history = False
+    with pytest.raises(LifecycleError, match="stale Commit request"):
+        manager.commit("run-1", "wrong-plan")
+    assert manager.lifecycle.status().state == "READY_TO_APPLY"
+    assert claim.owned is True
+
+    assert manager.commit("run-1", ready.plan_sha256).state == "SUCCEEDED"
+    assert len(adapter.installed) == 1
+    assert claim.owned is False
+
+
 def test_commit_retry_restores_runtime_after_post_commit_cleanup_failure(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -420,6 +499,30 @@ def test_cancel_stops_worker_returns_safe_and_releases(tmp_path: Path) -> None:
     assert status.state == "CANCELLING"
     _wait_state(manager, "CANCELLED")
     assert adapter.safe_returns == 1
+    assert claim.owned is False
+
+
+def test_ready_candidate_cancel_cleanup_failure_returns_terminal_and_releases(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+    manager.advance("run-1", 1, "stage-1")
+    _wait_state(manager, "READY_TO_APPLY")
+    original_unlink = lifecycle_module._durable_unlink
+
+    def fail_staged_unlink(path):
+        if path == manager.lifecycle.staged_candidate_path:
+            raise OSError("staged cleanup failed")
+        return original_unlink(path)
+
+    monkeypatch.setattr(lifecycle_module, "_durable_unlink", fail_staged_unlink)
+
+    status = manager.request_cancel("run-1")
+
+    assert status.state == "CANCELLED"
     assert claim.owned is False
 
 

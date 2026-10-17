@@ -37,6 +37,14 @@ ACTIVE_STATES = frozenset(
         "READY_TO_APPLY",
     }
 )
+PERSISTED_RECORD_ERRORS = (
+    OSError,
+    ValueError,
+    TypeError,
+    KeyError,
+    ArithmeticError,
+    json.JSONDecodeError,
+)
 
 
 class LifecycleError(RuntimeError):
@@ -420,7 +428,7 @@ class ForceCalibrationLifecycle:
     def _load_valid_active(self) -> dict[str, Any] | None:
         try:
             record = self._validate_record(_read_json(self.active_cache_path), require_current=True)
-        except (OSError, ValueError, json.JSONDecodeError):
+        except PERSISTED_RECORD_ERRORS:
             return None
         return record if record["was_committed"] else None
 
@@ -443,7 +451,7 @@ class ForceCalibrationLifecycle:
     def _read_latest_start_marker(self) -> dict[str, Any] | None:
         try:
             marker = _read_json(self.latest_start_path)
-        except (OSError, ValueError, json.JSONDecodeError):
+        except PERSISTED_RECORD_ERRORS:
             return None
         if not (
             marker.get("schema_version") == SCHEMA_VERSION
@@ -484,7 +492,7 @@ class ForceCalibrationLifecycle:
                 require_current=False,
                 allow_future_timestamp=True,
             )
-        except (OSError, ValueError, json.JSONDecodeError):
+        except PERSISTED_RECORD_ERRORS:
             return None
         if (
             history != active
@@ -541,7 +549,7 @@ class ForceCalibrationLifecycle:
                 require_current=False,
                 allow_future_timestamp=True,
             )
-        except (OSError, ValueError, json.JSONDecodeError):
+        except PERSISTED_RECORD_ERRORS:
             return False
         if active["run_id"] != run_id or active["was_committed"] is not True:
             return False
@@ -559,7 +567,7 @@ class ForceCalibrationLifecycle:
     ) -> dict[str, Any] | None:
         try:
             value = _read_json(path)
-        except (OSError, ValueError, json.JSONDecodeError):
+        except PERSISTED_RECORD_ERRORS:
             return None
         if (
             value.get("schema_version") != SCHEMA_VERSION
@@ -615,7 +623,7 @@ class ForceCalibrationLifecycle:
                 require_current=False,
                 allow_future_timestamp=True,
             )
-        except (OSError, ValueError, json.JSONDecodeError):
+        except PERSISTED_RECORD_ERRORS:
             return
         if record["was_committed"]:
             return
@@ -814,7 +822,7 @@ class ForceCalibrationLifecycle:
                     require_current=False,
                     allow_future_timestamp=True,
                 )
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
+            except PERSISTED_RECORD_ERRORS as exc:
                 raise LifecycleError("FAILED_PRECONDITION", "staged candidate is unavailable") from exc
             if record["run_id"] != run:
                 raise LifecycleError("FAILED_PRECONDITION", "staged candidate run mismatch")
@@ -841,7 +849,7 @@ class ForceCalibrationLifecycle:
                     require_current=False,
                     allow_future_timestamp=True,
                 )
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
+            except PERSISTED_RECORD_ERRORS as exc:
                 raise LifecycleError(
                     "FAILED_PRECONDITION", "staged candidate is unavailable"
                 ) from exc
@@ -934,7 +942,7 @@ class ForceCalibrationLifecycle:
                     require_current=False,
                     allow_future_timestamp=True,
                 )
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
+            except PERSISTED_RECORD_ERRORS as exc:
                 terminal = self._read_valid_terminal(
                     self._terminal_result_path(run_id), expected_run_id=run_id
                 )

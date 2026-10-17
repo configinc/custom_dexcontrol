@@ -110,6 +110,38 @@ def test_parameter_validator_rejects_cache_and_candidate_schema(
         )
 
 
+def test_parameter_validator_type_error_treats_persisted_cache_as_unusable(
+    tmp_path: Path, plan: BilateralCalibrationPlan, clock: Clock
+) -> None:
+    lifecycle = _lifecycle(tmp_path, plan, clock)
+    lifecycle.start("source-run", force_recalibrate=True)
+    _collect_all(lifecycle, "source-run")
+    lifecycle.stage_candidate(
+        "source-run",
+        parameters={"gripper_mass_kg": None},
+        quality={"passed": True},
+    )
+    lifecycle.commit("source-run", plan.plan_sha256)
+
+    def reject_bad_number(value):
+        if value.get("gripper_mass_kg") is None:
+            raise TypeError("mass must be numeric")
+
+    reloaded = ForceCalibrationLifecycle(
+        plan=plan,
+        server_identity={"unit_id": "ds-teleop-0001-04", "firmware": "1.2.3"},
+        storage_directory=tmp_path / "cache",
+        calibration_kind="wrist_ft_bias",
+        reference_point_id="configured_tcp",
+        command_timeout_seconds=5,
+        now_us=clock,
+        validate_parameters=reject_bad_number,
+    )
+
+    assert reloaded.get_result("")["available"] is False
+    assert reloaded.start("new-run", force_recalibrate=False).state == "READY_FOR_STAGE"
+
+
 def test_plan_is_one_exact_bilateral_artifact(tmp_path: Path) -> None:
     path = tmp_path / "plan.json"
     _write_plan(path)

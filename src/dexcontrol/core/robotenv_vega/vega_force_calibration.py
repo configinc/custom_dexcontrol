@@ -41,6 +41,17 @@ RETURN_MAX_JOINT_ERROR_RAD = np.radians(5.0)
 RETURN_MAX_POSITION_ERROR_M = 0.01
 RETURN_MAX_ROTATION_ERROR_RAD = np.radians(5.0)
 TERMINAL_PERSIST_RETRY_SECONDS = 1.0
+ACTIVE_CALIBRATION_STATES = {
+    "READY_FOR_STAGE",
+    "MOVING",
+    "SETTLING",
+    "COLLECTING",
+    "RETURNING",
+    "FITTING",
+    "READY_TO_APPLY",
+    "CANCELLING",
+}
+ROBOT_OWNING_CALIBRATION_STATES = ACTIVE_CALIBRATION_STATES - {"CANCELLING"}
 
 
 class CalibrationCancelled(RuntimeError):
@@ -535,7 +546,27 @@ class VegaForceCalibrationManager:
                 if status.state == "SUCCEEDED":
                     self._install_committed_result(run_id)
                     self._release_if_owned()
+                elif (
+                    status.state in ROBOT_OWNING_CALIBRATION_STATES
+                    and not self._owns_robot
+                ):
+                    if not self._claim_robot():
+                        raise LifecycleError(
+                            "FAILED_PRECONDITION", "robot command path is busy"
+                        )
+                    self._owns_robot = True
+                    if (
+                        status.state == "READY_FOR_STAGE"
+                        and status.completed_stages == 0
+                    ):
+                        self.adapter.begin_run()
+                if status.state == "READY_FOR_STAGE":
+                    self._schedule_deadline_locked(status)
                 return status
+            if current.state in ACTIVE_CALIBRATION_STATES:
+                raise LifecycleError(
+                    "FAILED_PRECONDITION", "robot command path is busy"
+                )
             validator = getattr(self.adapter, "validate_start", None)
             if callable(validator):
                 validator()
@@ -670,7 +701,16 @@ class VegaForceCalibrationManager:
 
     def request_cancel(self, run_id: str) -> CalibrationStatusSnapshot:
         with self._lock:
-            status = self.lifecycle.request_cancel(run_id)
+            try:
+                status = self.lifecycle.request_cancel(run_id)
+            except BaseException:
+                status = self.lifecycle.status()
+                if status.state in {"CANCELLED", "FAILED", "SUCCEEDED"}:
+                    if status.state == "SUCCEEDED":
+                        self._install_committed_result(run_id)
+                    self._release_if_owned()
+                    return status
+                raise
             self._cancel_deadline_locked()
             if status.state == "CANCELLING":
                 self._cancelled.set()
@@ -705,6 +745,11 @@ class VegaForceCalibrationManager:
     def commit(self, run_id: str, plan_sha256: str) -> CalibrationStatusSnapshot:
         with self._lock:
             current = self.lifecycle.status()
+            if (
+                run_id != current.run_id
+                or plan_sha256 != self.lifecycle.plan.plan_sha256
+            ):
+                raise LifecycleError("FAILED_PRECONDITION", "stale Commit request")
             if current.state == "SUCCEEDED":
                 status = self.lifecycle.commit(run_id, plan_sha256)
                 self._install_committed_result(run_id)
@@ -712,7 +757,11 @@ class VegaForceCalibrationManager:
                 return status
             record = self.lifecycle.get_staged_candidate(run_id)
             parameters = self._candidate
-            if parameters is None:
+            snapshotter = getattr(parameters, "as_parameters", None)
+            if (
+                not callable(snapshotter)
+                or snapshotter() != record["parameters"]
+            ):
                 parameters = wrist_ft_calibration_from_snapshot(record["parameters"])
             prepared = self.adapter.prepare_install(parameters)
             try:
@@ -733,10 +782,22 @@ class VegaForceCalibrationManager:
             status = self.expire_deadline()
             if run_id and run_id != status.run_id:
                 raise LifecycleError("NOT_FOUND", "unknown calibration run_id")
+            if status.state == "SUCCEEDED" and self._owns_robot:
+                self._install_committed_result(status.run_id)
+                self._release_if_owned()
+            elif status.state in {"CANCELLED", "FAILED"}:
+                self._release_if_owned()
             return status
 
     def result(self, run_id: str = "") -> dict[str, Any]:
-        return self.lifecycle.get_result(run_id)
+        with self._lock:
+            status = self.lifecycle.status()
+            if status.state == "SUCCEEDED" and self._owns_robot:
+                self._install_committed_result(status.run_id)
+                self._release_if_owned()
+            elif status.state in {"CANCELLED", "FAILED"}:
+                self._release_if_owned()
+            return self.lifecycle.get_result(run_id)
 
 
 def parameters_json(result: Mapping[str, Any]) -> str:
