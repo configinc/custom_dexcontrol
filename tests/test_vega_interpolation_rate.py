@@ -139,3 +139,64 @@ def test_multi_hand_velocity_uses_interpolation_tick_rate():
 
     assert sent[0][0] == pytest.approx(np.full(3, 0.01))
     assert sent[0][1] == 0.0
+
+
+def test_interpolated_scalar_gripper_velocity_resolves_once_per_input_step():
+    class Interpolator:
+        def add_point(self, timestamp, target):
+            self.target = np.asarray(target)
+
+    robot = VegaRobot.__new__(VegaRobot)
+    robot._interpolator = Interpolator()
+    robot._interp_lock = threading.Lock()
+    robot.control_hz = 20
+    robot._latest_target_joint_pos = None
+    robot._latest_hand_action = None
+    robot._latest_gripper_action = 0.0
+    robot._latest_gripper_action_space = "position"
+    robot.get_robot_state = lambda: ({"joint_positions": np.zeros(7)}, {})
+    robot._hand_dof = lambda: 1
+    robot.get_cached_gripper_position = lambda: 0.2
+
+    command = np.concatenate([np.zeros(7), [1.0]])
+    robot.add_command_point(
+        command, "joint_position", gripper_action_space="velocity"
+    )
+    assert robot._latest_hand_action == pytest.approx([0.25])
+    assert robot._latest_gripper_action_space == "position"
+
+    # A second 20 Hz input step integrates from the prior commanded target,
+    # not from the still-lagging 20 Hz measured/cache value.
+    robot.add_command_point(
+        command, "joint_position", gripper_action_space="velocity"
+    )
+    assert robot._latest_hand_action == pytest.approx([0.30])
+    assert robot._latest_gripper_action_space == "position"
+
+
+def test_interpolated_multi_hand_velocity_resolves_once_per_input_step():
+    class Interpolator:
+        def add_point(self, timestamp, target):
+            self.target = np.asarray(target)
+
+    hand = type(
+        "Hand", (), {"get_joint_pos": lambda self: np.full(3, 0.1)}
+    )()
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.hand = hand
+    robot._interpolator = Interpolator()
+    robot._interp_lock = threading.Lock()
+    robot.control_hz = 20
+    robot._latest_target_joint_pos = None
+    robot._latest_hand_action = None
+    robot._latest_gripper_action = 0.0
+    robot._latest_gripper_action_space = "position"
+    robot.get_robot_state = lambda: ({"joint_positions": np.zeros(7)}, {})
+    robot._hand_dof = lambda: 3
+
+    command = np.concatenate([np.zeros(7), np.ones(3)])
+    robot.add_command_point(
+        command, "joint_position", gripper_action_space="velocity"
+    )
+    assert robot._latest_hand_action == pytest.approx(np.full(3, 0.15))
+    assert robot._latest_gripper_action_space == "position"

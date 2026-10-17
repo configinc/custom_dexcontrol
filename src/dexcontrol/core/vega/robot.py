@@ -854,10 +854,40 @@ class VegaRobot:
         with self._interp_lock:
             self._interpolator.add_point(timestamp, target_joint_pos)
             self._latest_target_joint_pos = target_joint_pos.copy()
+            resolved_hand_action = np.asarray(
+                hand_action, dtype=np.float64
+            ).copy()
+            resolved_gripper_action_space = gripper_action_space
+            if gripper_action_space == "velocity":
+                previous_target = self._latest_hand_action
+                if (
+                    previous_target is None
+                    or self._latest_gripper_action_space != "position"
+                    or np.asarray(previous_target).size != resolved_hand_action.size
+                ):
+                    if resolved_hand_action.size <= 1:
+                        previous_target = np.array(
+                            [self.get_cached_gripper_position()], dtype=np.float64
+                        )
+                    elif self.hand is not None:
+                        previous_target = np.asarray(
+                            self.hand.get_joint_pos(), dtype=np.float64
+                        ).reshape(-1)
+                    else:
+                        previous_target = np.zeros_like(resolved_hand_action)
+                resolved_hand_action = (
+                    np.asarray(previous_target, dtype=np.float64).reshape(-1)
+                    + resolved_hand_action * dt
+                )
+                resolved_gripper_action_space = "position"
             # Store the full end-effector action (1 scalar gripper, or N-DoF hand).
-            self._latest_hand_action = np.asarray(hand_action, dtype=np.float64).copy()
-            self._latest_gripper_action = float(hand_action.reshape(-1)[0]) if hand_action.size else 0.0
-            self._latest_gripper_action_space = gripper_action_space
+            self._latest_hand_action = resolved_hand_action
+            self._latest_gripper_action = (
+                float(resolved_hand_action.reshape(-1)[0])
+                if resolved_hand_action.size
+                else 0.0
+            )
+            self._latest_gripper_action_space = resolved_gripper_action_space
 
     def execute_interpolated_tick(self) -> bool:
         """Run one control-loop tick using interpolated position.
