@@ -276,6 +276,36 @@ def test_advance_worker_start_failure_fails_run_and_releases_robot(
     assert manager._worker is None
 
 
+@pytest.mark.parametrize("through_deadline", [False, True])
+def test_cancel_worker_start_failure_finishes_cancel_and_releases_robot(
+    tmp_path: Path, monkeypatch, through_deadline: bool
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+
+    def fail_worker_start(_thread):
+        raise RuntimeError("cancel thread unavailable")
+
+    monkeypatch.setattr(manager_module.threading.Thread, "start", fail_worker_start)
+    if through_deadline:
+        monkeypatch.setattr(
+            manager.lifecycle,
+            "expire_command_deadline",
+            lambda: manager.lifecycle.request_cancel("run-1"),
+        )
+        operation = manager.expire_deadline
+    else:
+        operation = lambda: manager.request_cancel("run-1")
+
+    with pytest.raises(RuntimeError, match="cancel thread unavailable"):
+        operation()
+
+    assert manager.lifecycle.status().state == "CANCELLED"
+    assert adapter.safe_returns == 1
+    assert claim.owned is False
+    assert manager._worker is None
+
+
 def test_commit_applies_candidate_and_releases_robot(tmp_path: Path) -> None:
     manager, adapter, claim = _manager(tmp_path)
     manager.start("run-1", True)

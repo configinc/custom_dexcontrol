@@ -775,7 +775,12 @@ class VegaForceCalibrationManager:
                         name=f"vega-force-cal-cancel-{self.lifecycle.plan.arm_name}",
                         daemon=True,
                     )
-                    self._worker.start()
+                    try:
+                        self._worker.start()
+                    except BaseException:
+                        self._worker = None
+                        self._finish_cancel_safely(run_id)
+                        raise
             elif status.state in {"CANCELLED", "FAILED", "SUCCEEDED"}:
                 if status.state == "SUCCEEDED":
                     self._install_committed_result_and_release(run_id)
