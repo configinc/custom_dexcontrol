@@ -192,7 +192,7 @@ def test_sr_command_boundary_replaces_restored_target_with_measured(monkeypatch)
         getStatus=lambda: True,
         get_pos=lambda: 0.03,
     )
-    adapter._commit_target = lambda pos, vel, force: calls.append(pos)
+    adapter._commit_target = lambda pos, vel, force, **_kwargs: calls.append(pos)
     monkeypatch.setattr(sr_module.threading, "Thread", _NewWorker)
 
     adapter.reset_command_state()
@@ -586,6 +586,34 @@ def test_sr_set_joint_pos_refuses_physical_send_while_failure_is_latched():
         adapter.set_joint_pos(np.array([0.04]))
 
     assert commits == []
+
+
+def test_sr_physical_commit_rechecks_sticky_failure_under_io_lock():
+    adapter = SrGripperAdapter.__new__(SrGripperAdapter)
+    adapter._state_lock = threading.Lock()
+    adapter._cached_pos = 0.03
+    adapter._last_slew_target = None
+    adapter._last_sent_packet = b""
+    adapter._last_send_t = 0.0
+    adapter._command_failed = threading.Event()
+    sends = []
+
+    class FailOnEnter:
+        def __enter__(self):
+            adapter._command_failed.set()
+
+        def __exit__(self, *_args):
+            return False
+
+    adapter._gripper_io_lock = FailOnEnter()
+    adapter._gripper = SimpleNamespace(
+        client=SimpleNamespace(sendCommand=lambda _packet: sends.append(True))
+    )
+
+    with pytest.raises(RuntimeError, match="Reset is required"):
+        adapter.set_joint_pos(np.array([0.04]))
+
+    assert sends == []
 
 
 def test_sr_worker_latches_failed_state_readback():

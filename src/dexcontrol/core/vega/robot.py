@@ -735,8 +735,15 @@ class VegaRobot:
     def hand_command_path_healthy(self) -> bool:
         if self.hand is None:
             return True
+        outer_before = bool(self._prev_gripper_command_successful)
         health = getattr(self.hand, "command_path_healthy", True)
-        return bool(health() if callable(health) else health)
+        adapter_healthy = bool(health() if callable(health) else health)
+        # Re-read the outer sticky state after querying the adapter.  This
+        # makes the combined predicate a single conservative snapshot: an
+        # outer failure concurrent with the adapter read cannot hide between
+        # two separately sampled fields at the service boundary.
+        outer_after = bool(self._prev_gripper_command_successful)
+        return outer_before and adapter_healthy and outer_after
 
     # gripper_types that expose the end-effector as a multi-DoF joint vector.
     # Everything else — INCLUDING gripper_type "default" with an integrated

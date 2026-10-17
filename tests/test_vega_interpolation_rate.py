@@ -603,6 +603,21 @@ def test_normal_scalar_send_cannot_clear_outer_sticky_failure():
     assert robot._prev_gripper_command_successful is False
 
 
+def test_combined_hand_health_rechecks_outer_failure_after_adapter_sample():
+    robot = VegaRobot.__new__(VegaRobot)
+    robot._prev_gripper_command_successful = True
+
+    def adapter_health():
+        robot._prev_gripper_command_successful = False
+        return True
+
+    robot.hand = type(
+        "Hand", (), {"command_path_healthy": property(lambda self: adapter_health)}
+    )()
+
+    assert robot.hand_command_path_healthy() is False
+
+
 def test_reset_command_state_retains_restart_intent_after_adapter_failure():
     robot = VegaRobot.__new__(VegaRobot)
     worker = type("Worker", (), {"is_alive": lambda self: False})()

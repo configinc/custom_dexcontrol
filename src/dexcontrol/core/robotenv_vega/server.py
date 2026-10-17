@@ -1310,9 +1310,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     hand_health = getattr(
                         self._robot, "hand_command_path_healthy", lambda: True
                     )
-                    if not getattr(
-                        self._robot, "_prev_gripper_command_successful", True
-                    ) or not hand_health():
+                    if not hand_health():
                         self._command_recovery_error = (
                             "hand command path failed before Reset response commit"
                         )
@@ -1584,9 +1582,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             hand_health = getattr(
                 self._robot, "hand_command_path_healthy", lambda: True
             )
-            if not getattr(
-                self._robot, "_prev_gripper_command_successful", True
-            ) or not hand_health():
+            if not hand_health():
                 self._command_recovery_error = (
                     "previous asynchronous hand dispatch failed"
                 )
@@ -1626,9 +1622,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             hand_health = getattr(
                 self._robot, "hand_command_path_healthy", lambda: True
             )
-            if not getattr(
-                self._robot, "_prev_gripper_command_successful", True
-            ) or not hand_health():
+            if not hand_health():
                 self._command_recovery_error = "asynchronous hand dispatch failed"
                 self._command_recovery_required.set()
             if self._command_recovery_required.is_set():

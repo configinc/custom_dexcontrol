@@ -651,7 +651,9 @@ def test_reset_clear_cannot_erase_failure_registered_during_commit():
             self._robot._prev_gripper_command_successful = False
 
     service = _service()
-    service._robot.hand_command_path_healthy = lambda: True
+    service._robot.hand_command_path_healthy = lambda: bool(
+        service._robot._prev_gripper_command_successful
+    )
     service._robot._prev_gripper_command_successful = True
     service._command_recovery_required = FailingClearEvent(service._robot)
     service._create_observation = lambda: ({}, 1)
@@ -739,7 +741,9 @@ def test_health_check_latches_idle_adapter_dispatch_failure_without_state_read()
 def test_health_check_latches_idle_outer_gripper_failure_without_state_read():
     service = _service()
     service._load_version_info = lambda: {"tag": "test"}
-    service._robot.hand_command_path_healthy = lambda: True
+    service._robot.hand_command_path_healthy = lambda: bool(
+        service._robot._prev_gripper_command_successful
+    )
     service._robot._prev_gripper_command_successful = False
     service._robot.get_robot_state = lambda: pytest.fail(
         "known outer gripper failure must fail before transport read"
