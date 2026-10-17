@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import os
 import signal
@@ -51,6 +52,32 @@ from core.vega.robot import (  # noqa: E402
 from proto import robotenv_pb2, robotenv_pb2_grpc  # noqa: E402
 
 LOGGER = logging.getLogger("robotenv_vega")
+
+
+def _track_transport_rpc(response_type):
+    """Keep the robot transport alive for the full lifetime of an RPC."""
+
+    def decorate(method):
+        @functools.wraps(method)
+        def wrapped(self, request, context):
+            condition = self._transport_rpc_condition
+            with condition:
+                if self._shutdown_started.is_set():
+                    context.set_code(grpc.StatusCode.UNAVAILABLE)
+                    context.set_details("robot server is shutting down")
+                    return response_type()
+                self._active_transport_rpcs += 1
+            try:
+                return method(self, request, context)
+            finally:
+                with condition:
+                    self._active_transport_rpcs -= 1
+                    if self._active_transport_rpcs == 0:
+                        condition.notify_all()
+
+        return wrapped
+
+    return decorate
 
 
 def _to_proto_value(val: Any) -> robotenv_pb2.Value:
@@ -240,6 +267,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._shutdown_started = threading.Event()
         self._shutdown_lock = threading.Lock()
         self._shutdown_completed = False
+        self._transport_rpc_condition = threading.Condition()
+        self._active_transport_rpcs = 0
         if self._robot.interpolation_enabled and self._control_loop_hz > 0:
             self._start_control_loop()
             LOGGER.info(
@@ -885,6 +914,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self._set_force_calibration_rpc_error(context, exc)
             return robotenv_pb2.ForceCalibrationResult()
 
+    @_track_transport_rpc(robotenv_pb2.ResetResponse)
     def Reset(self, request, context):
         if self._reject_if_shutting_down(context):
             return robotenv_pb2.ResetResponse()
@@ -1035,6 +1065,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     with self._reset_state_lock:
                         self._reset_restart_control_loop = True
 
+    @_track_transport_rpc(robotenv_pb2.StepResponse)
     def Step(self, request, context):
         if self._reject_if_shutting_down(context):
             return robotenv_pb2.StepResponse()
@@ -1242,6 +1273,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     blocking=False,
                 )
 
+    @_track_transport_rpc(robotenv_pb2.HealthCheckResponse)
     def HealthCheck(self, request, context):
         del request, context
         try:
@@ -1748,6 +1780,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             manager = getattr(self, "_force_calibration_manager", None)
             if manager is not None:
                 manager.shutdown()
+            with self._transport_rpc_condition:
+                while self._active_transport_rpcs:
+                    self._transport_rpc_condition.wait()
             # Reset and Step perform physical dispatch while holding this lock.
             # Acquiring it here proves that every admitted command has unwound.
             with self._cmd_lock:

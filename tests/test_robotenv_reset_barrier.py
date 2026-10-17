@@ -42,6 +42,8 @@ def _service():
     service._shutdown_started = threading.Event()
     service._shutdown_lock = threading.Lock()
     service._shutdown_completed = False
+    service._transport_rpc_condition = threading.Condition()
+    service._active_transport_rpcs = 0
     service._control_loop_hz = 0
     service._robot = _Robot()
     service._control_loop_thread = None
@@ -110,6 +112,57 @@ def test_shutdown_closes_admission_before_draining_and_rejects_motion_rpcs():
     context.code = None
     assert service.Step(SimpleNamespace(), context).status == ""
     assert context.code == grpc.StatusCode.UNAVAILABLE
+
+
+def test_shutdown_waits_for_admitted_current_reset_observation_before_close():
+    class Context:
+        def __init__(self):
+            self.code = None
+            self.details = ""
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    service._control_loop_stop = threading.Event()
+    service._force_calibration_manager = SimpleNamespace(shutdown=lambda: None)
+    service._force_calibration_owns_robot.set()
+    observation_started = threading.Event()
+    release_observation = threading.Event()
+
+    def observation():
+        observation_started.set()
+        assert release_observation.wait(timeout=1.0)
+        return {}, 1
+
+    service._create_observation = observation
+    reset_response = {}
+    reset_thread = threading.Thread(
+        target=lambda: reset_response.setdefault(
+            "value",
+            service.Reset(SimpleNamespace(mode="current", params={}), Context()),
+        )
+    )
+    shutdown_thread = threading.Thread(target=service.shutdown)
+
+    reset_thread.start()
+    assert observation_started.wait(timeout=1.0)
+    shutdown_thread.start()
+    threading.Event().wait(0.05)
+    assert service._shutdown_started.is_set()
+    assert service._robot.closed is False
+    assert shutdown_thread.is_alive()
+
+    release_observation.set()
+    reset_thread.join(timeout=1.0)
+    shutdown_thread.join(timeout=1.0)
+
+    assert reset_response["value"].status == "SUCCESS"
+    assert service._robot.closed is True
+    assert service._active_transport_rpcs == 0
 
 
 def test_step_dispatch_uses_normal_path_when_no_reset_owns_robot():
