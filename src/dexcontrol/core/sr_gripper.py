@@ -390,6 +390,28 @@ class SrGripperAdapter:
             raise KeyError(f"Unknown predefined pose '{name}'. Available: {list(_POSE_POOL)}")
         return _POSE_POOL[name].copy()
 
+    def reset_command_state(self) -> None:
+        """Drain re-stream work and replace the active target with measured hold."""
+        self._stop_event.set()
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=2.0)
+            if worker.is_alive():
+                raise RuntimeError("SR gripper worker did not stop within 2 seconds")
+        with self._state_lock:
+            measured = float(self._cached_pos)
+        self._last_sent_packet = b""
+        self._last_send_t = 0.0
+        self._last_slew_target = measured
+        self._commit_target(measured, 0.05, 95)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name="sr-gripper-worker",
+            daemon=True,
+        )
+        self._worker.start()
+
     def reconnect(self) -> None:
         """Tear down and re-establish the SR EtherCAT connection.
 

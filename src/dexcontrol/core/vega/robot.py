@@ -517,14 +517,54 @@ class VegaRobot:
         fresh queue so no pre-reset command can execute afterward.
         """
         worker = getattr(self, "_gripper_worker", None)
-        restart_worker = worker is not None and worker.is_alive()
+        # A retained but no-longer-live handle means a previous drain timed
+        # out and is now retryable. Finalize that stale worker/queue through
+        # the same stop path, then restore a fresh worker as originally
+        # intended.
+        restart_worker = worker is not None
         if restart_worker:
-            self._stop_gripper_worker()
+            while True:
+                try:
+                    self._stop_gripper_worker()
+                    break
+                except Exception as exc:
+                    # A command already inside vendor I/O must finish before
+                    # ownership can change. Keep the stop event asserted and
+                    # retain the handle/queue for the same-resource retry.
+                    _logger.error(
+                        "Vega gripper command boundary is not yet drained; "
+                        "retrying: %s",
+                        exc,
+                    )
+                    _time.sleep(0.05)
         else:
             self._clear_gripper_command_queue()
+        hand_reset = getattr(getattr(self, "hand", None), "reset_command_state", None)
+        if callable(hand_reset):
+            while True:
+                try:
+                    hand_reset()
+                    break
+                except Exception as exc:
+                    _logger.error(
+                        "Hand-adapter command boundary is not yet drained; "
+                        "retrying: %s",
+                        exc,
+                    )
+                    _time.sleep(0.05)
         self.reset_filter_state()
         if restart_worker:
-            self._start_gripper_worker()
+            while True:
+                try:
+                    self._start_gripper_worker()
+                    break
+                except Exception as exc:
+                    _logger.error(
+                        "Vega gripper worker restart failed at command boundary; "
+                        "retrying: %s",
+                        exc,
+                    )
+                    _time.sleep(0.05)
 
     def launch_robot(self) -> None:
         """Validate robot readiness and default control mode."""

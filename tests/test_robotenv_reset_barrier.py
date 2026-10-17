@@ -301,6 +301,10 @@ def test_service_rejects_invalid_ema_alpha_before_robot_creation(
         ("vel_ratio", float("inf")),
         ("vel_ratio", -1.0),
         ("vel_smoothing_alpha", np.bool_(True)),
+        ("max_delta_scale", float("inf")),
+        ("max_jerk", float("inf")),
+        ("vel_damp_thresh", float("nan")),
+        ("rot_sensitivity", float("inf")),
     ],
 )
 def test_service_rejects_invalid_velocity_config_before_robot_creation(
@@ -337,6 +341,49 @@ def test_current_reset_discards_buffered_commands():
 
     assert response.status == "SUCCESS"
     assert service._robot.command_state_resets == 1
+
+
+def test_cancel_after_async_gripper_open_drains_reset_era_command():
+    class Context:
+        def __init__(self):
+            self.callback = None
+
+        def add_callback(self, callback):
+            self.callback = callback
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    service.reset_joints = np.zeros(7)
+    service._create_observation = lambda: ({}, 1)
+    context = Context()
+
+    def cancel_after_enqueue(*_args, **_kwargs):
+        context.callback()
+
+    service._robot.update_gripper = cancel_after_enqueue
+    service._robot.get_cached_gripper_position = lambda: 0.0
+
+    response = service.Reset(
+        SimpleNamespace(
+            mode="home",
+            params={
+                "calibration_cancellable": server_module.robotenv_pb2.Value(
+                    int_value=1
+                )
+            },
+        ),
+        context,
+    )
+
+    assert response.status == ""
+    # Initial boundary plus failure/cancellation cleanup.
+    assert service._robot.command_state_resets >= 2
 
 
 def test_post_launch_smoothing_log_failure_stops_worker_and_closes_robot(
@@ -402,6 +449,37 @@ def test_force_calibration_ownership_discards_commands_on_claim_and_release():
     service._release_robot_from_force_calibration()
     assert service._robot.command_state_resets == 2
     assert service._force_calibration_owns_robot.is_set() is False
+
+
+def test_force_calibration_claim_drain_failure_restores_prior_loop_state():
+    class RunningThread:
+        def is_alive(self):
+            return True
+
+    service = _service()
+    service._control_loop_thread = RunningThread()
+    calls = []
+
+    def stop_loop():
+        calls.append("stop")
+        service._control_loop_thread = None
+
+    def start_loop():
+        calls.append("start")
+        service._control_loop_thread = RunningThread()
+
+    service._stop_control_loop = stop_loop
+    service._start_control_loop = start_loop
+    service._robot.reset_command_state = lambda: (_ for _ in ()).throw(
+        RuntimeError("drain failed")
+    )
+
+    with pytest.raises(RuntimeError, match="drain failed"):
+        service._claim_robot_for_force_calibration()
+
+    assert calls == ["stop", "start"]
+    assert service._force_calibration_owns_robot.is_set() is False
+    assert service._force_calibration_restart_control_loop is False
 
 
 def test_cancelled_reset_clears_buffered_commands_before_return():

@@ -551,8 +551,8 @@ class VegaForceCalibrationManager:
     def _release_if_owned(self) -> None:
         with self._lock:
             if self._owns_robot:
-                self._owns_robot = False
                 self._release_robot()
+                self._owns_robot = False
 
     def start(self, run_id: str, force_recalibrate: bool) -> CalibrationStatusSnapshot:
         with self._lock:

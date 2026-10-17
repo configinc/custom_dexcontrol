@@ -58,6 +58,17 @@ class _StoppedWorker:
         return False
 
 
+class _NewWorker:
+    def __init__(self, *args, **kwargs):
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+    def is_alive(self):
+        return self.started
+
+
 class _EventuallyStoppedWorker:
     def __init__(self):
         self.join_calls = []
@@ -124,6 +135,77 @@ def test_wuji_shutdown_refuses_channel_teardown_with_live_worker():
 
     assert adapter._worker.join_calls == [2.0]
     assert teardown_calls == []
+
+
+def test_robotiq_command_boundary_discards_queue_and_holds_measured(monkeypatch):
+    calls = []
+    adapter = RobotiqGripper.__new__(RobotiqGripper)
+    adapter._stop_event = threading.Event()
+    adapter._command_queue = Queue(maxsize=1)
+    adapter._command_queue.put((0.0, 0.05, 95))
+    adapter._worker = _StoppedWorker()
+    adapter._state_lock = threading.Lock()
+    adapter._gripper_io_lock = threading.Lock()
+    adapter._cached_pos = 0.04
+    adapter._gripper = SimpleNamespace(
+        goto=lambda **kwargs: calls.append(("goto", kwargs["pos"])),
+        sendCommand=lambda: calls.append(("send", None)),
+    )
+    monkeypatch.setattr(robotiq_module.threading, "Thread", _NewWorker)
+
+    adapter.reset_command_state()
+
+    assert calls == [("goto", 0.04), ("send", None)]
+    assert adapter._command_queue.empty()
+    assert adapter._worker.started
+
+
+def test_sr_command_boundary_replaces_restored_target_with_measured(monkeypatch):
+    calls = []
+    adapter = SrGripperAdapter.__new__(SrGripperAdapter)
+    adapter._stop_event = threading.Event()
+    adapter._worker = _StoppedWorker()
+    adapter._state_lock = threading.Lock()
+    adapter._cached_pos = 0.03
+    adapter._last_sent_packet = b"old"
+    adapter._last_send_t = 1.0
+    adapter._last_slew_target = 0.08
+    adapter._commit_target = lambda pos, vel, force: calls.append(pos)
+    monkeypatch.setattr(sr_module.threading, "Thread", _NewWorker)
+
+    adapter.reset_command_state()
+
+    assert calls == [0.03]
+    assert adapter._last_slew_target == pytest.approx(0.03)
+    assert adapter._worker.started
+
+
+def test_wuji_command_boundary_discards_queue_and_holds_measured(monkeypatch):
+    adapter = WujiHandAdapter.__new__(WujiHandAdapter)
+    adapter._stop_event = threading.Event()
+    adapter._command_queue = Queue(maxsize=1)
+    adapter._command_queue.put(np.ones(20))
+    adapter._worker = _StoppedWorker()
+    adapter._state_lock = threading.Lock()
+    adapter._cached_pos = np.linspace(0.0, 0.19, 20)
+    adapter._latest_target = np.ones(20)
+    adapter._cmd_pos = np.ones(20)
+    adapter._last_send_time = 1.0
+    adapter._handedness = "left"
+    adapter._connected = True
+    holds = []
+    adapter._send = lambda target: holds.append(np.asarray(target).copy())
+    monkeypatch.setattr(wuji_module.threading, "Thread", _NewWorker)
+
+    adapter.reset_command_state()
+
+    assert adapter._command_queue.empty()
+    assert adapter._latest_target == pytest.approx(adapter._cached_pos)
+    assert adapter._cmd_pos == pytest.approx(adapter._cached_pos)
+    assert adapter._last_send_time is None
+    assert len(holds) == 1
+    assert holds[0] == pytest.approx(adapter._cached_pos)
+    assert adapter._worker.started
 
 
 def test_wuji_worker_does_not_send_after_shutdown_during_reconnect():

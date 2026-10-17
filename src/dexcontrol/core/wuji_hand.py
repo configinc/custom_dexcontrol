@@ -1430,6 +1430,37 @@ class WujiHandAdapter:
         """Move to the power-grasp curl pose (non-blocking)."""
         self.set_joint_pos(_POSE_POOL["close"], wait_time=wait_time)
 
+    def reset_command_state(self) -> None:
+        """Drain the command stream and resume with a measured-position hold."""
+        self._stop_event.set()
+        while True:
+            try:
+                self._command_queue.get_nowait()
+            except Empty:
+                break
+        if self._worker.is_alive():
+            self._worker.join(timeout=2.0)
+            if self._worker.is_alive():
+                raise RuntimeError("Wuji hand worker did not stop within 2 seconds")
+        with self._state_lock:
+            measured = self._cached_pos.copy()
+        measured_is_finite = bool(np.isfinite(measured).all())
+        self._latest_target = measured if measured_is_finite else None
+        self._cmd_pos = measured.copy() if measured_is_finite else None
+        self._last_send_time = None
+        if measured_is_finite and self._connected:
+            # Establish the hold before returning the ownership boundary; do
+            # not rely on the replacement worker being scheduled promptly.
+            self._send(measured)
+        self._command_queue = Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name=f"wuji-hand-{self._handedness}",
+            daemon=True,
+        )
+        self._worker.start()
+
     def get_predefined_pose(self, name: str) -> np.ndarray:
         """Return a predefined pose by name ('open' or 'close')."""
         if name not in _POSE_POOL:

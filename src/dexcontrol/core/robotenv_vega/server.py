@@ -187,6 +187,21 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         ):
             raise ValueError("control_hz must be a finite positive integer")
         self.control_hz = normalized_control_hz
+
+        def _finite_float(name: str, value: object) -> float:
+            try:
+                normalized = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{name} must be finite") from exc
+            if isinstance(value, (bool, np.bool_)) or not np.isfinite(normalized):
+                raise ValueError(f"{name} must be finite")
+            return normalized
+
+        normalized_rot_sensitivity = _finite_float(
+            "rot_sensitivity", rot_sensitivity
+        )
+        if normalized_rot_sensitivity < 0.0:
+            raise ValueError("rot_sensitivity must be non-negative")
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
         self.base_frame_rotation = base_frame_rotation
         self.external_wrench_sensor_to_wrist_yaw_degrees = (
@@ -213,7 +228,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 self.external_wrench_sensor_to_wrist_yaw_degrees,
             )
         self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(
-            self.control_hz, rot_sensitivity=rot_sensitivity,
+            self.control_hz, rot_sensitivity=normalized_rot_sensitivity,
         )
         prepared_base_rotation = None
         if base_frame_rotation is not None:
@@ -247,15 +262,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             raise ValueError("ema_alpha must be finite")
         normalized_ema_alpha = float(np.clip(raw_ema_alpha, 0.0, 0.99))
 
-        def _finite_float(name: str, value: object) -> float:
-            try:
-                normalized = float(value)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError(f"{name} must be finite") from exc
-            if isinstance(value, (bool, np.bool_)) or not np.isfinite(normalized):
-                raise ValueError(f"{name} must be finite")
-            return normalized
-
         normalized_filter_ema_alpha = float(
             np.clip(_finite_float("filter_ema_alpha", filter_ema_alpha), 0.0, 1.0)
         )
@@ -276,6 +282,19 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         normalized_vel_ratio = _finite_float("vel_ratio", vel_ratio)
         if normalized_vel_ratio < 0.0:
             raise ValueError("vel_ratio must be non-negative")
+        normalized_max_delta_scale = _finite_float(
+            "max_delta_scale", max_delta_scale
+        )
+        normalized_max_jerk = _finite_float("max_jerk", max_jerk)
+        normalized_vel_damp_thresh = _finite_float(
+            "vel_damp_thresh", vel_damp_thresh
+        )
+        if normalized_max_delta_scale < 0.0:
+            raise ValueError("max_delta_scale must be non-negative")
+        if normalized_max_jerk < 0.0:
+            raise ValueError("max_jerk must be non-negative")
+        if normalized_vel_damp_thresh <= 0.0:
+            raise ValueError("vel_damp_thresh must be positive")
         interpolation_tick_hz = (
             normalized_control_loop_hz
             if interpolation_method != "none" and normalized_control_loop_hz > 0
@@ -302,10 +321,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             filter_ema_alpha=normalized_filter_ema_alpha,
             vel_smoothing_alpha=normalized_vel_smoothing_alpha,
             hw_correction_alpha=normalized_hw_correction_alpha,
-            max_delta_scale=max_delta_scale,
-            max_jerk=max_jerk,
+            max_delta_scale=normalized_max_delta_scale,
+            max_jerk=normalized_max_jerk,
             vel_ratio=normalized_vel_ratio,
-            vel_damp_thresh=vel_damp_thresh,
+            vel_damp_thresh=normalized_vel_damp_thresh,
             head_init_pos=head_init_pos,
         )
         try:
@@ -548,7 +567,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             try:
                 if self._reset_in_progress.is_set():
                     return False
-                self._force_calibration_owns_robot.set()
                 with self._command_epoch_lock:
                     self._command_epoch += 1
                 self._force_calibration_restart_control_loop = bool(
@@ -564,7 +582,17 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 # Calibration takes over the same physical command path. No
                 # Step-era arm target or asynchronous gripper command may
                 # survive the ownership transition.
-                self._robot.reset_command_state()
+                try:
+                    self._robot.reset_command_state()
+                except BaseException:
+                    if self._force_calibration_restart_control_loop:
+                        self._start_control_loop()
+                        self._force_calibration_restart_control_loop = False
+                    raise
+                # Publish ownership only after the old command path is fully
+                # stopped and drained. Until this point a failed acquisition
+                # remains a normal, rollback-safe failed claim.
+                self._force_calibration_owns_robot.set()
                 return True
             finally:
                 self._cmd_lock.release()
@@ -574,11 +602,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             # Calibration motion ends at a measured safe return. Discard all
             # calibration-era buffers before normal Step dispatch can resume.
             self._robot.reset_command_state()
-            self._force_calibration_owns_robot.clear()
-            if getattr(self, "_force_calibration_restart_control_loop", False):
-                self._force_calibration_restart_control_loop = False
+            restart_control_loop = bool(
+                getattr(self, "_force_calibration_restart_control_loop", False)
+            )
+            if restart_control_loop:
                 if not self._shutdown_started.is_set():
+                    # Start while ownership is still asserted. The new loop
+                    # cannot dispatch until every release phase has succeeded.
                     self._start_control_loop()
+                self._force_calibration_restart_control_loop = False
+            self._force_calibration_owns_robot.clear()
 
     def _set_force_calibration_applier(self, applier) -> None:
         with self._force_calibration_applier_lock:
@@ -1169,6 +1202,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     )
         except Exception as exc:
             LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
+            # A cancellable reset may have queued a nonblocking hand-open
+            # command before cancellation arrived. Reacquire the command
+            # boundary and drain reset-era arm/hand work before returning or
+            # allowing the interpolation loop to restart.
+            with self._cmd_lock:
+                reset_command_state = getattr(
+                    self._robot, "reset_command_state", self._robot.reset_filter_state
+                )
+                reset_command_state()
             if rpc_cancelled.is_set():
                 pass
             elif motion_cancelled.is_set():

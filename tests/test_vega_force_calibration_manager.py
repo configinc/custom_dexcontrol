@@ -1311,6 +1311,27 @@ def test_second_start_is_rejected_while_first_run_owns_robot(tmp_path: Path) -> 
         manager.start("run-2", True)
 
 
+def test_release_failure_retains_manager_ownership_for_retry(tmp_path: Path) -> None:
+    manager, _, _ = _manager(tmp_path)
+    calls = []
+
+    def release():
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("transient release failure")
+
+    manager._release_robot = release
+    manager._owns_robot = True
+
+    with pytest.raises(RuntimeError, match="transient release"):
+        manager._release_if_owned()
+    assert manager.owns_robot is True
+
+    manager._release_if_owned()
+    assert manager.owns_robot is False
+    assert len(calls) == 2
+
+
 def test_shutdown_cancels_active_stage_waits_for_safe_return_and_releases_robot(
     tmp_path: Path,
 ) -> None:

@@ -237,6 +237,32 @@ class RobotiqGripper:
             raise KeyError(f"Unknown predefined pose '{name}'. Available: {list(_POSE_POOL)}")
         return _POSE_POOL[name].copy()
 
+    def reset_command_state(self) -> None:
+        """Drain queued/in-flight work and establish a measured-position hold."""
+        self._stop_event.set()
+        while True:
+            try:
+                self._command_queue.get_nowait()
+            except Empty:
+                break
+        if self._worker.is_alive():
+            self._worker.join(timeout=2.0)
+            if self._worker.is_alive():
+                raise RuntimeError("Robotiq worker did not stop within 2 seconds")
+        with self._state_lock:
+            measured = float(self._cached_pos)
+        with self._gripper_io_lock:
+            self._gripper.goto(pos=measured, vel=0.05, force=95)
+            self._gripper.sendCommand()
+        self._command_queue = Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name="robotiq-gripper-worker",
+            daemon=True,
+        )
+        self._worker.start()
+
     def shutdown(self) -> None:
         """Stop worker thread and disconnect from the gripper."""
         self._stop_event.set()
