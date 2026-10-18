@@ -99,7 +99,8 @@ message GetVersionRequest {
 message StartForceCalibrationRequest {
     // Shared by the left and right servers in one coordinated run.
     // run_id must be non-empty. Repeating Start with the same run_id and the
-    // same force_recalibrate value is idempotent. Empty run_id is
+    // same force_recalibrate value is idempotent. While a physical run is
+    // active, retries must keep the same fit inputs. Empty run_id is
     // INVALID_ARGUMENT. Conflicting retry arguments,
     // or a different run_id while calibration owns the robot, must be rejected
     // as FAILED_PRECONDITION. A successful reply is READY_FOR_STAGE or a
@@ -107,6 +108,10 @@ message StartForceCalibrationRequest {
     // a valid applied cache returns SUCCEEDED under the requested run_id.
     string run_id = 1;
     bool force_recalibrate = 2;
+    // Existing GUI inputs forwarded by the bilateral coordinator to each
+    // owning robot server. COM is expressed in that server's sensor frame.
+    double gripper_mass_kg = 3;
+    repeated double gripper_com_sensor_m = 4;
 }
 
 message AdvanceForceCalibrationRequest {

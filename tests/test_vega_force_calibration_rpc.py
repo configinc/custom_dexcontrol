@@ -54,8 +54,8 @@ class Manager:
     def __init__(self) -> None:
         self.calls = []
 
-    def start(self, run_id, force):
-        self.calls.append(("start", run_id, force))
+    def start(self, run_id, force, fit_inputs=None):
+        self.calls.append(("start", run_id, force, fit_inputs))
         return _status()
 
     def advance(self, run_id, index, stage_id):
@@ -110,7 +110,10 @@ def test_rpc_methods_forward_exact_contract_fields() -> None:
 
     started = service.StartForceCalibration(
         robotenv_pb2.StartForceCalibrationRequest(
-            run_id="run-1", force_recalibrate=True
+            run_id="run-1",
+            force_recalibrate=True,
+            gripper_mass_kg=1.2,
+            gripper_com_sensor_m=[0.01, 0.02, 0.03],
         ),
         context,
     )
@@ -123,10 +126,10 @@ def test_rpc_methods_forward_exact_contract_fields() -> None:
     assert started.state == robotenv_pb2.FORCE_CALIBRATION_STATE_READY_FOR_STAGE
     assert started.plan_sha256 == "a" * 64
     assert moved.state == robotenv_pb2.FORCE_CALIBRATION_STATE_MOVING
-    assert manager.calls[:2] == [
-        ("start", "run-1", True),
-        ("advance", "run-1", 0, "stage-0"),
-    ]
+    assert manager.calls[0][:3] == ("start", "run-1", True)
+    assert manager.calls[0][3].gripper_mass_kg == 1.2
+    assert manager.calls[0][3].gripper_com_sensor_m == (0.01, 0.02, 0.03)
+    assert manager.calls[1] == ("advance", "run-1", 0, "stage-0")
 
 
 def test_result_serializes_inspectable_json() -> None:
@@ -141,12 +144,17 @@ def test_result_serializes_inspectable_json() -> None:
 
 def test_lifecycle_error_maps_to_grpc_status() -> None:
     class RejectingManager(Manager):
-        def start(self, run_id, force):
+        def start(self, run_id, force, fit_inputs=None):
             raise LifecycleError("FAILED_PRECONDITION", "busy")
 
     context = Context()
     response = _service(RejectingManager()).StartForceCalibration(
-        robotenv_pb2.StartForceCalibrationRequest(run_id="run-2"), context
+        robotenv_pb2.StartForceCalibrationRequest(
+            run_id="run-2",
+            gripper_mass_kg=1.2,
+            gripper_com_sensor_m=[0.01, 0.02, 0.03],
+        ),
+        context,
     )
     assert response == robotenv_pb2.ForceCalibrationStatus()
     assert context.code == grpc.StatusCode.FAILED_PRECONDITION

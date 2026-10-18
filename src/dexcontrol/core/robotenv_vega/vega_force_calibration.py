@@ -58,6 +58,24 @@ class CalibrationCancelled(RuntimeError):
     """Internal cooperative-cancellation signal."""
 
 
+@dataclass(frozen=True)
+class VegaForceCalibrationFitInputs:
+    gripper_mass_kg: float
+    gripper_com_sensor_m: tuple[float, float, float]
+
+    def __post_init__(self) -> None:
+        mass = float(self.gripper_mass_kg)
+        com = np.asarray(self.gripper_com_sensor_m, dtype=np.float64)
+        if not isfinite(mass) or mass <= 0:
+            raise ValueError("gripper_mass_kg must be finite and positive")
+        if com.shape != (3,) or not np.isfinite(com).all():
+            raise ValueError("gripper_com_sensor_m must contain three finite values")
+        object.__setattr__(self, "gripper_mass_kg", mass)
+        object.__setattr__(
+            self, "gripper_com_sensor_m", tuple(float(value) for value in com)
+        )
+
+
 class CalibrationAdapter(Protocol):
     def begin_run(self) -> None: ...
 
@@ -160,6 +178,12 @@ class VegaRobotCalibrationAdapter:
     def begin_run(self) -> None:
         self._start_joints = None
         self._gripper_position = 0.0
+
+    def configure_fit_inputs(self, inputs: VegaForceCalibrationFitInputs) -> None:
+        self.gripper_mass_kg = inputs.gripper_mass_kg
+        self.gripper_com_sensor_m = np.asarray(
+            inputs.gripper_com_sensor_m, dtype=np.float64
+        )
 
     def validate_start(self) -> None:
         if not str(self.service.gripper_type).lower().split("@", 1)[0].startswith(
@@ -430,6 +454,7 @@ class VegaForceCalibrationManager:
         self._candidate: WristFtCalibrationParameters | None = None
         self._pending_terminal: tuple[str, str | None] | None = None
         self._runtime_install_pending_run_id: str | None = None
+        self._fit_inputs: VegaForceCalibrationFitInputs | None = None
         self._owns_robot = False
         self._restore_runtime_state()
 
@@ -554,10 +579,33 @@ class VegaForceCalibrationManager:
                 self._release_robot()
                 self._owns_robot = False
 
-    def start(self, run_id: str, force_recalibrate: bool) -> CalibrationStatusSnapshot:
+    def _bind_fit_inputs_locked(
+        self, inputs: VegaForceCalibrationFitInputs | None
+    ) -> None:
+        if inputs is None:
+            return
+        configure = getattr(self.adapter, "configure_fit_inputs", None)
+        if callable(configure):
+            configure(inputs)
+        self._fit_inputs = inputs
+
+    def start(
+        self,
+        run_id: str,
+        force_recalibrate: bool,
+        fit_inputs: VegaForceCalibrationFitInputs | None = None,
+    ) -> CalibrationStatusSnapshot:
         with self._lock:
             current = self.lifecycle.status()
             if run_id == current.run_id:
+                if (
+                    fit_inputs is not None
+                    and self._fit_inputs is not None
+                    and fit_inputs != self._fit_inputs
+                ):
+                    raise LifecycleError(
+                        "FAILED_PRECONDITION", "conflicting Start fit inputs"
+                    )
                 status = self.lifecycle.start(
                     run_id, force_recalibrate=force_recalibrate
                 )
@@ -584,6 +632,7 @@ class VegaForceCalibrationManager:
                             )
                         self._owns_robot = True
                         acquired = True
+                        self._bind_fit_inputs_locked(fit_inputs)
                         if (
                             status.state == "READY_FOR_STAGE"
                             and status.completed_stages == 0
@@ -611,6 +660,7 @@ class VegaForceCalibrationManager:
                 )
             self._owns_robot = True
             try:
+                self._bind_fit_inputs_locked(fit_inputs)
                 self.adapter.begin_run()
                 status = self.lifecycle.start(
                     run_id, force_recalibrate=force_recalibrate

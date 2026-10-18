@@ -35,6 +35,7 @@ from core.robotenv_vega.force_calibration_lifecycle import (  # noqa: E402
     ForceCalibrationLifecycle,
 )
 from core.robotenv_vega.vega_force_calibration import (  # noqa: E402
+    VegaForceCalibrationFitInputs,
     VegaForceCalibrationManager,
     VegaRobotCalibrationAdapter,
     parameters_json,
@@ -774,6 +775,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "control_hz": str(self.control_hz),
                 "force_signal_provider_kind": "wrist_force_torque",
                 "force_signal_provider_schema_version": "2",
+                "force_calibration_owner": "robot_server",
                 "force_signal_stream_id": f"{self.robot_model}:{self.arm_side}:wrist_ft",
                 "external_wrench_world_frame_id": self.frame_type,
             },
@@ -1024,6 +1026,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "arm_side": self.arm_side,
                 "force_signal_provider_kind": "wrist_force_torque",
                 "force_signal_provider_schema_version": "2",
+                "force_calibration_owner": "robot_server",
                 "force_signal_stream_id": f"{self.robot_model}:{self.arm_side}:wrist_ft",
                 "external_wrench_world_frame_id": self.frame_type,
                 "external_wrench_sensor_to_wrist_yaw_degrees": (
@@ -1087,8 +1090,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         if self._reject_if_shutting_down(context):
             return robotenv_pb2.ForceCalibrationStatus()
         try:
+            fit_inputs = VegaForceCalibrationFitInputs(
+                gripper_mass_kg=request.gripper_mass_kg,
+                gripper_com_sensor_m=tuple(request.gripper_com_sensor_m),
+            )
             status = self._force_calibration_manager.start(
-                request.run_id, bool(request.force_recalibrate)
+                request.run_id, bool(request.force_recalibrate), fit_inputs
             )
             return self._force_calibration_status_proto(status)
         except BaseException as exc:

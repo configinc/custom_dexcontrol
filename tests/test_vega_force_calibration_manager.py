@@ -19,6 +19,7 @@ from dexcontrol.core.robotenv_vega.force_calibration_lifecycle import (
 )
 from dexcontrol.core.robotenv_vega.vega_force_calibration import (
     CalibrationCancelled,
+    VegaForceCalibrationFitInputs,
     VegaForceCalibrationManager,
     VegaRobotCalibrationAdapter,
     _minimum_jerk_rotation_steps,
@@ -74,6 +75,10 @@ class FakeAdapter:
         self.release = threading.Event()
         self.block = False
         self.safe_return_error = None
+        self.fit_inputs = None
+
+    def configure_fit_inputs(self, inputs):
+        self.fit_inputs = inputs
 
     def begin_run(self):
         return None
@@ -225,6 +230,23 @@ def test_new_run_rejection_does_not_flap_robot_claim(tmp_path: Path) -> None:
 
     assert claim.claims == claims
     assert claim.releases == releases
+    manager.request_cancel("run-1")
+    _wait_state(manager, "CANCELLED")
+
+
+def test_start_binds_gui_fit_inputs_and_rejects_conflicting_retry(tmp_path: Path) -> None:
+    manager, adapter, _ = _manager(tmp_path)
+    inputs = VegaForceCalibrationFitInputs(1.2, (0.01, 0.02, 0.03))
+
+    manager.start("run-1", True, inputs)
+
+    assert adapter.fit_inputs == inputs
+    with pytest.raises(LifecycleError, match="conflicting Start fit inputs"):
+        manager.start(
+            "run-1",
+            True,
+            VegaForceCalibrationFitInputs(1.3, (0.01, 0.02, 0.03)),
+        )
     manager.request_cancel("run-1")
     _wait_state(manager, "CANCELLED")
 

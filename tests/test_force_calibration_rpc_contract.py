@@ -64,6 +64,8 @@ def test_force_calibration_rpc_v1_field_numbers() -> None:
         robotenv_pb2.StartForceCalibrationRequest: {
             "run_id": 1,
             "force_recalibrate": 2,
+            "gripper_mass_kg": 3,
+            "gripper_com_sensor_m": 4,
         },
         robotenv_pb2.AdvanceForceCalibrationRequest: {
             "run_id": 1,
