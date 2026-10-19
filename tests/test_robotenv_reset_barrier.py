@@ -338,6 +338,20 @@ def test_service_rejects_invalid_velocity_config_before_robot_creation(
     assert robot_calls == []
 
 
+def test_cli_default_head_position_stays_within_hardware_limits(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(server_module, "serve", lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(
+        server_module.sys,
+        "argv",
+        ["server.py", "--arm-side", "left"],
+    )
+
+    server_module.main()
+
+    assert captured["head_init_pos"] == [1.48, 0.0, -0.3]
+
+
 def test_current_reset_discards_buffered_commands():
     class Context:
         def add_callback(self, _callback):

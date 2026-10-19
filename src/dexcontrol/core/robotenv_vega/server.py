@@ -2625,7 +2625,7 @@ def main() -> None:
         "--head-init-pos",
         type=float,
         nargs=3,
-        default=[2.0, 0.0, -0.3],
+        default=[1.48, 0.0, -0.3],
         metavar=("YAW", "PITCH", "ROLL"),
         help="Head joint init position in radians [yaw, pitch, roll]. "
              "Defaults to [1.48, 0.0, -0.3] (head_j1 limit: ±1.483 rad).",
