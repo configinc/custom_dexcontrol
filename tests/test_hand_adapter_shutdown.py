@@ -537,7 +537,7 @@ def test_robotiq_worker_does_not_send_queued_target_after_failure():
     assert adapter.command_path_healthy is False
 
 
-def test_robotiq_worker_latches_failed_state_readback():
+def test_robotiq_worker_retries_failed_state_readback_without_poisoning_commands():
     adapter = RobotiqGripper.__new__(RobotiqGripper)
     adapter._stop_event = threading.Event()
     adapter._command_queue = Queue(maxsize=1)
@@ -553,7 +553,7 @@ def test_robotiq_worker_latches_failed_state_readback():
     adapter._gripper = SimpleNamespace(getStatus=failed_status)
     adapter._worker_loop()
 
-    assert adapter.command_path_healthy is False
+    assert adapter.command_path_healthy is True
 
 
 def test_sr_set_joint_pos_latches_commit_failure():

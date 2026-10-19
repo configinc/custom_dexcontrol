@@ -170,10 +170,11 @@ class RobotiqGripper:
                         raise RuntimeError("Robotiq state readback is invalid")
                     with self._state_lock:
                         self._cached_pos = measured
-                else:
-                    self._command_failed.set()
             except Exception as e:
-                self._command_failed.set()
+                # A transient Modbus telemetry miss is not evidence that the
+                # asynchronous command path failed.  Keep the last measured
+                # position and retry on the next worker iteration.  Actual
+                # goto/sendCommand failures above remain sticky until Reset.
                 logger.warning("Robotiq worker state refresh error: {}", e)
 
     def _enqueue_command(self, pos_m: float, vel: float = 0.05, force: float = 95) -> None:
