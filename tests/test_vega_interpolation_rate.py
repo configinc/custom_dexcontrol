@@ -518,7 +518,7 @@ def test_reset_command_state_reseeds_outer_gripper_cache_from_hold():
     assert robot._prev_gripper_command_successful is True
 
 
-def test_successful_telemetry_recovers_transient_hand_read_failure():
+def test_successful_telemetry_does_not_erase_sticky_hand_dispatch_failure():
     robot = VegaRobot.__new__(VegaRobot)
     robot.hand = type(
         "Hand", (), {"get_joint_pos": lambda self: np.array([0.04])}
@@ -532,6 +532,25 @@ def test_successful_telemetry_recovers_transient_hand_read_failure():
     robot._prev_gripper_command_successful = False
 
     assert robot._refresh_gripper_state() is True
+    assert robot._prev_gripper_command_successful is False
+
+
+def test_failed_telemetry_does_not_create_hand_dispatch_failure():
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.hand = type(
+        "Hand",
+        (),
+        {
+            "get_joint_pos": lambda self: (_ for _ in ()).throw(
+                RuntimeError("transient read failure")
+            )
+        },
+    )()
+    robot._gripper_io_lock = threading.Lock()
+    robot._gripper_state_lock = threading.Lock()
+    robot._prev_gripper_command_successful = True
+
+    assert robot._refresh_gripper_state() is False
     assert robot._prev_gripper_command_successful is True
 
 

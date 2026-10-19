@@ -664,13 +664,11 @@ class VegaRobot:
             with self._gripper_state_lock:
                 self._gripper_joint_pos = hand_joint_pos.copy()
                 self._gripper_position = gripper_position
-            # Match the production recovery behavior: a transient telemetry
-            # read failure must not leave the hand path permanently latched
-            # after communication is healthy again.
-            self._prev_gripper_command_successful = True
             return True
         except Exception:
-            self._prev_gripper_command_successful = False
+            # Telemetry freshness and command-dispatch health are separate
+            # concerns.  Production tolerated a transient state-read failure;
+            # it must not turn into a server command-recovery latch.
             return False
 
     def _execute_gripper_command(
