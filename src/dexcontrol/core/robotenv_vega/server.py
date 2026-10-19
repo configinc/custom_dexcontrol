@@ -35,6 +35,7 @@ from core.robotenv_vega.force_calibration_lifecycle import (  # noqa: E402
     ForceCalibrationLifecycle,
 )
 from core.robotenv_vega.vega_force_calibration import (  # noqa: E402
+    DesiredNormalResetJointPositionsRad,
     VegaForceCalibrationFitInputs,
     VegaForceCalibrationManager,
     VegaRobotCalibrationAdapter,
@@ -1101,8 +1102,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 gripper_mass_kg=request.gripper_mass_kg,
                 gripper_com_sensor_m=tuple(request.gripper_com_sensor_m),
             )
+            desired_normal_reset_joint_positions_rad = (
+                DesiredNormalResetJointPositionsRad(
+                    tuple(request.normal_reset_joint_positions_rad)
+                )
+                if request.normal_reset_joint_positions_rad
+                else None
+            )
             status = self._force_calibration_manager.start(
-                request.run_id, bool(request.force_recalibrate), fit_inputs
+                request.run_id,
+                bool(request.force_recalibrate),
+                fit_inputs,
+                desired_normal_reset_joint_positions_rad,
             )
             return self._force_calibration_status_proto(status)
         except BaseException as exc:

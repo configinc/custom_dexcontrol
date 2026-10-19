@@ -112,6 +112,9 @@ message StartForceCalibrationRequest {
     // owning robot server. COM is expressed in that server's sensor frame.
     double gripper_mass_kg = 3;
     repeated double gripper_com_sensor_m = 4;
+    // Existing frame.yaml target selected by RCI for this arm. The owning
+    // server uses it only for the successful post-fit return.
+    repeated double normal_reset_joint_positions_rad = 5;
 }
 
 message AdvanceForceCalibrationRequest {

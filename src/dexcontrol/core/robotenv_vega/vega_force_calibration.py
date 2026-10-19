@@ -76,6 +76,19 @@ class VegaForceCalibrationFitInputs:
         )
 
 
+@dataclass(frozen=True)
+class DesiredNormalResetJointPositionsRad:
+    values: tuple[float, float, float, float, float, float, float]
+
+    def __post_init__(self) -> None:
+        values = np.asarray(self.values, dtype=np.float64)
+        if values.shape != (7,) or not np.isfinite(values).all():
+            raise ValueError(
+                "normal_reset_joint_positions_rad must contain seven finite values"
+            )
+        object.__setattr__(self, "values", tuple(float(value) for value in values))
+
+
 class CalibrationAdapter(Protocol):
     def begin_run(self) -> None: ...
 
@@ -219,6 +232,12 @@ class VegaRobotCalibrationAdapter:
         ).all():
             raise ValueError("gripper_com_sensor_m must contain three finite values")
         self._start_joints: np.ndarray | None = None
+        service_reset_joints = getattr(self.service, "reset_joints", None)
+        self._desired_normal_reset_joint_positions_rad = (
+            None
+            if service_reset_joints is None
+            else np.asarray(service_reset_joints, dtype=np.float64).copy()
+        )
         self._gripper_position = 0.0
 
     def begin_run(self) -> None:
@@ -229,6 +248,13 @@ class VegaRobotCalibrationAdapter:
         self.gripper_mass_kg = inputs.gripper_mass_kg
         self.gripper_com_sensor_m = np.asarray(
             inputs.gripper_com_sensor_m, dtype=np.float64
+        )
+
+    def configure_desired_normal_reset_joint_positions_rad(
+        self, desired: DesiredNormalResetJointPositionsRad
+    ) -> None:
+        self._desired_normal_reset_joint_positions_rad = np.asarray(
+            desired.values, dtype=np.float64
         )
 
     def validate_start(self) -> None:
@@ -482,14 +508,18 @@ class VegaRobotCalibrationAdapter:
     def normal_return(self, cancelled: threading.Event | None = None) -> None:
         """Return to the configured inference/reset pose after a successful fit."""
         safe_cancel = threading.Event() if cancelled is None else cancelled
+        configured_target = self._desired_normal_reset_joint_positions_rad
+        if configured_target is None:
+            configured_target = np.asarray(self.service.reset_joints, dtype=np.float64)
+        target = configured_target.copy()
         with self.service._cmd_lock:
             self.service._execute_reset_sequence(
-                self.service.reset_joints,
+                target,
                 cancelled=safe_cancel,
                 interruptible_gripper=True,
             )
             self._check_cancelled(safe_cancel)
-            self._verify_joint_return(self.service.reset_joints)
+            self._verify_joint_return(target)
 
     def fit(self, holds: Sequence[WristFtCalibrationHold]) -> WristFtCalibrationParameters:
         return fit_wrist_ft_calibration(
@@ -564,6 +594,9 @@ class VegaForceCalibrationManager:
         self._pending_terminal: tuple[str, str | None] | None = None
         self._runtime_install_pending_run_id: str | None = None
         self._fit_inputs: VegaForceCalibrationFitInputs | None = None
+        self._desired_normal_reset_joint_positions_rad: (
+            DesiredNormalResetJointPositionsRad | None
+        ) = None
         self._owns_robot = False
         self._restore_runtime_state()
 
@@ -697,11 +730,28 @@ class VegaForceCalibrationManager:
             configure(inputs)
         self._fit_inputs = inputs
 
+    def _bind_desired_normal_reset_joint_positions_rad_locked(
+        self, desired: DesiredNormalResetJointPositionsRad | None
+    ) -> None:
+        if desired is None:
+            return
+        configure = getattr(
+            self.adapter,
+            "configure_desired_normal_reset_joint_positions_rad",
+            None,
+        )
+        if callable(configure):
+            configure(desired)
+        self._desired_normal_reset_joint_positions_rad = desired
+
     def start(
         self,
         run_id: str,
         force_recalibrate: bool,
         fit_inputs: VegaForceCalibrationFitInputs | None = None,
+        desired_normal_reset_joint_positions_rad: (
+            DesiredNormalResetJointPositionsRad | None
+        ) = None,
     ) -> CalibrationStatusSnapshot:
         with self._lock:
             current = self.lifecycle.status()
@@ -713,6 +763,16 @@ class VegaForceCalibrationManager:
                 ):
                     raise LifecycleError(
                         "FAILED_PRECONDITION", "conflicting Start fit inputs"
+                    )
+                if (
+                    desired_normal_reset_joint_positions_rad is not None
+                    and self._desired_normal_reset_joint_positions_rad is not None
+                    and desired_normal_reset_joint_positions_rad
+                    != self._desired_normal_reset_joint_positions_rad
+                ):
+                    raise LifecycleError(
+                        "FAILED_PRECONDITION",
+                        "conflicting Start normal reset joints",
                     )
                 status = self.lifecycle.start(
                     run_id, force_recalibrate=force_recalibrate
@@ -741,6 +801,9 @@ class VegaForceCalibrationManager:
                         self._owns_robot = True
                         acquired = True
                         self._bind_fit_inputs_locked(fit_inputs)
+                        self._bind_desired_normal_reset_joint_positions_rad_locked(
+                            desired_normal_reset_joint_positions_rad
+                        )
                         if (
                             status.state == "READY_FOR_STAGE"
                             and status.completed_stages == 0
@@ -769,6 +832,9 @@ class VegaForceCalibrationManager:
             self._owns_robot = True
             try:
                 self._bind_fit_inputs_locked(fit_inputs)
+                self._bind_desired_normal_reset_joint_positions_rad_locked(
+                    desired_normal_reset_joint_positions_rad
+                )
                 self.adapter.begin_run()
                 status = self.lifecycle.start(
                     run_id, force_recalibrate=force_recalibrate

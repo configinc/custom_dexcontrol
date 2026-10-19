@@ -54,8 +54,10 @@ class Manager:
     def __init__(self) -> None:
         self.calls = []
 
-    def start(self, run_id, force, fit_inputs=None):
-        self.calls.append(("start", run_id, force, fit_inputs))
+    def start(self, run_id, force, fit_inputs=None, normal_reset_joints=None):
+        self.calls.append(
+            ("start", run_id, force, fit_inputs, normal_reset_joints)
+        )
         return _status()
 
     def advance(self, run_id, index, stage_id):
@@ -114,6 +116,7 @@ def test_rpc_methods_forward_exact_contract_fields() -> None:
             force_recalibrate=True,
             gripper_mass_kg=1.2,
             gripper_com_sensor_m=[0.01, 0.02, 0.03],
+            normal_reset_joint_positions_rad=[1, 2, 3, 4, 5, 6, 7],
         ),
         context,
     )
@@ -129,6 +132,7 @@ def test_rpc_methods_forward_exact_contract_fields() -> None:
     assert manager.calls[0][:3] == ("start", "run-1", True)
     assert manager.calls[0][3].gripper_mass_kg == 1.2
     assert manager.calls[0][3].gripper_com_sensor_m == (0.01, 0.02, 0.03)
+    assert manager.calls[0][4].values == (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0)
     assert manager.calls[1] == ("advance", "run-1", 0, "stage-0")
 
 
@@ -144,7 +148,7 @@ def test_result_serializes_inspectable_json() -> None:
 
 def test_lifecycle_error_maps_to_grpc_status() -> None:
     class RejectingManager(Manager):
-        def start(self, run_id, force, fit_inputs=None):
+        def start(self, run_id, force, fit_inputs=None, normal_reset_joints=None):
             raise LifecycleError("FAILED_PRECONDITION", "busy")
 
     context = Context()
@@ -159,6 +163,24 @@ def test_lifecycle_error_maps_to_grpc_status() -> None:
     assert response == robotenv_pb2.ForceCalibrationStatus()
     assert context.code == grpc.StatusCode.FAILED_PRECONDITION
     assert context.details == "busy"
+
+
+def test_start_rejects_invalid_normal_reset_joint_target_before_manager() -> None:
+    manager = Manager()
+    context = Context()
+    response = _service(manager).StartForceCalibration(
+        robotenv_pb2.StartForceCalibrationRequest(
+            run_id="run-2",
+            gripper_mass_kg=1.2,
+            gripper_com_sensor_m=[0.01, 0.02, 0.03],
+            normal_reset_joint_positions_rad=[1.0] * 6,
+        ),
+        context,
+    )
+    assert response == robotenv_pb2.ForceCalibrationStatus()
+    assert context.code == grpc.StatusCode.INVALID_ARGUMENT
+    assert "seven finite values" in context.details
+    assert manager.calls == []
 
 
 def test_empty_cancel_is_not_found_without_touching_manager() -> None:

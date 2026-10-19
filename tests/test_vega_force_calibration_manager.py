@@ -20,6 +20,7 @@ from dexcontrol.core.robotenv_vega.force_calibration_lifecycle import (
 )
 from dexcontrol.core.robotenv_vega.vega_force_calibration import (
     CalibrationCancelled,
+    DesiredNormalResetJointPositionsRad,
     VegaForceCalibrationFitInputs,
     VegaForceCalibrationManager,
     VegaRobotCalibrationAdapter,
@@ -91,9 +92,13 @@ class FakeAdapter:
         self.block = False
         self.safe_return_error = None
         self.fit_inputs = None
+        self.normal_reset_joint_positions = None
 
     def configure_fit_inputs(self, inputs):
         self.fit_inputs = inputs
+
+    def configure_desired_normal_reset_joint_positions_rad(self, desired):
+        self.normal_reset_joint_positions = desired
 
     def begin_run(self):
         return None
@@ -263,15 +268,26 @@ def test_new_run_rejection_does_not_flap_robot_claim(tmp_path: Path) -> None:
 def test_start_binds_gui_fit_inputs_and_rejects_conflicting_retry(tmp_path: Path) -> None:
     manager, adapter, _ = _manager(tmp_path)
     inputs = VegaForceCalibrationFitInputs(1.2, (0.01, 0.02, 0.03))
+    desired = DesiredNormalResetJointPositionsRad(
+        (-0.13, 1.32, 1.14, -2.21, 0.41, 0.05, -1.11)
+    )
 
-    manager.start("run-1", True, inputs)
+    manager.start("run-1", True, inputs, desired)
 
     assert adapter.fit_inputs == inputs
+    assert adapter.normal_reset_joint_positions == desired
     with pytest.raises(LifecycleError, match="conflicting Start fit inputs"):
         manager.start(
             "run-1",
             True,
             VegaForceCalibrationFitInputs(1.3, (0.01, 0.02, 0.03)),
+        )
+    with pytest.raises(LifecycleError, match="conflicting Start normal reset joints"):
+        manager.start(
+            "run-1",
+            True,
+            inputs,
+            DesiredNormalResetJointPositionsRad((0.0,) * 7),
         )
     manager.request_cancel("run-1")
     _wait_state(manager, "CANCELLED")
@@ -1435,7 +1451,7 @@ def test_successful_fit_preserves_legacy_normal_joint_reset() -> None:
         )
 
     adapter._sample = sample
-    hold = adapter.execute_stage(
+    adapter.execute_stage(
         "pose-9",
         {"kind": "pose", "rpy_degrees": [0.0, 0.0, 0.0]},
         threading.Event(),
@@ -1446,10 +1462,15 @@ def test_successful_fit_preserves_legacy_normal_joint_reset() -> None:
     # joint reset belongs after a successful fit, not before quality validation.
     assert service.reset_calls == 0
     adapter.fit = lambda _holds: FakeParameters()
+    desired = DesiredNormalResetJointPositionsRad(
+        (-0.13, 1.32, 1.14, -2.21, 0.41, 0.05, -1.11)
+    )
+    adapter.configure_desired_normal_reset_joint_positions_rad(desired)
     adapter.normal_return(threading.Event())
 
     assert service.reset_calls == 1
-    np.testing.assert_allclose(service.reset_targets[0], service.reset_joints)
+    np.testing.assert_allclose(service.reset_targets[0], desired.values)
+    assert not np.allclose(service.reset_targets[0], service.reset_joints)
 
 
 def test_sample_uses_sensor_timestamp_and_rejects_cross_stream_skew() -> None:
