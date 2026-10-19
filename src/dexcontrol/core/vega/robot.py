@@ -1148,8 +1148,12 @@ class VegaRobot:
                 return False
 
             now = _time.perf_counter()
-            query_time = now - (1.0 / max(1, self.control_hz))
-            combined_pos, combined_vel = self._interpolator.interpolate(
+            # Preserve the production Vega control law: interpolate at the
+            # current dispatch time.  Delaying the query by one 20 Hz input
+            # period adds perceptible command latency and was not part of the
+            # force-calibration split.
+            query_time = now
+            combined_pos, _combined_vel = self._interpolator.interpolate(
                 query_time,
                 compute_velocity=self.use_velocity_feedforward,
             )
@@ -1164,37 +1168,14 @@ class VegaRobot:
                 combined_pos = np.concatenate(
                     [self._latest_target_joint_pos, latest_hand]
                 )
-                combined_vel = None
+                _combined_vel = None
 
             combined_pos = np.asarray(combined_pos, dtype=np.float64).reshape(-1)
             if combined_pos.size < 8:
                 raise RuntimeError("Interpolated command is missing its hand target")
             pos = combined_pos[:7].copy()
             hand_action = combined_pos[7:].copy()
-            arm_feedforward_velocity = (
-                None
-                if combined_vel is None
-                else np.asarray(combined_vel, dtype=np.float64).reshape(-1)[:7].copy()
-            )
-            latest_command_monotonic = self._latest_command_monotonic
-            if (
-                arm_feedforward_velocity is None
-                and self._latest_arm_feedforward_velocity is not None
-                and latest_command_monotonic is not None
-                and now - latest_command_monotonic
-                <= self._FEEDFORWARD_MAX_AGE_INPUT_PERIODS
-                / max(1, self.control_hz)
-            ):
-                arm_feedforward_velocity = self._latest_arm_feedforward_velocity.copy()
-            if arm_feedforward_velocity is None:
-                arm_feedforward_velocity = np.zeros_like(
-                    self._latest_target_joint_pos
-                )
             gripper_vel = self._latest_gripper_action_space == "velocity"
-            feedforward_deadman = (
-                latest_command_monotonic is None
-                or query_time >= latest_command_monotonic
-            )
 
         # Apply the output filter (Butterworth / EMA) after interpolation.
         if self._output_filter is not None:
@@ -1221,15 +1202,11 @@ class VegaRobot:
                 pos,
                 velocity=False,
                 blocking=False,
-                execution_hz=self.interpolation_control_hz,
-                feedforward_velocity=arm_feedforward_velocity,
-                force_zero_feedforward=feedforward_deadman,
             )
             self._apply_hand_action(
                 hand_action,
                 "velocity" if gripper_vel else "position",
                 blocking=False,
-                execution_hz=self.interpolation_control_hz,
             )
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):

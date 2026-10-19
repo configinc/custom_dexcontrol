@@ -71,7 +71,7 @@ def test_first_order_alpha_preserves_decay_over_one_input_period():
     assert (1.0 - target_alpha) ** 10 == pytest.approx(1.0 - source_alpha)
 
 
-def test_interpolated_tick_passes_execution_rate_to_arm_and_hand():
+def test_interpolated_tick_preserves_production_input_rate_dispatch():
     robot = VegaRobot.__new__(VegaRobot)
     robot._interp_lock = threading.Lock()
     robot._latest_target_joint_pos = np.ones(7)
@@ -101,8 +101,10 @@ def test_interpolated_tick_passes_execution_rate_to_arm_and_hand():
     robot._apply_hand_action = lambda *args, **kwargs: calls.append(("hand", kwargs))
 
     assert robot.execute_interpolated_tick()
-    assert calls[0][1]["execution_hz"] == 100
-    assert calls[1][1]["execution_hz"] == 100
+    assert "execution_hz" not in calls[0][1]
+    assert "feedforward_velocity" not in calls[0][1]
+    assert "force_zero_feedforward" not in calls[0][1]
+    assert "execution_hz" not in calls[1][1]
 
 
 def test_interpolated_tick_propagates_physical_dispatch_failure():
@@ -722,7 +724,7 @@ def test_nonfinite_measured_hand_anchor_rejects_entire_command():
     assert robot._latest_target_joint_pos is None
 
 
-def test_delayed_interpolation_produces_motion_and_zeroes_feedforward_at_hold(
+def test_interpolation_uses_current_dispatch_time_without_added_input_period_delay(
     monkeypatch,
 ):
     times = iter([10.0, 10.05, 10.075, 10.16])
@@ -747,7 +749,7 @@ def test_delayed_interpolation_produces_motion_and_zeroes_feedforward_at_hold(
     dispatched = []
     dispatched_hand = []
     robot.update_joints = lambda pos, **kwargs: dispatched.append(
-        (np.asarray(pos), np.asarray(kwargs["feedforward_velocity"]))
+        (np.asarray(pos), kwargs)
     )
     robot._apply_hand_action = lambda action, *args, **kwargs: dispatched_hand.append(
         np.asarray(action)
@@ -758,13 +760,13 @@ def test_delayed_interpolation_produces_motion_and_zeroes_feedforward_at_hold(
     robot.add_command_point(zero, "joint_position")
     robot.add_command_point(one, "joint_position")
     assert robot.execute_interpolated_tick()
-    assert dispatched[-1][0] == pytest.approx(np.full(7, 0.5), abs=0.01)
-    assert dispatched[-1][1] == pytest.approx(np.full(7, 20.0), rel=0.02)
-    assert dispatched_hand[-1] == pytest.approx([0.5], abs=0.01)
+    assert dispatched[-1][0] == pytest.approx(np.ones(7))
+    assert dispatched[-1][1] == {"velocity": False, "blocking": False}
+    assert dispatched_hand[-1] == pytest.approx([1.0])
 
     assert robot.execute_interpolated_tick()
     assert dispatched[-1][0] == pytest.approx(np.ones(7))
-    assert dispatched[-1][1] == pytest.approx(np.zeros(7))
+    assert dispatched[-1][1] == {"velocity": False, "blocking": False}
     assert dispatched_hand[-1] == pytest.approx([1.0])
 
 
