@@ -871,13 +871,18 @@ class VegaForceCalibrationManager:
                 if self._cancelled.is_set():
                     raise CalibrationCancelled("force calibration cancelled")
                 self._candidate = parameters
+                parameter_snapshot = parameters.as_parameters()
                 with self._lock:
                     if self._cancelled.is_set():
                         raise CalibrationCancelled("force calibration cancelled")
                     self.lifecycle.stage_candidate(
                         run_id,
-                        parameters=parameters.as_parameters(),
-                        quality=dict(parameters.quality),
+                        parameters=parameter_snapshot,
+                        # as_parameters() deep-thaws the immutable nested
+                        # MappingProxyType values used by runtime parameters.
+                        # A shallow dict(parameters.quality) leaves nested
+                        # proxies that json.dumps cannot serialize.
+                        quality=parameter_snapshot["quality"],
                     )
         except CalibrationCancelled:
             self._finish_cancel_safely(run_id)

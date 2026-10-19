@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 import pytest
@@ -60,10 +61,22 @@ def _lifecycle(tmp_path: Path, stage_count: int = 2) -> ForceCalibrationLifecycl
 
 
 class FakeParameters:
-    quality = {"passed": True}
+    quality = MappingProxyType(
+        {
+            "passed": True,
+            "held_out_validation": MappingProxyType({"passed": True}),
+        }
+    )
 
     def as_parameters(self):
-        return {"schema_version": 5, "fake": True}
+        return {
+            "schema_version": 5,
+            "fake": True,
+            "quality": {
+                "passed": True,
+                "held_out_validation": {"passed": True},
+            },
+        }
 
 
 class FakeAdapter:
