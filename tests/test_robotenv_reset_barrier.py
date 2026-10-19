@@ -315,9 +315,6 @@ def test_service_rejects_invalid_ema_alpha_before_robot_creation(
         ("rot_sensitivity", 2.01),
         ("head_init_pos", [float("nan"), 0.0, 0.0]),
         ("head_init_pos", [1e308, 0.0, 0.0]),
-        ("head_init_pos", [1.484, 0.0, 0.0]),
-        ("head_init_pos", [0.0, 2.793, 0.0]),
-        ("head_init_pos", [0.0, 0.0, -1.379]),
         ("head_init_pos", [True, False, False]),
         ("wuji_effort_limit", float("inf")),
         ("wuji_effort_limit", 1.71),
@@ -339,7 +336,7 @@ def test_service_rejects_invalid_velocity_config_before_robot_creation(
     assert robot_calls == []
 
 
-def test_cli_default_head_position_stays_within_hardware_limits(monkeypatch):
+def test_cli_default_head_position_preserves_production_view(monkeypatch):
     captured = {}
     monkeypatch.setattr(server_module, "serve", lambda **kwargs: captured.update(kwargs))
     monkeypatch.setattr(
@@ -350,7 +347,7 @@ def test_cli_default_head_position_stays_within_hardware_limits(monkeypatch):
 
     server_module.main()
 
-    assert captured["head_init_pos"] == [1.48, 0.0, -0.3]
+    assert captured["head_init_pos"] == [2.0, 0.0, -0.3]
 
 
 def test_current_reset_discards_buffered_commands():

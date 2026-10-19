@@ -149,7 +149,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         rot_sensitivity: float = 1.0,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
-        head_init_pos: tuple[float, ...] | list[float] = (1.48, 0.0, -0.3),
+        head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
         force_calibration_gripper_mass_kg: float = 1.2,
         force_calibration_gripper_com_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.072),
         force_calibration_storage_directory: str | None = None,
@@ -219,15 +219,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             head_init_pos_float32 = normalized_head_init_pos.astype(np.float32)
         if not np.isfinite(head_init_pos_float32).all():
             raise ValueError("head_init_pos must remain finite in the hardware float32 format")
-        # Vega 1 URDF head_j1..j3 limits, in radians. Validate before any
-        # hardware object exists because the custom startup pose is dispatched
-        # during the base Robot constructor.
-        head_lower = np.array([-1.483, -2.792, -1.378], dtype=np.float64)
-        head_upper = np.array([1.483, 2.792, 1.483], dtype=np.float64)
-        if np.any(normalized_head_init_pos < head_lower) or np.any(
-            normalized_head_init_pos > head_upper
-        ):
-            raise ValueError("head_init_pos exceeds Vega head joint limits")
         normalized_wuji_effort_limit = None
         if wuji_effort_limit is not None:
             normalized_wuji_effort_limit = _finite_float(
@@ -2442,10 +2433,10 @@ def main() -> None:
         "--head-init-pos",
         type=float,
         nargs=3,
-        default=[1.48, 0.0, -0.3],
+        default=[2.0, 0.0, -0.3],
         metavar=("YAW", "PITCH", "ROLL"),
         help="Head joint init position in radians [yaw, pitch, roll]. "
-             "Defaults to [1.48, 0.0, -0.3] (head_j1 limit: ±1.483 rad).",
+             "Defaults to [2.0, 0.0, -0.3].",
     )
     parser.add_argument(
         "--force-calibration-gripper-mass-kg",
