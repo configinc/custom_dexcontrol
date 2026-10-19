@@ -1,6 +1,7 @@
 import sys
 import threading
 import logging
+import time
 from types import ModuleType, SimpleNamespace
 
 import grpc
@@ -480,6 +481,26 @@ def test_force_calibration_ownership_discards_commands_on_claim_and_release():
     service._release_robot_from_force_calibration()
     assert service._robot.command_state_resets == 2
     assert service._force_calibration_owns_robot.is_set() is False
+
+
+def test_force_calibration_claim_waits_for_inflight_control_tick():
+    service = _service()
+    service._force_calibration_restart_control_loop = False
+    service._cmd_lock.acquire()
+
+    def finish_tick():
+        time.sleep(0.05)
+        service._cmd_lock.release()
+
+    tick = threading.Thread(target=finish_tick)
+    tick.start()
+    try:
+        assert service._claim_robot_for_force_calibration() is True
+    finally:
+        tick.join(timeout=1.0)
+
+    assert service._robot.command_state_resets == 1
+    assert service._force_calibration_owns_robot.is_set() is True
 
 
 def test_force_calibration_claim_drain_failure_restores_prior_loop_state():

@@ -659,7 +659,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 return False
             if self._force_calibration_owns_robot.is_set() or self._reset_in_progress.is_set():
                 return False
-            if not self._cmd_lock.acquire(blocking=False):
+            # A 200 Hz interpolation tick briefly owns this lock every 5 ms.
+            # Treat that normal overlap as a handoff, not as a busy robot.
+            # The bounded wait still fails closed if Reset or a physical
+            # command is genuinely stuck.
+            if not self._cmd_lock.acquire(timeout=1.0):
                 return False
             try:
                 if self._reset_in_progress.is_set():
