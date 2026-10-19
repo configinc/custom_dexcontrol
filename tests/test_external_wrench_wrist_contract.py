@@ -241,7 +241,11 @@ def test_observation_publishes_both_calibrated_frames_only_with_active_applier()
     )
     assert (
         observation["external_wrench_wrist_reference_point"].string_value
-        == "configured TCP anchor (rotation only)"
+        == "physical F/T sensor measurement origin"
+    )
+    assert (
+        observation["external_wrench_world_reference_point"].string_value
+        == "physical F/T sensor measurement origin"
     )
 
     service._force_calibration_expires_at_timestamp_us = 1

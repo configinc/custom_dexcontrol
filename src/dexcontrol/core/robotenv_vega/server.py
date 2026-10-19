@@ -1695,7 +1695,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                                     "Omitting calibrated external wrench: %s", exc
                                 )
                             else:
-                                anchor = "configured TCP anchor (rotation only)"
+                                # Frame rotation does not translate a wrench's
+                                # moment origin.  Both calibrated outputs remain
+                                # referenced at the physical F/T sensor.
+                                anchor = reference_point
                                 for name, values in (
                                     ("external_wrench_wrist", wrist_wrench),
                                     ("external_wrench_world", world_wrench),
