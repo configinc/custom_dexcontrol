@@ -1256,6 +1256,26 @@ def test_rotation_delta_is_exactly_conjugated_into_robot_frame() -> None:
     np.testing.assert_allclose(actual_robot, expected_robot, atol=1e-12)
 
 
+def test_motion_commands_accumulated_target_error_not_each_tiny_increment() -> None:
+    service = _FakeService()
+    adapter = _physical_adapter(service)
+
+    def skip_sleep(_started):
+        return None
+
+    adapter._sleep_tick = skip_sleep
+    commanded = adapter._move_profile(
+        [np.array([0.1, 0.0, 0.0]), np.array([0.1, 0.0, 0.0])],
+        np.zeros(6),
+        threading.Event(),
+    )
+
+    assert commanded[3] == pytest.approx(0.2)
+    # The fake measured pose never moves. The second command must therefore
+    # retain the missed first increment and request the full 0.2 rad error.
+    assert service._robot.last_action[3] == pytest.approx(0.2)
+
+
 def test_sample_uses_sensor_timestamp_and_rejects_cross_stream_skew() -> None:
     adapter = _physical_adapter(_FakeService(sensor_timestamp_ns=1_000_000_000))
     assert adapter._sample()[3] == pytest.approx(1.0)

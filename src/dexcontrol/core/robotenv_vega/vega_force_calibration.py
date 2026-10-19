@@ -233,10 +233,13 @@ class VegaRobotCalibrationAdapter:
             raise CalibrationCancelled("force calibration cancelled")
 
     def _command_delta(self, delta_rotation: np.ndarray) -> None:
+        self._command_cartesian_error(
+            np.r_[np.zeros(3), np.asarray(delta_rotation, dtype=np.float64)]
+        )
+
+    def _command_cartesian_error(self, cartesian_error: np.ndarray) -> None:
         action = np.r_[
-            np.zeros(3),
-            np.asarray(delta_rotation, dtype=np.float64),
-            self._gripper_position,
+            np.asarray(cartesian_error, dtype=np.float64), self._gripper_position
         ]
         if self.service.R_world_to_robot is not None:
             action[:3] = self.service.R_world_to_robot @ action[:3]
@@ -254,6 +257,15 @@ class VegaRobotCalibrationAdapter:
             blocking=False,
         )
 
+    def _command_cartesian_target(self, target: np.ndarray) -> None:
+        actual = self._current_cartesian()
+        linear_error = np.asarray(target[:3]) - np.asarray(actual[:3])
+        rotation_error = (
+            Rotation.from_euler("xyz", target[3:])
+            * Rotation.from_euler("xyz", actual[3:]).inv()
+        ).as_euler("xyz")
+        self._command_cartesian_error(np.r_[linear_error, rotation_error])
+
     def _sleep_tick(self, started: float) -> None:
         delay = 1.0 / self.service.control_hz - (time.perf_counter() - started)
         if delay > 0:
@@ -262,13 +274,20 @@ class VegaRobotCalibrationAdapter:
     def _move_profile(
         self,
         steps: Sequence[np.ndarray],
+        commanded: np.ndarray,
         cancelled: threading.Event,
-    ) -> None:
+    ) -> np.ndarray:
+        target = np.asarray(commanded, dtype=np.float64).copy()
         for delta in steps:
             self._check_cancelled(cancelled)
             started = time.perf_counter()
-            self._command_delta(delta)
+            target[3:] = (
+                Rotation.from_euler("xyz", delta)
+                * Rotation.from_euler("xyz", target[3:])
+            ).as_euler("xyz")
+            self._command_cartesian_target(target)
             self._sleep_tick(started)
+        return target
 
     def _sample(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         state, timestamps = self.service._robot.get_robot_state()
@@ -361,7 +380,7 @@ class VegaRobotCalibrationAdapter:
         )
         start_cartesian = self._current_cartesian()
         set_phase("MOVING", f"moving to {stage_id}")
-        self._move_profile(forward_steps, cancelled)
+        commanded = self._move_profile(forward_steps, start_cartesian, cancelled)
         samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float]] = []
         try:
             set_phase("SETTLING", f"settling at {stage_id}")
@@ -373,11 +392,10 @@ class VegaRobotCalibrationAdapter:
             for index in range(count):
                 self._check_cancelled(cancelled)
                 started = time.perf_counter()
-                self._command_delta(np.zeros(3))
-                if index >= collect_after:
-                    if index == collect_after:
-                        set_phase("COLLECTING", f"collecting {stage_id}")
-                    _append_fresh_sample(samples, self._sample())
+                self._command_cartesian_target(commanded)
+                if index == collect_after:
+                    set_phase("COLLECTING", f"collecting {stage_id}")
+                _append_fresh_sample(samples, self._sample())
                 self._sleep_tick(started)
             settled = _settled_tail(samples)
             raw_samples = np.asarray([item[0] for item in settled], dtype=np.float64)
@@ -392,7 +410,7 @@ class VegaRobotCalibrationAdapter:
             if cancelled.is_set():
                 raise CalibrationCancelled("force calibration cancelled")
             set_phase("RETURNING", f"returning from {stage_id}")
-            self._move_profile(reverse_steps, cancelled)
+            self._move_profile(reverse_steps, commanded, cancelled)
             self._verify_cartesian_return(start_cartesian)
 
     def execute_stage(
