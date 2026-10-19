@@ -22,6 +22,7 @@ from dexcontrol.core.robotenv_vega.vega_force_calibration import (
     VegaForceCalibrationFitInputs,
     VegaForceCalibrationManager,
     VegaRobotCalibrationAdapter,
+    _append_fresh_sample,
     _minimum_jerk_rotation_steps,
 )
 
@@ -1268,6 +1269,65 @@ def test_sample_uses_sensor_timestamp_and_rejects_cross_stream_skew() -> None:
     missing._robot.get_robot_state = lambda: (original_state()[0], {})
     with pytest.raises(RuntimeError, match="robot-state acquisition timestamp"):
         _physical_adapter(missing)._sample()
+
+
+def test_repeated_sensor_frame_is_ignored_but_regression_fails_closed() -> None:
+    samples = []
+
+    def sample(timestamp: float, value: float = 0.0):
+        return (
+            np.full(6, value, dtype=np.float64),
+            np.eye(3, dtype=np.float64),
+            np.zeros(7, dtype=np.float64),
+            timestamp,
+        )
+
+    assert _append_fresh_sample(samples, sample(1.0, 1.0)) is True
+    assert _append_fresh_sample(samples, sample(1.0, 99.0)) is False
+    assert _append_fresh_sample(samples, sample(1.05, 2.0)) is True
+    assert [item[0][0] for item in samples] == [1.0, 2.0]
+
+    with pytest.raises(RuntimeError, match="moved backwards"):
+        _append_fresh_sample(samples, sample(1.04, 3.0))
+
+
+def test_pose_collection_accepts_slower_sensor_without_duplicate_evidence() -> None:
+    adapter = _physical_adapter(_FakeService())
+    adapter._start_joints = np.zeros(7)
+
+    def skip_sleep(_started):
+        return None
+
+    adapter._sleep_tick = skip_sleep
+    sample_index = 0
+
+    def slower_sensor_sample():
+        nonlocal sample_index
+        # The 20 Hz calibration loop observes a 10 Hz sensor frame twice.
+        timestamp = 1.0 + 0.1 * (sample_index // 2)
+        sample_index += 1
+        return (
+            np.full(6, timestamp, dtype=np.float64),
+            np.eye(3, dtype=np.float64),
+            np.zeros(7, dtype=np.float64),
+            timestamp,
+        )
+
+    adapter._sample = slower_sensor_sample
+    phases = []
+    hold = adapter.execute_stage(
+        "pose-0",
+        {"kind": "pose", "rpy_degrees": [0.0, 0.0, 0.0]},
+        threading.Event(),
+        lambda state, _message: phases.append(state),
+    )
+
+    assert hold is not None
+    assert hold.measured_sensor_wrench_samples.shape[0] >= 19
+    assert np.unique(hold.measured_sensor_wrench_samples[:, 0]).size == len(
+        hold.measured_sensor_wrench_samples
+    )
+    assert phases == ["MOVING", "SETTLING", "COLLECTING", "RETURNING"]
 
 
 def test_safe_return_verification_rejects_unreached_joint_target() -> None:

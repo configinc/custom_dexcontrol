@@ -141,7 +141,12 @@ def _settled_tail(
     )
     for index in range(start, len(samples)):
         speed_start = int(
-            np.searchsorted(timestamps, timestamps[index] - SPEED_WINDOW_SECONDS, side="left")
+            np.searchsorted(
+                timestamps,
+                timestamps[index] - SPEED_WINDOW_SECONDS,
+                side="right",
+            )
+            - 1
         )
         speed_start = max(speed_start, window_start)
         span = timestamps[index] - timestamps[speed_start]
@@ -151,6 +156,30 @@ def _settled_tail(
         if float(np.max(joint_range_deg) / span) >= SETTLED_MAX_JOINT_SPEED_DPS:
             raise RuntimeError("calibration hold did not settle before measurement")
     return tuple(samples[start:])
+
+
+def _append_fresh_sample(
+    samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float]],
+    sample: tuple[np.ndarray, np.ndarray, np.ndarray, float],
+) -> bool:
+    """Append a new sensor frame, ignoring a repeated acquisition timestamp.
+
+    The calibration loop may poll faster than the physical F/T publisher. A
+    repeated timestamp is therefore the same atomic measurement, not additional
+    evidence. A backwards timestamp still indicates a broken acquisition epoch
+    and fails closed.
+    """
+    timestamp = float(sample[3])
+    if not np.isfinite(timestamp):
+        raise RuntimeError("calibration timestamp must be finite")
+    if samples:
+        previous = float(samples[-1][3])
+        if timestamp < previous:
+            raise RuntimeError("calibration sensor timestamp moved backwards")
+        if timestamp == previous:
+            return False
+    samples.append(sample)
+    return True
 
 
 @dataclass
@@ -348,7 +377,7 @@ class VegaRobotCalibrationAdapter:
                 if index >= collect_after:
                     if index == collect_after:
                         set_phase("COLLECTING", f"collecting {stage_id}")
-                    samples.append(self._sample())
+                    _append_fresh_sample(samples, self._sample())
                 self._sleep_tick(started)
             settled = _settled_tail(samples)
             raw_samples = np.asarray([item[0] for item in settled], dtype=np.float64)
