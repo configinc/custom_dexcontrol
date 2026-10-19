@@ -341,6 +341,11 @@ class ForceCalibrationLifecycle:
                 command_deadline_timestamp_us=self._deadline_us,
             )
 
+    def invalidate_active_result(self) -> None:
+        """Remove the currently applied cache before a manual recalibration."""
+        with self._lock:
+            _durable_unlink(self.active_cache_path)
+
     def _base_record(
         self,
         *,

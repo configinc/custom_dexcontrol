@@ -77,7 +77,10 @@ def test_force_calibration_rpc_v1_field_numbers() -> None:
             "plan_sha256": 2,
         },
         robotenv_pb2.GetForceCalibrationStatusRequest: {"run_id": 1},
-        robotenv_pb2.CancelForceCalibrationRequest: {"run_id": 1},
+        robotenv_pb2.CancelForceCalibrationRequest: {
+            "run_id": 1,
+            "skip_safe_return": 2,
+        },
         robotenv_pb2.GetForceCalibrationResultRequest: {"run_id": 1},
         robotenv_pb2.ForceCalibrationStatus: {
             "state": 1,

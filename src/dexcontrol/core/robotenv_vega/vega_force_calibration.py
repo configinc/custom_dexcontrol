@@ -32,14 +32,14 @@ LOGGER = logging.getLogger("robotenv_vega.force_calibration")
 
 MAX_ROTATION_SPEED_DPS = 15.0
 POSE_HOLD_SECONDS = 7.0
+START_HOLD_SECONDS = 15.0
+NEUTRAL_RETURN_HOLD_SECONDS = 1.0
 FIT_TAIL_SECONDS = 2.0
 SPEED_WINDOW_SECONDS = 0.5
 SETTLED_MAX_JOINT_SPEED_DPS = 2.5
 REFERENCE_POINT = "physical F/T sensor measurement origin"
 SENSOR_ROBOT_MAX_SKEW_SECONDS = 0.25
 RETURN_MAX_JOINT_ERROR_RAD = np.radians(5.0)
-RETURN_MAX_POSITION_ERROR_M = 0.01
-RETURN_MAX_ROTATION_ERROR_RAD = np.radians(5.0)
 TERMINAL_PERSIST_RETRY_SECONDS = 1.0
 ACTIVE_CALIBRATION_STATES = {
     "READY_FOR_STAGE",
@@ -91,17 +91,23 @@ class CalibrationAdapter(Protocol):
 
     def safe_return(self, cancelled: threading.Event | None = None) -> None: ...
 
+    def normal_return(self, cancelled: threading.Event | None = None) -> None: ...
+
     def fit(self, holds: Sequence[WristFtCalibrationHold]) -> WristFtCalibrationParameters: ...
 
     def prepare_install(self, parameters: WristFtCalibrationParameters | None) -> Any: ...
 
-    def install_prepared(self, prepared: Any) -> None: ...
+    def install_prepared(
+        self, prepared: Any, *, expires_at_timestamp_us: int | None = None
+    ) -> None: ...
 
     def commit_install(
         self,
         prepared: Any,
         commit: Callable[[], CalibrationStatusSnapshot],
         install_if: Callable[[], bool],
+        *,
+        expires_at_timestamp_us: int,
     ) -> CalibrationStatusSnapshot: ...
 
 
@@ -126,60 +132,71 @@ def _minimum_jerk_rotation_steps(
 def _settled_tail(
     samples: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray, float]],
 ) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray, float], ...]:
-    if len(samples) < 2:
-        raise RuntimeError("calibration hold contains too few samples")
+    """Return the latest two-second settled interval from the complete hold."""
+    if not samples:
+        raise RuntimeError("calibration hold contains no samples")
     timestamps = np.asarray([item[3] for item in samples], dtype=np.float64)
     joints = np.asarray([item[2] for item in samples], dtype=np.float64)
-    if not np.isfinite(timestamps).all() or np.any(np.diff(timestamps) <= 0):
-        raise RuntimeError("calibration timestamps must be finite and strictly increasing")
-    end = float(timestamps[-1])
-    start = int(np.searchsorted(timestamps, end - FIT_TAIL_SECONDS, side="left"))
-    if start >= len(samples) - 1 or end - float(timestamps[start]) < FIT_TAIL_SECONDS * 0.9:
-        raise RuntimeError("calibration hold did not contain two seconds of fresh samples")
-    window_start = int(
-        np.searchsorted(timestamps, end - FIT_TAIL_SECONDS - SPEED_WINDOW_SECONDS, side="left")
+    if not np.all(np.isfinite(timestamps)):
+        raise RuntimeError("calibration hold timestamps contain a non-finite value")
+    timestamp_deltas = np.diff(timestamps)
+    invalid = np.flatnonzero(timestamp_deltas <= 0)
+    if invalid.size:
+        index = int(invalid[0] + 1)
+        raise RuntimeError(
+            "calibration hold timestamps are not strictly increasing "
+            f"(sample_index={index}, previous={timestamps[index - 1]:.9f}s, "
+            f"current={timestamps[index]:.9f}s, delta={timestamp_deltas[index - 1]:.9f}s)"
+        )
+    span_epsilon = max(
+        1e-9,
+        np.finfo(np.float64).eps * float(np.max(np.abs(timestamps))),
     )
-    for index in range(start, len(samples)):
+    settled = np.zeros(len(samples), dtype=bool)
+    speeds_dps = np.full(len(samples), np.nan, dtype=np.float64)
+    for index, timestamp in enumerate(timestamps):
         speed_start = int(
-            np.searchsorted(
-                timestamps,
-                timestamps[index] - SPEED_WINDOW_SECONDS,
-                side="right",
-            )
+            np.searchsorted(timestamps, timestamp - SPEED_WINDOW_SECONDS, side="right")
             - 1
         )
-        speed_start = max(speed_start, window_start)
-        span = timestamps[index] - timestamps[speed_start]
-        if span < SPEED_WINDOW_SECONDS * 0.9:
-            raise RuntimeError("calibration hold lacks a full joint-speed window")
+        if speed_start < 0 or speed_start >= index:
+            continue
+        span = timestamp - timestamps[speed_start]
+        if span < SPEED_WINDOW_SECONDS:
+            continue
         joint_range_deg = np.degrees(np.ptp(joints[speed_start : index + 1], axis=0))
-        if float(np.max(joint_range_deg) / span) >= SETTLED_MAX_JOINT_SPEED_DPS:
-            raise RuntimeError("calibration hold did not settle before measurement")
-    return tuple(samples[start:])
-
-
-def _append_fresh_sample(
-    samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float]],
-    sample: tuple[np.ndarray, np.ndarray, np.ndarray, float],
-) -> bool:
-    """Append a new sensor frame, ignoring a repeated acquisition timestamp.
-
-    The calibration loop may poll faster than the physical F/T publisher. A
-    repeated timestamp is therefore the same atomic measurement, not additional
-    evidence. A backwards timestamp still indicates a broken acquisition epoch
-    and fails closed.
-    """
-    timestamp = float(sample[3])
-    if not np.isfinite(timestamp):
-        raise RuntimeError("calibration timestamp must be finite")
-    if samples:
-        previous = float(samples[-1][3])
-        if timestamp < previous:
-            raise RuntimeError("calibration sensor timestamp moved backwards")
-        if timestamp == previous:
-            return False
-    samples.append(sample)
-    return True
+        speed = float(np.max(joint_range_deg) / span)
+        speeds_dps[index] = speed
+        settled[index] = speed < SETTLED_MAX_JOINT_SPEED_DPS
+    edges = np.flatnonzero(np.diff(np.r_[False, settled, False].astype(np.int8)))
+    runs = list(zip(edges[::2], edges[1::2], strict=True))
+    spans = [timestamps[end - 1] - timestamps[start] for start, end in runs]
+    qualifying = [
+        (start, end)
+        for (start, end), span in zip(runs, spans, strict=True)
+        if span >= FIT_TAIL_SECONDS - span_epsilon
+    ]
+    if not qualifying:
+        finite_speeds = speeds_dps[np.isfinite(speeds_dps)]
+        maximum_speed = (
+            float(np.max(finite_speeds)) if finite_speeds.size else float("nan")
+        )
+        raise RuntimeError(
+            "calibration hold did not contain two continuous settled seconds "
+            f"(samples={len(samples)}, duration={timestamps[-1] - timestamps[0]:.2f}s, "
+            f"max_joint_speed={maximum_speed:.3f}deg/s, "
+            f"best_settled_span={max(spans, default=0.0):.2f}s, "
+            f"threshold={SETTLED_MAX_JOINT_SPEED_DPS:.3f}deg/s)"
+        )
+    run_start, run_end = qualifying[-1]
+    run_end_timestamp = timestamps[run_end - 1]
+    tail_start = int(
+        np.searchsorted(
+            timestamps, run_end_timestamp - FIT_TAIL_SECONDS, side="right"
+        )
+        - 1
+    )
+    return tuple(samples[max(tail_start, run_start) : run_end])
 
 
 @dataclass
@@ -238,18 +255,22 @@ class VegaRobotCalibrationAdapter:
         )
 
     def _command_cartesian_error(self, cartesian_error: np.ndarray) -> None:
+        from dexcontrol.core.vega.robot import (
+            _TELEOP_POS_ACTION_GAIN,
+            _TELEOP_ROT_ACTION_GAIN,
+        )
+
         action = np.r_[
             np.asarray(cartesian_error, dtype=np.float64), self._gripper_position
         ]
         if self.service.R_world_to_robot is not None:
             action[:3] = self.service.R_world_to_robot @ action[:3]
-            delta_world = Rotation.from_euler("xyz", action[3:6]).as_matrix()
-            delta_robot = (
-                self.service.R_world_to_robot
-                @ delta_world
-                @ self.service.R_robot_to_world
-            )
-            action[3:6] = Rotation.from_matrix(delta_robot).as_euler("xyz")
+            # Preserve the deployed Step path exactly: its small RPY delta is
+            # treated as a three-vector and rotated into the robot frame.
+            action[3:6] = self.service.R_world_to_robot @ action[3:6]
+        action[:3] *= _TELEOP_POS_ACTION_GAIN
+        action[3:6] *= _TELEOP_ROT_ACTION_GAIN
+        action = self.service._cartesian_velocity_to_delta(action)
         self.service._robot.update_command(
             action,
             action_space="cartesian_delta",
@@ -289,6 +310,18 @@ class VegaRobotCalibrationAdapter:
             self._sleep_tick(started)
         return target
 
+    def _hold_cartesian_target(
+        self,
+        target: np.ndarray,
+        seconds: float,
+        cancelled: threading.Event,
+    ) -> None:
+        for _ in range(max(1, round(seconds * self.service.control_hz))):
+            self._check_cancelled(cancelled)
+            started = time.perf_counter()
+            self._command_cartesian_target(target)
+            self._sleep_tick(started)
+
     def _sample(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         state, timestamps = self.service._robot.get_robot_state()
         cartesian = np.asarray(state["cartesian_position"], dtype=np.float64)
@@ -317,7 +350,7 @@ class VegaRobotCalibrationAdapter:
         robot_timestamp = robot_timestamp_us * 1e-6
         if abs(sensor_timestamp - robot_timestamp) > SENSOR_ROBOT_MAX_SKEW_SECONDS:
             raise RuntimeError("Vega wrench and robot-state samples are not time aligned")
-        return wrench, world_from_sensor, joints, sensor_timestamp
+        return wrench, world_from_sensor, joints, robot_timestamp
 
     def _current_cartesian(self) -> np.ndarray:
         state, _ = self.service._robot.get_robot_state()
@@ -336,17 +369,6 @@ class VegaRobotCalibrationAdapter:
         if error > RETURN_MAX_JOINT_ERROR_RAD:
             raise RuntimeError(f"Vega safe return joint error is {error:.4f} rad")
 
-    def _verify_cartesian_return(self, target: np.ndarray) -> None:
-        actual = self._current_cartesian()
-        position_error = float(np.linalg.norm(actual[:3] - target[:3]))
-        rotation_error = float(
-            (Rotation.from_euler("xyz", actual[3:]) * Rotation.from_euler("xyz", target[3:]).inv()).magnitude()
-        )
-        if position_error > RETURN_MAX_POSITION_ERROR_M:
-            raise RuntimeError(f"Vega pose return position error is {position_error:.4f} m")
-        if rotation_error > RETURN_MAX_ROTATION_ERROR_RAD:
-            raise RuntimeError(f"Vega pose return rotation error is {rotation_error:.4f} rad")
-
     def _prepare(self, payload: Mapping[str, Any], cancelled: threading.Event) -> None:
         joints = np.asarray(payload.get("start_joints"), dtype=np.float64)
         if joints.shape != (7,) or not np.isfinite(joints).all():
@@ -362,6 +384,11 @@ class VegaRobotCalibrationAdapter:
         if gripper.size != 1 or not np.isfinite(gripper[0]):
             raise RuntimeError("Vega RobotiQ gripper position is unavailable")
         self._gripper_position = float(gripper[0])
+        # Preserve the legacy sequence's 15-second active neutral hold after
+        # the reset and before the first calibration pose.
+        self._hold_cartesian_target(
+            self._current_cartesian(), START_HOLD_SECONDS, cancelled
+        )
 
     def _pose(
         self,
@@ -385,19 +412,26 @@ class VegaRobotCalibrationAdapter:
         try:
             set_phase("SETTLING", f"settling at {stage_id}")
             count = max(1, round(POSE_HOLD_SECONDS * self.service.control_hz))
-            collect_after = max(
-                0,
-                count - round((FIT_TAIL_SECONDS + SPEED_WINDOW_SECONDS) * self.service.control_hz),
-            )
+            settled = None
             for index in range(count):
                 self._check_cancelled(cancelled)
                 started = time.perf_counter()
                 self._command_cartesian_target(commanded)
-                if index == collect_after:
+                samples.append(self._sample())
+                try:
+                    settled = _settled_tail(samples)
+                except RuntimeError as exc:
+                    if "did not contain two continuous settled seconds" not in str(exc):
+                        raise
+                else:
                     set_phase("COLLECTING", f"collecting {stage_id}")
-                _append_fresh_sample(samples, self._sample())
+                    # The legacy loop completed the current control tick before
+                    # starting the reverse profile, even on early settlement.
+                    self._sleep_tick(started)
+                    break
                 self._sleep_tick(started)
-            settled = _settled_tail(samples)
+            if settled is None:
+                settled = _settled_tail(samples)
             raw_samples = np.asarray([item[0] for item in settled], dtype=np.float64)
             rotation = Rotation.from_matrix([item[1] for item in settled]).mean().as_matrix()
             return WristFtCalibrationHold(
@@ -410,8 +444,10 @@ class VegaRobotCalibrationAdapter:
             if cancelled.is_set():
                 raise CalibrationCancelled("force calibration cancelled")
             set_phase("RETURNING", f"returning from {stage_id}")
-            self._move_profile(reverse_steps, commanded, cancelled)
-            self._verify_cartesian_return(start_cartesian)
+            neutral_target = self._move_profile(reverse_steps, commanded, cancelled)
+            self._hold_cartesian_target(
+                neutral_target, NEUTRAL_RETURN_HOLD_SECONDS, cancelled
+            )
 
     def execute_stage(
         self,
@@ -443,6 +479,18 @@ class VegaRobotCalibrationAdapter:
             )
             self._verify_joint_return(self._start_joints)
 
+    def normal_return(self, cancelled: threading.Event | None = None) -> None:
+        """Return to the configured inference/reset pose after a successful fit."""
+        safe_cancel = threading.Event() if cancelled is None else cancelled
+        with self.service._cmd_lock:
+            self.service._execute_reset_sequence(
+                self.service.reset_joints,
+                cancelled=safe_cancel,
+                interruptible_gripper=True,
+            )
+            self._check_cancelled(safe_cancel)
+            self._verify_joint_return(self.service.reset_joints)
+
     def fit(self, holds: Sequence[WristFtCalibrationHold]) -> WristFtCalibrationParameters:
         return fit_wrist_ft_calibration(
             holds,
@@ -460,20 +508,33 @@ class VegaRobotCalibrationAdapter:
     ) -> WristFtCalibrationApplier | None:
         return None if parameters is None else WristFtCalibrationApplier(parameters)
 
-    def install_prepared(self, prepared: WristFtCalibrationApplier | None) -> None:
-        self.service._set_force_calibration_applier(prepared)
+    def install_prepared(
+        self,
+        prepared: WristFtCalibrationApplier | None,
+        *,
+        expires_at_timestamp_us: int | None = None,
+    ) -> None:
+        self.service._set_force_calibration_applier(
+            prepared,
+            expires_at_timestamp_us=expires_at_timestamp_us,
+        )
 
     def commit_install(
         self,
         prepared: WristFtCalibrationApplier | None,
         commit: Callable[[], CalibrationStatusSnapshot],
         install_if: Callable[[], bool],
+        *,
+        expires_at_timestamp_us: int,
     ) -> CalibrationStatusSnapshot:
         """Publish runtime state and durable success as one observable transition."""
         with self.service._force_calibration_applier_lock:
             status = commit()
             if install_if():
                 self.service._force_calibration_applier = prepared
+                self.service._force_calibration_expires_at_timestamp_us = int(
+                    expires_at_timestamp_us
+                )
             return status
 
 
@@ -497,6 +558,7 @@ class VegaForceCalibrationManager:
         self._deadline_timer: threading.Timer | None = None
         self._terminal_retry_timer: threading.Timer | None = None
         self._cancelled = threading.Event()
+        self._cancel_safe_return = True
         self._holds: list[WristFtCalibrationHold] = []
         self._candidate: WristFtCalibrationParameters | None = None
         self._pending_terminal: tuple[str, str | None] | None = None
@@ -607,8 +669,7 @@ class VegaForceCalibrationManager:
                 )
             result = self.lifecycle.get_result("")
             if result.get("available"):
-                parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
-                self.adapter.install_prepared(self.adapter.prepare_install(parameters))
+                self._install_result_snapshot(result)
         except BaseException:
             if result.get("available") and result.get("run_id"):
                 self._runtime_install_pending_run_id = str(result["run_id"])
@@ -712,7 +773,14 @@ class VegaForceCalibrationManager:
                 status = self.lifecycle.start(
                     run_id, force_recalibrate=force_recalibrate
                 )
+                if force_recalibrate and status.state != "SUCCEEDED":
+                    self.lifecycle.invalidate_active_result()
+                    self.adapter.install_prepared(
+                        None, expires_at_timestamp_us=1
+                    )
+                    self._runtime_install_pending_run_id = None
                 self._cancelled = threading.Event()
+                self._cancel_safe_return = True
                 self._holds = []
                 self._candidate = None
                 self._pending_terminal = None
@@ -796,6 +864,12 @@ class VegaForceCalibrationManager:
                 parameters = self.adapter.fit(tuple(self._holds))
                 if self._cancelled.is_set():
                     raise CalibrationCancelled("force calibration cancelled")
+                # Legacy behavior returns to the normal configured pose only
+                # after fit/quality validation succeeds. Failures still use the
+                # calibration-start safe return in the exception path below.
+                self.adapter.normal_return(self._cancelled)
+                if self._cancelled.is_set():
+                    raise CalibrationCancelled("force calibration cancelled")
                 self._candidate = parameters
                 with self._lock:
                     if self._cancelled.is_set():
@@ -838,12 +912,15 @@ class VegaForceCalibrationManager:
                 return
         message = "force calibration cancelled"
         return_failed = False
-        try:
-            self.adapter.safe_return()
-        except BaseException as exc:
-            detail = str(exc).strip() or type(exc).__name__
-            message = f"force calibration cancelled; safe return failed: {detail}"
-            return_failed = True
+        with self._lock:
+            safe_return = self._cancel_safe_return
+        if safe_return:
+            try:
+                self.adapter.safe_return()
+            except BaseException as exc:
+                detail = str(exc).strip() or type(exc).__name__
+                message = f"force calibration cancelled; safe return failed: {detail}"
+                return_failed = True
         with self._lock:
             self._pending_terminal = (
                 run_id,
@@ -851,8 +928,11 @@ class VegaForceCalibrationManager:
             )
             self._persist_pending_terminal_locked()
 
-    def request_cancel(self, run_id: str) -> CalibrationStatusSnapshot:
+    def request_cancel(
+        self, run_id: str, *, safe_return: bool = True
+    ) -> CalibrationStatusSnapshot:
         with self._lock:
+            self._cancel_safe_return = self._cancel_safe_return and bool(safe_return)
             try:
                 status = self.lifecycle.request_cancel(run_id)
             except BaseException:
@@ -899,7 +979,10 @@ class VegaForceCalibrationManager:
 
     def _install_result_snapshot(self, result: Mapping[str, Any]) -> None:
         parameters = wrist_ft_calibration_from_snapshot(result["parameters"])
-        self.adapter.install_prepared(self.adapter.prepare_install(parameters))
+        self.adapter.install_prepared(
+            self.adapter.prepare_install(parameters),
+            expires_at_timestamp_us=int(result["expires_at_timestamp_us"]),
+        )
 
     def _install_current_result_if_available(self, run_id: str) -> bool:
         result = self.lifecycle.get_result("")
@@ -961,6 +1044,9 @@ class VegaForceCalibrationManager:
                     prepared,
                     commit_or_repair,
                     lambda: self._current_result_matches(run_id),
+                    expires_at_timestamp_us=int(
+                        record["expires_at_timestamp_us"]
+                    ),
                 )
             except BaseException:
                 if self.lifecycle.status().state == "SUCCEEDED":

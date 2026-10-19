@@ -221,6 +221,7 @@ def test_observation_publishes_both_calibrated_frames_only_with_active_applier()
     service = _service()
     service._force_calibration_applier_lock = threading.Lock()
     service._force_calibration_applier = Applier()
+    service._force_calibration_expires_at_timestamp_us = 2**63 - 1
     service._robot = SimpleNamespace(
         get_robot_state=lambda: (state, {"robot_timestamp_us": 123}),
         arm=SimpleNamespace(
@@ -242,6 +243,12 @@ def test_observation_publishes_both_calibrated_frames_only_with_active_applier()
         observation["external_wrench_wrist_reference_point"].string_value
         == "configured TCP anchor (rotation only)"
     )
+
+    service._force_calibration_expires_at_timestamp_us = 1
+    expired_observation, _ = service._create_observation()
+    assert "external_wrench_wrist" not in expired_observation
+    assert "external_wrench_world" not in expired_observation
+    assert service._force_calibration_applier is None
 
 
 def test_misaligned_sample_keeps_raw_but_omits_pose_dependent_wrench() -> None:

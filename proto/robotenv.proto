@@ -144,6 +144,9 @@ message CancelForceCalibrationRequest {
     // is NOT_FOUND. After CANCELLING no new pose may start; terminal states do
     // not transition back to a non-terminal state.
     string run_id = 1;
+    // Emergency reset owns robot recovery and must suppress the calibration
+    // worker's competing safe return.  False preserves legacy client behavior.
+    bool skip_safe_return = 2;
 }
 
 message GetForceCalibrationResultRequest {

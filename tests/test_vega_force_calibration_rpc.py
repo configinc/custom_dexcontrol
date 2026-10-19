@@ -70,8 +70,8 @@ class Manager:
         self.calls.append(("status", run_id))
         return _status()
 
-    def request_cancel(self, run_id):
-        self.calls.append(("cancel", run_id))
+    def request_cancel(self, run_id, *, safe_return=True):
+        self.calls.append(("cancel", run_id, safe_return))
         return _status("CANCELLING")
 
     def result(self, run_id):

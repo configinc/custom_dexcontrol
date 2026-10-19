@@ -428,6 +428,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self._command_recovery_error = ""
             self._force_calibration_applier_lock = threading.Lock()
             self._force_calibration_applier = None
+            self._force_calibration_expires_at_timestamp_us = 0
             self._command_epoch = 0
             self._reset_in_progress = threading.Event()
             self._reset_state_lock = threading.Lock()
@@ -717,9 +718,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             self._command_recovery_required.set()
             raise
 
-    def _set_force_calibration_applier(self, applier) -> None:
+    def _set_force_calibration_applier(
+        self, applier, *, expires_at_timestamp_us: int | None = None
+    ) -> None:
         with self._force_calibration_applier_lock:
             self._force_calibration_applier = applier
+            if expires_at_timestamp_us is not None:
+                self._force_calibration_expires_at_timestamp_us = int(
+                    expires_at_timestamp_us
+                )
 
     def _reject_if_shutting_down(self, context) -> bool:
         shutting_down = getattr(self, "_shutdown_started", None)
@@ -1144,7 +1151,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             context.set_details("unknown calibration run_id")
             return robotenv_pb2.ForceCalibrationStatus()
         try:
-            status = self._force_calibration_manager.request_cancel(request.run_id)
+            status = self._force_calibration_manager.request_cancel(
+                request.run_id,
+                safe_return=not request.skip_safe_return,
+            )
             return self._force_calibration_status_proto(status)
         except BaseException as exc:
             LOGGER.exception("CancelForceCalibration failed: %s", exc)
@@ -1865,6 +1875,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     )
                     with applier_lock if applier_lock is not None else nullcontext():
                         applier = getattr(self, "_force_calibration_applier", None)
+                        expires_at_us = getattr(
+                            self, "_force_calibration_expires_at_timestamp_us", 0
+                        )
+                        if (
+                            applier is not None
+                            and expires_at_us > 0
+                            and int(time.time() * 1_000_000) >= expires_at_us
+                        ):
+                            self._force_calibration_applier = None
+                            applier = None
                         if applier is not None:
                             try:
                                 wrist_wrench = (
