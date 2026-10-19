@@ -380,7 +380,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             ema_alpha=normalized_ema_alpha,
             interpolation_method=interpolation_method,
             interpolation_history=normalized_interpolation_history,
-            interpolation_control_hz=interpolation_tick_hz,
             filter_type=filter_type,
             filter_cutoff_freq=normalized_filter_cutoff_freq,
             filter_order=normalized_filter_order,
@@ -485,15 +484,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             else:
                 LOGGER.info("Smoothing: disabled (alpha=0.0)")
 
-            # Startup is deliberately motionless.  A single arm may restart while
-            # its peer is still in a coordinated calibration pose; moving here
-            # would bypass the bilateral RCI barrier.  The coordinator performs an
-            # explicit paired Reset before teleoperation or recalibration.
-            LOGGER.info(
-                "Startup leaves arm at its measured pose; waiting for an explicit "
-                "coordinated Reset (arm=%s)",
-                arm_side,
-            )
+            # Preserve the production startup behavior. Calibration is layered
+            # on top of the existing controller and does not redefine startup.
+            LOGGER.info("Moving to init position on startup (arm=%s)", arm_side)
+            self._execute_reset_sequence(self.reset_joints)
 
             # Fetch and cache robot firmware version once at startup.
             self._firmware_version = self._fetch_firmware_version()
@@ -583,11 +577,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     def _start_control_loop(self) -> None:
         """Start the background control-loop thread."""
         if self._control_loop_thread is not None:
-            if self._control_loop_thread.is_alive():
-                if self._control_loop_stop.is_set():
-                    raise RuntimeError("Vega control loop is still stopping")
-                return
-            self._control_loop_thread = None
+            return
         self._control_loop_stop.clear()
         self._control_loop_thread = threading.Thread(
             target=self._control_loop_run,
@@ -599,11 +589,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     def _stop_control_loop(self) -> None:
         """Stop the background control-loop thread."""
         self._control_loop_stop.set()
-        thread = self._control_loop_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
-            if thread.is_alive():
-                raise RuntimeError("Vega control loop did not stop within 2 seconds")
+        if self._control_loop_thread is not None and self._control_loop_thread.is_alive():
+            self._control_loop_thread.join(timeout=2.0)
         self._control_loop_thread = None
 
     def _control_loop_run(self) -> None:
@@ -612,39 +599,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         LOGGER.info("Control loop running at %d Hz", self._control_loop_hz)
         while not self._control_loop_stop.is_set():
             t0 = time.perf_counter()
-            dispatch_error = None
             try:
-                if (
-                    not self._reset_in_progress.is_set()
-                    and not self._force_calibration_owns_robot.is_set()
-                    and not self._command_recovery_required.is_set()
-                    and self._cmd_lock.acquire(blocking=False)
-                ):
-                    try:
-                        # Recheck after acquiring the same admission gate used
-                        # by Step. A physical failure publishes the recovery
-                        # latch before this gate is released, so no later Step
-                        # can queue work in the failure window.
-                        if (
-                            not self._reset_in_progress.is_set()
-                            and not self._force_calibration_owns_robot.is_set()
-                            and not self._command_recovery_required.is_set()
-                        ):
-                            self._robot.execute_interpolated_tick()
-                    except Exception as exc:
-                        dispatch_error = exc
-                        self._command_recovery_error = (
-                            f"interpolated dispatch failed: {exc}"
-                        )
-                        self._command_recovery_required.set()
-                    finally:
-                        self._cmd_lock.release()
+                if not self._reset_in_progress.is_set():
+                    self._robot.execute_interpolated_tick()
             except Exception as exc:
-                dispatch_error = exc
-                self._command_recovery_error = f"control loop failed: {exc}"
-                self._command_recovery_required.set()
-            if dispatch_error is not None:
-                LOGGER.error("Control loop tick error: %s", dispatch_error)
+                LOGGER.error("Control loop tick error: %s", exc)
             elapsed = time.perf_counter() - t0
             sleep_time = dt - elapsed
             if sleep_time > 0:
@@ -652,10 +611,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
     def _claim_robot_for_force_calibration(self) -> bool:
         with self._force_calibration_owner_lock:
-            if (
-                self._shutdown_started.is_set()
-                or self._command_recovery_required.is_set()
-            ):
+            if self._shutdown_started.is_set():
                 return False
             if self._force_calibration_owns_robot.is_set() or self._reset_in_progress.is_set():
                 return False
@@ -668,8 +624,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             try:
                 if self._reset_in_progress.is_set():
                     return False
-                with self._command_epoch_lock:
-                    self._command_epoch += 1
                 self._force_calibration_restart_control_loop = bool(
                     self._control_loop_thread is not None
                 )
@@ -680,19 +634,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                         self._force_calibration_restart_control_loop = False
                         self._force_calibration_owns_robot.clear()
                         raise
-                # Calibration takes over the same physical command path. No
-                # Step-era arm target or asynchronous gripper command may
-                # survive the ownership transition.
-                try:
-                    self._reset_robot_command_state()
-                except BaseException:
-                    if self._force_calibration_restart_control_loop:
-                        self._start_control_loop()
-                        self._force_calibration_restart_control_loop = False
-                    raise
-                # Publish ownership only after the old command path is fully
-                # stopped and drained. Until this point a failed acquisition
-                # remains a normal, rollback-safe failed claim.
                 self._force_calibration_owns_robot.set()
                 return True
             finally:
@@ -700,28 +641,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
     def _release_robot_from_force_calibration(self) -> None:
         with self._force_calibration_owner_lock:
-            # Calibration motion ends at a measured safe return. Discard all
-            # calibration-era buffers before normal Step dispatch can resume.
-            self._reset_robot_command_state()
             restart_control_loop = bool(
                 getattr(self, "_force_calibration_restart_control_loop", False)
             )
+            self._force_calibration_owns_robot.clear()
             if restart_control_loop:
                 if not self._shutdown_started.is_set():
-                    # Start while ownership is still asserted. The new loop
-                    # cannot dispatch until every release phase has succeeded.
                     self._start_control_loop()
                 self._force_calibration_restart_control_loop = False
-            self._force_calibration_owns_robot.clear()
-
-    def _reset_robot_command_state(self) -> None:
-        """Attempt one retry-safe command drain and latch failures closed."""
-        try:
-            self._robot.reset_command_state()
-        except BaseException:
-            self._command_recovery_error = "command-boundary recovery failed"
-            self._command_recovery_required.set()
-            raise
 
     def _set_force_calibration_applier(
         self, applier, *, expires_at_timestamp_us: int | None = None
@@ -1209,28 +1136,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
     @_track_transport_rpc(robotenv_pb2.ResetResponse)
     def Reset(self, request, context):
-        if self._reject_if_shutting_down(context):
-            return robotenv_pb2.ResetResponse()
+        if self._force_calibration_owns_robot.is_set():
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details("force calibration owns robot commands")
+            return robotenv_pb2.ResetResponse(
+                status="BUSY", message="force calibration owns robot commands"
+            )
         mode = request.mode or "home"
         LOGGER.info("Reset requested: mode=%s arm=%s", mode, self.arm_side)
-        calibration_owner = getattr(self, "_force_calibration_owns_robot", None)
-        if (
-            mode == "current"
-            and calibration_owner is not None
-            and calibration_owner.is_set()
-        ):
-            try:
-                observation, timestamp_us = self._create_observation()
-                return robotenv_pb2.ResetResponse(
-                    observation=observation,
-                    status="SUCCESS",
-                    message="Reset to current",
-                    timestamp_us=timestamp_us,
-                )
-            except Exception as exc:
-                context.set_code(grpc.StatusCode.INTERNAL)
-                context.set_details(f"Reset failed: {exc}")
-                return robotenv_pb2.ResetResponse()
         rpc_cancelled = threading.Event()
         motion_cancelled = threading.Event()
 
@@ -1245,31 +1158,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         # reset cancels the previous reset's local motion loop, while the
         # shared in-progress event stays set until every superseded handler has
         # unwound.
-        owner_guard = getattr(self, "_force_calibration_owner_lock", None)
-        with owner_guard if owner_guard is not None else nullcontext():
-            calibration_owner = getattr(self, "_force_calibration_owns_robot", None)
-            if (
-                mode != "current"
-                and calibration_owner is not None
-                and calibration_owner.is_set()
-            ):
-                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-                context.set_details("force calibration owns the robot command path")
-                return robotenv_pb2.ResetResponse()
-            with self._reset_state_lock:
-                if self._active_reset_cancel is not None:
-                    self._active_reset_cancel.set()
-                self._active_reset_cancel = motion_cancelled
-                self._active_reset_count += 1
-                self._reset_in_progress.set()
-                with self._command_epoch_lock:
-                    self._command_epoch += 1
+        with self._reset_state_lock:
+            if self._active_reset_cancel is not None:
+                self._active_reset_cancel.set()
+            self._active_reset_cancel = motion_cancelled
+            self._active_reset_count += 1
+            self._reset_in_progress.set()
+            with self._command_epoch_lock:
+                self._command_epoch += 1
 
         was_running = False
         try:
             with self._cmd_lock:
-                if self._shutdown_started.is_set():
-                    raise RuntimeError("Reset was cancelled because the robot server is shutting down")
                 if motion_cancelled.is_set():
                     raise RuntimeError("Reset was cancelled before robot motion started")
                 calibration_cancellable = bool(
@@ -1281,10 +1181,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     with self._reset_state_lock:
                         self._reset_restart_control_loop = True
                     self._stop_control_loop()
-                # Every Reset mode, including the read-current mode, is an
-                # episode command boundary. Drain the async gripper queue and
-                # discard interpolation/feedforward state before proceeding.
-                self._reset_robot_command_state()
                 if mode == "home":
                     target_joints = self.reset_joints
                     self._execute_reset_sequence(
@@ -1315,11 +1211,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 if motion_cancelled.is_set():
                     raise RuntimeError("Reset was cancelled during robot motion")
 
-                # Prove every asynchronous hand command issued by the reset
-                # has drained, obtain a fresh measured hold, and clear adapter
-                # sticky failures before the Reset success can be committed.
-                self._reset_robot_command_state()
-
                 observation, timestamp_us = self._create_observation()
                 # Linearize success against registration of a newer Reset.
                 # A newer owner either sets our cancellation event before
@@ -1331,25 +1222,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                         or self._active_reset_cancel is not motion_cancelled
                     ):
                         raise RuntimeError("Reset was superseded before its response was committed")
-                    # Clear the old server-side interlock *before* the final
-                    # worker-health sample.  Nothing after that sample may
-                    # erase a newly registered asynchronous failure: a fault
-                    # before the sample is rejected here, while a fault after
-                    # it is a new post-Reset event retained by the worker's
-                    # sticky state for the next Step/Health check.
-                    self._command_recovery_error = ""
-                    self._command_recovery_required.clear()
-                    hand_health = getattr(
-                        self._robot, "hand_command_path_healthy", lambda: True
-                    )
-                    if not hand_health():
-                        self._command_recovery_error = (
-                            "hand command path failed before Reset response commit"
-                        )
-                        self._command_recovery_required.set()
-                        raise RuntimeError(
-                            self._command_recovery_error
-                        )
                     return robotenv_pb2.ResetResponse(
                         observation=observation,
                         status="SUCCESS",
@@ -1358,29 +1230,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     )
         except Exception as exc:
             LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
-            with self._reset_state_lock:
-                superseded_by_newer_reset = bool(
-                    motion_cancelled.is_set()
-                    and self._active_reset_cancel is not motion_cancelled
-                )
-            if not superseded_by_newer_reset:
-                self._command_recovery_error = f"Reset did not complete safely: {exc}"
-                self._command_recovery_required.set()
-            # A cancellable reset may have queued a nonblocking hand-open
-            # command before cancellation arrived. Reacquire the command
-            # boundary and drain reset-era arm/hand work before returning or
-            # allowing the interpolation loop to restart.
-            cleanup_error = None
-            try:
-                with self._cmd_lock:
-                    self._reset_robot_command_state()
-            except BaseException as drain_exc:  # fail closed via recovery latch
-                cleanup_error = drain_exc
-                LOGGER.exception(
-                    "Reset command-boundary cleanup failed; Step remains "
-                    "interlocked until a successful Reset: %s",
-                    drain_exc,
-                )
             if rpc_cancelled.is_set():
                 pass
             elif motion_cancelled.is_set():
@@ -1388,10 +1237,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 context.set_details("Reset was superseded by a newer reset request")
             else:
                 context.set_code(grpc.StatusCode.INTERNAL)
-                details = f"Reset failed: {exc}"
-                if cleanup_error is not None:
-                    details += f"; command recovery required: {cleanup_error}"
-                context.set_details(details)
+                context.set_details(f"Reset failed: {exc}")
             return robotenv_pb2.ResetResponse()
         finally:
             restart_control_loop = False
@@ -1403,34 +1249,17 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     self._reset_in_progress.clear()
                     restart_control_loop = self._reset_restart_control_loop
                     self._reset_restart_control_loop = False
-            if (
-                restart_control_loop
-                and not self._shutdown_started.is_set()
-                and not self._command_recovery_required.is_set()
-            ):
-                try:
-                    self._start_control_loop()
-                except RuntimeError:
-                    # A timed-out old loop still owns the handle.  Keep the
-                    # restart intent so the next Step can recover after it exits.
-                    with self._reset_state_lock:
-                        self._reset_restart_control_loop = True
+            if restart_control_loop:
+                self._start_control_loop()
 
     @_track_transport_rpc(robotenv_pb2.StepResponse)
     def Step(self, request, context):
-        if self._reject_if_shutting_down(context):
-            return robotenv_pb2.StepResponse()
-        calibration_owner = getattr(self, "_force_calibration_owns_robot", None)
-        if calibration_owner is not None and calibration_owner.is_set():
+        if self._force_calibration_owns_robot.is_set():
             context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-            context.set_details("force calibration owns the robot command path")
-            return robotenv_pb2.StepResponse()
-        if self._command_recovery_required.is_set():
-            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-            context.set_details(
-                "robot command recovery is required; run Reset before Step"
+            context.set_details("force calibration owns robot commands")
+            return robotenv_pb2.StepResponse(
+                status="BUSY", message="force calibration owns robot commands"
             )
-            return robotenv_pb2.StepResponse()
         rpc_cancelled = threading.Event()
         if hasattr(context, "add_callback") and not context.add_callback(rpc_cancelled.set):
             rpc_cancelled.set()
@@ -1601,76 +1430,29 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 or reset_superseded_command
                 or reset_active_at_entry
                 or (rpc_cancelled is not None and rpc_cancelled.is_set())
-                or (
-                    getattr(self, "_force_calibration_owns_robot", None) is not None
-                    and self._force_calibration_owns_robot.is_set()
-                )
-                or self._shutdown_started.is_set()
-                or self._command_recovery_required.is_set()
             ):
-                raise RuntimeError(
-                    "Step was superseded by reset, force calibration, or shutdown"
-                )
-            hand_health = getattr(
-                self._robot, "hand_command_path_healthy", lambda: True
-            )
-            if not hand_health():
-                self._command_recovery_error = (
-                    "previous asynchronous hand dispatch failed"
-                )
-                self._command_recovery_required.set()
-                raise CommunicationFailedError(self._command_recovery_error)
+                raise RuntimeError("Step was superseded by robot reset")
             if self._robot.interpolation_enabled and self._control_loop_hz > 0:
-                if self._control_loop_thread is None or not self._control_loop_thread.is_alive():
-                    self._start_control_loop()
-                    with self._reset_state_lock:
-                        self._reset_restart_control_loop = False
-                elif self._control_loop_stop.is_set():
-                    raise RuntimeError("Vega control loop is still stopping")
                 self._robot.add_command_point(
                     action,
                     action_space=action_space,
                     gripper_action_space=gripper_action_space,
                 )
             else:
-                try:
-                    self._robot.update_command(
-                        action,
-                        action_space=action_space,
-                        gripper_action_space=gripper_action_space,
-                        blocking=False,
-                    )
-                except CommunicationFailedError as exc:
-                    self._command_recovery_error = f"direct dispatch failed: {exc}"
-                    self._command_recovery_required.set()
-                    raise
+                self._robot.update_command(
+                    action,
+                    action_space=action_space,
+                    gripper_action_space=gripper_action_space,
+                    blocking=False,
+                )
 
     @_track_transport_rpc(robotenv_pb2.HealthCheckResponse)
     def HealthCheck(self, request, context):
         del request, context
         try:
+            self._robot.get_robot_state()
             version_info = self._load_version_info()
             version_str = version_info.get("tag", "1.0.0-vega")
-            hand_health = getattr(
-                self._robot, "hand_command_path_healthy", lambda: True
-            )
-            if not hand_health():
-                self._command_recovery_error = "asynchronous hand dispatch failed"
-                self._command_recovery_required.set()
-            if self._command_recovery_required.is_set():
-                return robotenv_pb2.HealthCheckResponse(
-                    status="UNHEALTHY",
-                    message=(
-                        "robot command recovery required"
-                        + (
-                            f": {self._command_recovery_error}"
-                            if self._command_recovery_error
-                            else ""
-                        )
-                    ),
-                    version=version_str,
-                )
-            self._robot.get_robot_state()
             return robotenv_pb2.HealthCheckResponse(
                 status="HEALTHY",
                 message=f"Vega {self.arm_side} arm operational",

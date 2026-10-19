@@ -88,45 +88,25 @@ class RobotiqGripper:
             init_timeout: Seconds to wait for the gripper to become ready.
         """
         logger.info("Connecting to Robotiq 2F-85 on {} ...", comport)
+        self._gripper = Robotiq2FingerGripper(comport=comport)
+        self._gripper.full_init(timeout=init_timeout)
+
+        # Locks
         self._gripper_io_lock = threading.Lock()
         self._state_lock = threading.Lock()
+
+        # Cached state (updated by worker thread only — measured, never commanded)
+        self._cached_pos = self._gripper.get_pos()
+
+        # Worker thread
         self._command_queue: Queue[tuple[float, float, float]] = Queue(maxsize=1)
         self._stop_event = threading.Event()
-        self._command_failed = threading.Event()
-        self._worker = threading.Thread()
-        self._gripper = None
-        try:
-            # Retain the driver object even if its __init__ raises after opening
-            # the serial device, so rollback still has a cleanup handle.
-            driver = Robotiq2FingerGripper.__new__(Robotiq2FingerGripper)
-            self._gripper = driver
-            driver.__init__(comport=comport)
-            driver.full_init(timeout=init_timeout)
-            self._cached_pos = driver.get_pos()
-            self._worker = threading.Thread(
-                target=self._worker_loop,
-                name="robotiq-gripper-worker",
-                daemon=True,
-            )
-            self._worker.start()
-        except BaseException:
-            while True:
-                try:
-                    self._stop_event.set()
-                    if self._worker.is_alive():
-                        self._worker.join(timeout=2.0)
-                        if self._worker.is_alive():
-                            raise RuntimeError("Robotiq worker did not stop")
-                    if self._gripper is not None:
-                        self._gripper.shutdown()
-                    break
-                except BaseException as cleanup_exc:
-                    logger.error(
-                        "Robotiq constructor cleanup is not yet safe; retrying: {}",
-                        cleanup_exc,
-                    )
-                    time.sleep(0.1)
-            raise
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name="robotiq-gripper-worker",
+            daemon=True,
+        )
+        self._worker.start()
 
         logger.info("Robotiq 2F-85 ready (async worker started).")
 
@@ -145,8 +125,6 @@ class RobotiqGripper:
 
             # Execute command
             if latest_cmd is not None:
-                if self._stop_event.is_set():
-                    break
                 pos_m, vel, force = latest_cmd
                 try:
                     with self._gripper_io_lock:
@@ -155,23 +133,14 @@ class RobotiqGripper:
                 except Exception as e:
                     logger.warning("Robotiq worker command error: {}", e)
 
-            if self._stop_event.is_set():
-                break
             # Refresh cached state from real Modbus read
             try:
                 with self._gripper_io_lock:
                     status_ok = self._gripper.getStatus()
                 if status_ok:
-                    measured = float(self._gripper.get_pos())
-                    if not np.isfinite(measured) or not 0.0 <= measured <= _STROKE_M:
-                        raise RuntimeError("Robotiq state readback is invalid")
                     with self._state_lock:
-                        self._cached_pos = measured
+                        self._cached_pos = self._gripper.get_pos()
             except Exception as e:
-                # A transient Modbus telemetry miss is not evidence that the
-                # asynchronous command path failed.  Keep the last measured
-                # position and retry on the next worker iteration.  Actual
-                # goto/sendCommand failures above remain sticky until Reset.
                 logger.warning("Robotiq worker state refresh error: {}", e)
 
     def _enqueue_command(self, pos_m: float, vel: float = 0.05, force: float = 95) -> None:
@@ -245,59 +214,12 @@ class RobotiqGripper:
             raise KeyError(f"Unknown predefined pose '{name}'. Available: {list(_POSE_POOL)}")
         return _POSE_POOL[name].copy()
 
-    def reset_command_state(self) -> None:
-        """Drain queued/in-flight work and establish a measured-position hold."""
-        self._stop_event.set()
-        while True:
-            try:
-                self._command_queue.get_nowait()
-            except Empty:
-                break
-        if self._worker.is_alive():
-            self._worker.join(timeout=2.0)
-            if self._worker.is_alive():
-                raise RuntimeError("Robotiq worker did not stop within 2 seconds")
-        with self._gripper_io_lock:
-            if not self._gripper.getStatus():
-                raise RuntimeError("Robotiq measured hold readback failed")
-            measured = float(self._gripper.get_pos())
-            if not np.isfinite(measured) or not 0.0 <= measured <= _STROKE_M:
-                raise RuntimeError("Robotiq measured hold is invalid")
-            self._gripper.goto(pos=measured, vel=0.05, force=95)
-            sent = self._gripper.sendCommand()
-            if sent is False:
-                raise RuntimeError("Robotiq measured hold transmission failed")
-        if not hasattr(self, "_command_failed"):
-            self._command_failed = threading.Event()
-        self._command_failed.clear()
-        with self._state_lock:
-            self._cached_pos = measured
-        self._command_queue = Queue(maxsize=1)
-        self._stop_event = threading.Event()
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            name="robotiq-gripper-worker",
-            daemon=True,
-        )
-        self._worker.start()
-
-    @property
-    def command_path_healthy(self) -> bool:
-        # Match the established production Robotiq behavior: asynchronous
-        # Modbus failures are logged and retried by the worker.  They are not
-        # promoted into the server-wide command recovery latch.
-        return True
-
     def shutdown(self) -> None:
         """Stop worker thread and disconnect from the gripper."""
         self._stop_event.set()
-        while True:
-            try:
-                self._command_queue.get_nowait()
-            except Empty:
-                break
         if self._worker.is_alive():
             self._worker.join(timeout=2.0)
-            if self._worker.is_alive():
-                raise RuntimeError("Robotiq worker did not stop within 2 seconds")
-        self._gripper.shutdown()
+        try:
+            self._gripper.shutdown()
+        except Exception:
+            pass

@@ -44,7 +44,6 @@ class _RobotWithCustomHeadPose(Robot):
 
     def __init__(self, *args, head_init_pos: np.ndarray | None = None, **kwargs):
         self._head_init_pos = head_init_pos
-        kwargs.setdefault("auto_shutdown", False)
         super().__init__(*args, **kwargs)
 
     def _set_default_state(self) -> None:
@@ -74,18 +73,6 @@ class _RobotWithCustomHeadPose(Robot):
             else:
                 init_pos = self.compensate_torso_pitch(
                     head.get_predefined_pose("home"), "head"
-                )
-            init_pos = np.asarray(init_pos, dtype=np.float64)
-            lower = np.array([-1.483, -2.792, -1.378], dtype=np.float64)
-            upper = np.array([1.483, 2.792, 1.483], dtype=np.float64)
-            if (
-                init_pos.shape != (3,)
-                or not np.isfinite(init_pos).all()
-                or np.any(init_pos < lower)
-                or np.any(init_pos > upper)
-            ):
-                raise ValueError(
-                    "torso-compensated head startup pose exceeds Vega joint limits"
                 )
             head.set_joint_pos(init_pos)
 
@@ -129,61 +116,8 @@ class CommunicationFailedError(RuntimeError):
     """Raised when arm/hand command transmission fails."""
 
 
-def _resample_smoothing_alpha(
-    alpha: float, source_hz: float, target_hz: float
-) -> float:
-    """Preserve a filter's wall-clock response when its tick rate changes."""
-    clipped = float(np.clip(alpha, 0.0, 0.99))
-    if clipped <= 0.0 or float(source_hz) == float(target_hz):
-        return clipped
-    omega = clipped * float(source_hz) / (1.0 - clipped)
-    target_dt = 1.0 / float(target_hz)
-    return float((omega * target_dt) / (1.0 + omega * target_dt))
-
-
-def _resample_first_order_alpha(
-    alpha: float, source_hz: float, target_hz: float
-) -> float:
-    """Preserve first-order EMA wall-clock decay across tick rates."""
-    clipped = float(np.clip(alpha, 0.0, 1.0))
-    if clipped <= 0.0 or clipped >= 1.0 or source_hz == target_hz:
-        return clipped
-    return float(1.0 - (1.0 - clipped) ** (float(source_hz) / float(target_hz)))
-
-
 class VegaRobot:
-    _FEEDFORWARD_MAX_AGE_INPUT_PERIODS = 2.0
     """Thin wrapper around dexcontrol Robot for single-arm control."""
-
-    @staticmethod
-    def _retry_failed_constructor_cleanup(
-        robot: object | None,
-        custom_hand: object | None,
-    ) -> None:
-        """Drain acquired hardware before propagating constructor failure.
-
-        Once a custom hand worker or the base Robot exists, losing the wrapper
-        object would also lose the only retry handle.  Keep retrying the same
-        strict hand-before-base shutdown contract used by service shutdown.
-        """
-        for label, resource in (("custom hand", custom_hand), ("base robot", robot)):
-            if resource is None:
-                continue
-            shutdown = getattr(resource, "shutdown", None)
-            if not callable(shutdown):
-                continue
-            while True:
-                try:
-                    shutdown()
-                    break
-                except BaseException as exc:  # pylint: disable=broad-except
-                    _logger.error(
-                        "Vega constructor cleanup for %s is not yet safe; "
-                        "retrying: %s",
-                        label,
-                        exc,
-                    )
-                    _time.sleep(0.1)
 
     def __init__(
         self,
@@ -199,7 +133,6 @@ class VegaRobot:
         ema_alpha: float = 0.0,
         interpolation_method: str = "none",
         interpolation_history: int = 4,
-        interpolation_control_hz: int | None = None,
         filter_type: str = "none",
         filter_cutoff_freq: float = 10.0,
         filter_order: int = 2,
@@ -210,7 +143,7 @@ class VegaRobot:
         max_jerk: float = 0.25,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
-        head_init_pos: tuple[float, ...] | list[float] = (1.48, 0.0, -0.3),
+        head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -250,114 +183,61 @@ class VegaRobot:
         self.robot_model = robot_model
         self.arm_side = arm_side
         self.control_hz = int(control_hz)
-        self.interpolation_control_hz = int(
-            interpolation_control_hz
-            if interpolation_control_hz is not None
-            else control_hz
-        )
         self.gripper_type = gripper_type
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
-
-        prepared_head_init_pos = None
-        if head_init_pos is not None:
-            head64 = np.asarray(head_init_pos, dtype=np.float64)
-            head_lower = np.array([-1.483, -2.792, -1.378], dtype=np.float64)
-            head_upper = np.array([1.483, 2.792, 1.483], dtype=np.float64)
-            if (
-                head64.shape != (3,)
-                or not np.isfinite(head64).all()
-                or np.any(head64 < head_lower)
-                or np.any(head64 > head_upper)
-            ):
-                raise ValueError("head_init_pos exceeds Vega head joint limits")
-            prepared_head_init_pos = head64.astype(np.float32)
-            if not np.isfinite(prepared_head_init_pos).all():
-                raise ValueError("head_init_pos is not finite in hardware format")
 
         configs = get_robot_config(robot_model)
         self.robot = _RobotWithCustomHeadPose(
             configs=configs,
-            head_init_pos=prepared_head_init_pos,
+            head_init_pos=np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None,
         )
-        custom_hand = None
-        try:
-            self.arm = getattr(self.robot, f"{arm_side}_arm")
-            hand_component = f"{arm_side}_hand"
-            if gripper_type == "robotiq":
-                from dexcontrol.core.robotiq_gripper import RobotiqGripper  # lazy import
-                self.hand = RobotiqGripper(comport=self._robotiq_comport)
-                custom_hand = self.hand
-            elif gripper_type == "sr_gripper":
-                from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
-                self.hand = SrGripperAdapter(comport=self._robotiq_comport)
-                custom_hand = self.hand
-            elif gripper_type in ("wuji_hand_v1", "wuji_hand_v2"):
-                from dexcontrol.core.wuji_hand import WujiHandAdapter  # lazy import
-                if wuji_effort_limit is None:
-                    wuji_effort_limit = 1.7 if gripper_type == "wuji_hand_v2" else 1.5
-                self.hand = WujiHandAdapter(
-                    handedness=arm_side,
-                    sn=wuji_sn,
-                    effort_limit=wuji_effort_limit,
-                )
-                custom_hand = self.hand
-                # The adapter connects whichever wuji generation is attached,
-                # but RCI builds its retargeter from the configured type.
-                if self.hand.model != gripper_type:
-                    raise RuntimeError(
-                        f"Unit config says gripper_type={gripper_type!r} but the "
-                        f"attached hand is a {self.hand.model!r} "
-                        f"(sn={self.hand.serial_number}). Fix the unit config in "
-                        f"data-studio or attach the matching hand, then restart."
-                    )
-            else:
-                self.hand = (
-                    getattr(self.robot, hand_component)
-                    if self.robot.has_component(hand_component)
-                    else None
-                )
+        self.arm = getattr(self.robot, f"{arm_side}_arm")
+        hand_component = f"{arm_side}_hand"
 
-            custom_ik_cfg = self._build_ik_config()
-            self.ik_controller = BaseIKController(
-                bot=self.robot, visualize=False,
-                ik_solver_type=self._ik_solver_type,
-                custom_local_ik_config=custom_ik_cfg,
+        if gripper_type == "robotiq":
+            from dexcontrol.core.robotiq_gripper import RobotiqGripper  # lazy import
+            self.hand = RobotiqGripper(comport=self._robotiq_comport)
+        elif gripper_type == "sr_gripper":
+            from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
+            self.hand = SrGripperAdapter(comport=self._robotiq_comport)
+        elif gripper_type in ("wuji_hand_v1", "wuji_hand_v2"):
+            from dexcontrol.core.wuji_hand import WujiHandAdapter  # lazy import
+            if wuji_effort_limit is None:
+                wuji_effort_limit = 1.7 if gripper_type == "wuji_hand_v2" else 1.5
+            self.hand = WujiHandAdapter(
+                handedness=arm_side,
+                sn=wuji_sn,
+                effort_limit=wuji_effort_limit,
             )
-        except BaseException:
-            self._retry_failed_constructor_cleanup(self.robot, custom_hand)
-            raise
-        try:
-            self._finish_initialization(
-                arm_side=arm_side,
-                control_hz=control_hz,
-                ema_alpha=ema_alpha,
-                interpolation_method=interpolation_method,
-                interpolation_history=interpolation_history,
-                interpolation_control_hz=self.interpolation_control_hz,
-                filter_type=filter_type,
-                filter_cutoff_freq=filter_cutoff_freq,
-                filter_order=filter_order,
-                filter_ema_alpha=filter_ema_alpha,
-                vel_smoothing_alpha=vel_smoothing_alpha,
-                hw_correction_alpha=hw_correction_alpha,
-                max_delta_scale=max_delta_scale,
-                max_jerk=max_jerk,
-                vel_ratio=vel_ratio,
-                vel_damp_thresh=vel_damp_thresh,
-            )
-        except BaseException:
-            self._retry_failed_constructor_cleanup(self.robot, custom_hand)
-            raise
+            # The adapter connects whichever wuji generation is attached, but
+            # RCI builds its finger retargeter from the CONFIGURED type — a
+            # generation mismatch runs without any error while every finger
+            # command uses the wrong kinematics, and recordings claim the
+            # wrong hand. Refuse to start instead.
+            if self.hand.model != gripper_type:
+                raise RuntimeError(
+                    f"Unit config says gripper_type={gripper_type!r} but the "
+                    f"attached hand is a {self.hand.model!r} "
+                    f"(sn={self.hand.serial_number}). Fix the unit config in "
+                    f"data-studio or attach the matching hand, then restart."
+                )
+        else:
+            self.hand = getattr(self.robot, hand_component) if self.robot.has_component(hand_component) else None
 
-    def _finish_initialization(self, **config) -> None:
-        """Complete all fallible setup while constructor rollback owns hardware."""
-        arm_side = config["arm_side"]
-        control_hz = config["control_hz"]
+        custom_ik_cfg = self._build_ik_config()
+        self.ik_controller = BaseIKController(
+            bot=self.robot, visualize=False,
+            ik_solver_type=self._ik_solver_type,
+            custom_local_ik_config=custom_ik_cfg,
+        )
         self._arm_joint_names = [f"{arm_side[0].upper()}_arm_j{i + 1}" for i in range(7)]
+
+        # Use Vega unfold pose (L_shape) as default reset, same as fold_robot.py unfold.
         self.reset_joints = np.asarray(
             self.arm.get_predefined_pose("L_shape"), dtype=np.float64
         )
         self.safe_transit_pose = self.reset_joints.copy()
+
         self._gripper_open_pos, self._gripper_close_pos = self._init_gripper_reference()
         self._gripper_state_lock = threading.Lock()
         self._gripper_io_lock = threading.Lock()
@@ -367,89 +247,103 @@ class VegaRobot:
         self._gripper_command_queue: Queue[float] | None = None
         self._gripper_stop_event = threading.Event()
         self._gripper_worker: threading.Thread | None = None
-        self._gripper_worker_restart_required = False
-        self._hand_shutdown_completed = False
-        self._robot_shutdown_completed = False
         self._prev_command_successful = True
         self._prev_gripper_command_successful = True
         self._prev_controller_latency_ms = 0.0
         self._prev_joint_vel: np.ndarray | None = None
-        self._vel_smoothing_alpha = float(np.clip(config["vel_smoothing_alpha"], 0.0, 1.0))
-        self._interpolation_vel_smoothing_alpha = _resample_first_order_alpha(
-            self._vel_smoothing_alpha,
-            float(control_hz),
-            float(config["interpolation_control_hz"]),
-        )
-        self._last_cmd_joint_pos: np.ndarray | None = None
-        self._prev_cmd_delta: np.ndarray | None = None
-        self._HW_CORRECTION_ALPHA = float(np.clip(config["hw_correction_alpha"], 0.0, 1.0))
-        self._INTERPOLATION_HW_CORRECTION_ALPHA = _resample_first_order_alpha(
-            self._HW_CORRECTION_ALPHA,
-            float(control_hz),
-            float(config["interpolation_control_hz"]),
-        )
-        self._HW_CORRECTION_OUTLIER_THRESH = 0.5
-        self._max_delta_scale = float(max(0.1, config["max_delta_scale"]))
-        self._MOTOR_MAX_JERK_RAD = float(max(0.0, config["max_jerk"]))
-        self._vel_ratio = float(max(0.0, config["vel_ratio"]))
-        self._vel_damp_thresh = float(max(0.001, config["vel_damp_thresh"]))
+        self._vel_smoothing_alpha = float(np.clip(vel_smoothing_alpha, 0.0, 1.0))
+        self._last_cmd_joint_pos: np.ndarray | None = None  # Track last sent command for delta clipping
+        self._prev_cmd_delta: np.ndarray | None = None  # Previous step delta for jerk limiting
+        self._HW_CORRECTION_ALPHA = float(np.clip(hw_correction_alpha, 0.0, 1.0))
+        self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
+        self._max_delta_scale = float(max(0.1, max_delta_scale))
+        self._MOTOR_MAX_JERK_RAD = float(max(0.0, max_jerk))
+        self._vel_ratio = float(max(0.0, vel_ratio))
+        self._vel_damp_thresh = float(max(0.001, vel_damp_thresh))
 
+        # Velocity logging for diagnostics.
         vel_log_path = os.environ.get("VEL_LOG_PATH")
-        self._vel_log_file = open(vel_log_path, "a") if vel_log_path else None
-        if self._vel_log_file is not None:
-            self._vel_log_file.write(
-                f"timestamp,{','.join(f'j{i+1}_vel' for i in range(7))}\n"
-            )
+        if vel_log_path:
+            self._vel_log_file = open(vel_log_path, "a")
+            header = f"timestamp,{','.join(f'j{i+1}_vel' for i in range(7))}\n"
+            self._vel_log_file.write(header)
             _logger.info("Velocity logging enabled: %s", vel_log_path)
+        else:
+            self._vel_log_file = None
 
-        self._ema_alpha = float(np.clip(config["ema_alpha"], 0.0, 0.99))
-        self._interpolation_ema_alpha = _resample_smoothing_alpha(
-            self._ema_alpha,
-            float(control_hz),
-            float(config["interpolation_control_hz"]),
-        )
+        # Critically damped 2nd-order smoothing filter for joint commands.
+        # alpha controls responsiveness (0.0 = disabled, 0.3~0.8 = typical).
+        self._ema_alpha = float(np.clip(ema_alpha, 0.0, 0.99))
         self._filter_pos: np.ndarray | None = None
         self._filter_vel: np.ndarray | None = None
-        self._interpolation_method = config["interpolation_method"]
-        if self._interpolation_method != "none":
+
+        # --- Trajectory interpolation (input-rate → control-rate upsampling) ---
+        # When interpolation_method != "none", incoming commands are buffered
+        # via add_command_point() and the control loop calls
+        # get_interpolated_command() at a higher rate for smooth output.
+        self._interpolation_method = interpolation_method
+        if interpolation_method != "none":
             self._interpolator = TrajectoryInterpolator(
-                method=self._interpolation_method,
-                history_size=config["interpolation_history"],
+                method=interpolation_method,
+                history_size=interpolation_history,
+            )
+            _logger.info(
+                "Trajectory interpolation enabled: method=%s history=%d",
+                interpolation_method,
+                interpolation_history,
             )
         else:
             self._interpolator = None
 
-        filter_type = config["filter_type"]
+        # --- Output filter (applied after interpolation / EMA) ---
         if filter_type != "none":
             filter_cfg = {"default": {"type": filter_type}}
             if filter_type == "butterworth":
-                filter_cfg["default"].update(
-                    cutoff_freq=config["filter_cutoff_freq"],
-                    order=config["filter_order"],
-                )
+                filter_cfg["default"]["cutoff_freq"] = filter_cutoff_freq
+                filter_cfg["default"]["order"] = filter_order
             elif filter_type == "ema":
-                filter_cfg["default"]["alpha"] = _resample_first_order_alpha(
-                    config["filter_ema_alpha"],
-                    float(control_hz),
-                    float(config["interpolation_control_hz"]),
-                )
+                filter_cfg["default"]["alpha"] = filter_ema_alpha
             self._output_filter = MultiChannelFilter(
                 filter_config=filter_cfg,
-                control_rate=float(config["interpolation_control_hz"]),
+                control_rate=float(control_hz),
+            )
+            _logger.info(
+                "Output filter enabled: type=%s (cutoff=%.1f order=%d ema_alpha=%.2f)",
+                filter_type,
+                filter_cutoff_freq,
+                filter_order,
+                filter_ema_alpha,
             )
         else:
             self._output_filter = None
 
+        # Latest raw command stored by add_command_point for the control loop
         self._latest_target_joint_pos: np.ndarray | None = None
-        self._latest_arm_feedforward_velocity: np.ndarray | None = None
-        self._latest_command_monotonic: float | None = None
-        self._latest_gripper_action = 0.0
+        self._latest_gripper_action: float = 0.0
         self._latest_hand_action: np.ndarray | None = None
-        self._latest_gripper_action_space = "position"
+        self._latest_gripper_action_space: str = "position"
         self._interp_lock = threading.Lock()
+
         if self.hand is not None:
             self._refresh_gripper_state()
             self._start_gripper_worker()
+
+        # #region agent log
+        self._agent_debug_log(
+            run_id=f"joint-diagnostics-{self.arm_side}",
+            hypothesis_id="H10",
+            location="dexcontrol/core/vega/robot.py:__init__",
+            message="agent_debug_probe",
+            data={
+                "pid": int(os.getpid()),
+                "module_file": str(Path(__file__).resolve()),
+                "log_path": self._AGENT_DEBUG_LOG_PATH,
+                "arm_side": self.arm_side,
+                "control_hz": self.control_hz,
+                "ik_solver_type": self._ik_solver_type,
+            },
+        )
+        # #endregion
 
     _AGENT_DEBUG_LOG_PATH = "/home/dexmate/.cursor/debug-daf7f0.log"
     _AGENT_DEBUG_SESSION_ID = "daf7f0"
@@ -524,53 +418,11 @@ class VegaRobot:
         self._filter_vel = None
         self._last_cmd_joint_pos = None
         self._prev_cmd_delta = None
-        self._prev_joint_vel = None
         if self._interpolator is not None:
             self._interpolator.clear()
         if self._output_filter is not None:
             self._output_filter.reset()
         self._latest_target_joint_pos = None
-        self._latest_arm_feedforward_velocity = None
-        self._latest_command_monotonic = None
-        self._latest_hand_action = None
-        self._latest_gripper_action = 0.0
-        self._latest_gripper_action_space = "position"
-
-    def reset_command_state(self) -> None:
-        """Drain asynchronous hand work and discard every buffered command.
-
-        Reset/current is a command boundary, not merely a filter boundary.  A
-        scalar gripper command may already have left the interpolation loop and
-        be waiting in the one-element worker queue (or be executing).  Stop and
-        join that worker before clearing interpolation state, then create a
-        fresh queue so no pre-reset command can execute afterward.
-        """
-        worker = getattr(self, "_gripper_worker", None)
-        # A retained but no-longer-live handle means a previous drain timed
-        # out and is now retryable. Finalize that stale worker/queue through
-        # the same stop path, then restore a fresh worker as originally
-        # intended.
-        restart_worker = bool(
-            getattr(self, "_gripper_worker_restart_required", False)
-            or worker is not None
-        )
-        if worker is not None:
-            self._gripper_worker_restart_required = True
-            self._stop_gripper_worker()
-        else:
-            self._clear_gripper_command_queue()
-        hand_reset = getattr(getattr(self, "hand", None), "reset_command_state", None)
-        if callable(hand_reset):
-            hand_reset()
-        if getattr(self, "hand", None) is not None and not self._refresh_gripper_state():
-            raise RuntimeError(
-                "fresh hand state is unavailable after command-boundary hold"
-            )
-        self._prev_gripper_command_successful = True
-        self.reset_filter_state()
-        if restart_worker:
-            self._start_gripper_worker()
-            self._gripper_worker_restart_required = False
 
     def launch_robot(self) -> None:
         """Validate robot readiness and default control mode."""
@@ -596,15 +448,8 @@ class VegaRobot:
 
     def _stop_gripper_worker(self) -> None:
         self._gripper_stop_event.set()
-        self._clear_gripper_command_queue()
-        worker = self._gripper_worker
-        if worker is not None and worker.is_alive():
-            worker.join(timeout=1.0)
-            if worker.is_alive():
-                # Preserve the handle and queue so a later shutdown retry can
-                # prove the worker has exited.  Closing the hand transport
-                # underneath an in-flight command is unsafe.
-                raise RuntimeError("Vega gripper worker did not stop within 1 second")
+        if self._gripper_worker is not None and self._gripper_worker.is_alive():
+            self._gripper_worker.join(timeout=1.0)
         self._gripper_worker = None
         self._gripper_command_queue = None
 
@@ -622,24 +467,10 @@ class VegaRobot:
                     pass
 
             if latest_target is not None:
-                if self._gripper_stop_event.is_set():
-                    break
-                if (
-                    not self._prev_gripper_command_successful
-                    or not self.hand_command_path_healthy()
-                ):
-                    # A sticky adapter failure is a command boundary.  Do not
-                    # allow an already-dequeued target to reach the adapter
-                    # after the server has entered recovery; only the strict
-                    # reset/hold path may transmit while recovering.
-                    self._prev_gripper_command_successful = False
-                else:
-                    self._execute_gripper_command(
-                        latest_target, wait_time=0.0, raise_on_error=False
-                    )
+                self._execute_gripper_command(
+                    latest_target, wait_time=0.0, raise_on_error=False
+                )
 
-            if self._gripper_stop_event.is_set():
-                break
             self._refresh_gripper_state()
 
     def _clear_gripper_command_queue(self) -> None:
@@ -666,9 +497,7 @@ class VegaRobot:
                 self._gripper_position = gripper_position
             return True
         except Exception:
-            # Telemetry freshness and command-dispatch health are separate
-            # concerns.  Production tolerated a transient state-read failure;
-            # it must not turn into a server command-recovery latch.
+            self._prev_gripper_command_successful = False
             return False
 
     def _execute_gripper_command(
@@ -678,9 +507,8 @@ class VegaRobot:
         raise_on_error: bool,
     ) -> bool:
         if self.hand is None:
+            self._prev_gripper_command_successful = True
             return True
-        if not np.isfinite(target):
-            raise ValueError("Refusing to send non-finite scalar hand target")
         target = float(np.clip(target, 0.0, 1.0))
         target_joint_pos = self._gripper_target_to_joint_pos(target)
         try:
@@ -696,6 +524,7 @@ class VegaRobot:
             # target into `_gripper_position` here. Conflating commanded
             # and measured produces logs/plots where state tracks the
             # action and snaps back to reality on contact stalls.
+            self._prev_gripper_command_successful = True
             return True
         except Exception:
             self._prev_gripper_command_successful = False
@@ -704,8 +533,6 @@ class VegaRobot:
             return False
 
     def _enqueue_gripper_target(self, target: float) -> None:
-        if not np.isfinite(target):
-            raise ValueError("Refusing to enqueue non-finite scalar hand target")
         target = float(np.clip(target, 0.0, 1.0))
         if self._gripper_command_queue is None:
             self._execute_gripper_command(target, wait_time=0.0, raise_on_error=False)
@@ -733,19 +560,6 @@ class VegaRobot:
             return np.zeros(1, dtype=np.float64)
         with self._gripper_state_lock:
             return np.asarray(self._gripper_joint_pos, dtype=np.float64).copy()
-
-    def hand_command_path_healthy(self) -> bool:
-        if self.hand is None:
-            return True
-        outer_before = bool(self._prev_gripper_command_successful)
-        health = getattr(self.hand, "command_path_healthy", True)
-        adapter_healthy = bool(health() if callable(health) else health)
-        # Re-read the outer sticky state after querying the adapter.  This
-        # makes the combined predicate a single conservative snapshot: an
-        # outer failure concurrent with the adapter read cannot hide between
-        # two separately sampled fields at the service boundary.
-        outer_after = bool(self._prev_gripper_command_successful)
-        return outer_before and adapter_healthy and outer_after
 
     # gripper_types that expose the end-effector as a multi-DoF joint vector.
     # Everything else — INCLUDING gripper_type "default" with an integrated
@@ -805,7 +619,6 @@ class VegaRobot:
         hand_action: np.ndarray,
         gripper_action_space: str,
         blocking: bool,
-        execution_hz: float | None = None,
     ) -> None:
         """Send the end-effector command.
 
@@ -819,7 +632,6 @@ class VegaRobot:
                 float(hand_action.reshape(-1)[0]) if hand_action.size else 0.0,
                 velocity=(gripper_action_space == "velocity"),
                 blocking=blocking,
-                execution_hz=execution_hz,
             )
             return
         if self.hand is None:
@@ -835,8 +647,7 @@ class VegaRobot:
                     raise ValueError(
                         f"hand velocity command size {target.size} != state size {current.size}"
                     )
-                tick_hz = self.control_hz if execution_hz is None else execution_hz
-                target = current + target * (1.0 / max(1, tick_hz))
+                target = current + target * (1.0 / max(1, self.control_hz))
             # Check before clipping: infinities must fail rather than turn
             # into finite boundary commands that the adapter would accept.
             if not np.isfinite(target).all():
@@ -846,73 +657,16 @@ class VegaRobot:
             if not is_wuji and limits is not None and np.asarray(limits).shape == (target.size, 2):
                 limits = np.asarray(limits, dtype=np.float64)
                 target = np.clip(target, limits[:, 0], limits[:, 1])
-            tick_hz = self.control_hz if execution_hz is None else execution_hz
-            wait_time = (1.0 / max(1, tick_hz)) if blocking else 0.0
+            wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
             with self._gripper_io_lock:
                 self.hand.set_joint_pos(target, wait_time=wait_time)
+            self._prev_gripper_command_successful = True
         except Exception:
             self._prev_gripper_command_successful = False
-            raise
-
-    def _prepare_direct_hand_action(
-        self, hand_action: np.ndarray, gripper_action_space: str
-    ) -> tuple[str, np.ndarray]:
-        """Resolve and validate a direct-path hand target before arm dispatch."""
-        command = np.asarray(hand_action, dtype=np.float64).reshape(-1)
-        if not np.isfinite(command).all():
-            raise ValueError("Hand command contains non-finite values")
-        if self.hand is None:
-            return "none", command
-        if command.size <= 1:
-            value = float(command[0]) if command.size else 0.0
-            if gripper_action_space == "velocity":
-                current = self.get_cached_gripper_position()
-                if not np.isfinite(current):
-                    raise ValueError("Scalar hand state is non-finite")
-                value = current + value / max(1, self.control_hz)
-            target = np.array([np.clip(value, 0.0, 1.0)], dtype=np.float64)
-            return "scalar", target
-
-        target = command.copy()
-        if gripper_action_space == "velocity":
-            current = np.asarray(self.hand.get_joint_pos(), dtype=np.float64).reshape(-1)
-            if current.size != target.size or not np.isfinite(current).all():
-                raise ValueError("Multi-DoF hand state is invalid")
-            target = current + target / max(1, self.control_hz)
-        if not np.isfinite(target).all():
-            raise ValueError("Resolved hand target contains non-finite values")
-        limits = getattr(self.hand, "joint_limits", None)
-        is_wuji = getattr(self.hand, "model", None) in ("wuji_hand_v1", "wuji_hand_v2")
-        if not is_wuji and limits is not None and np.asarray(limits).shape == (target.size, 2):
-            limits = np.asarray(limits, dtype=np.float64)
-            if not np.isfinite(limits).all():
-                raise ValueError("Hand joint limits contain non-finite values")
-            target = np.clip(target, limits[:, 0], limits[:, 1])
-        return "multi", target
-
-    def _dispatch_prepared_direct_hand_action(
-        self, kind: str, target: np.ndarray, blocking: bool
-    ) -> None:
-        if kind == "none":
-            return
-        if kind == "scalar":
+            # Parity with the scalar path: blocking callers (Reset, blocking
+            # update_command) must see the failure, not just a status flag.
             if blocking:
-                self._clear_gripper_command_queue()
-                self._execute_gripper_command(
-                    float(target[0]),
-                    wait_time=1.0 / max(1, self.control_hz),
-                    raise_on_error=True,
-                )
-            else:
-                self._enqueue_gripper_target(float(target[0]))
-            return
-        wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
-        try:
-            with self._gripper_io_lock:
-                self.hand.set_joint_pos(target, wait_time=wait_time)
-        except Exception:
-            self._prev_gripper_command_successful = False
-            raise
+                raise
 
     def update_command(
         self,
@@ -927,13 +681,9 @@ class VegaRobot:
             raise ValueError(f"Unsupported gripper_action_space '{gripper_action_space}'")
 
         action = np.asarray(command, dtype=np.float64).reshape(-1)
-        if not np.isfinite(action).all():
-            raise ValueError("Command contains non-finite values")
         dt = 1.0 / max(1, self.control_hz)
         state_dict, _ = self.get_robot_state()
         current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
-        if current_joint_pos.shape != (7,) or not np.isfinite(current_joint_pos).all():
-            raise ValueError("Measured arm joint state is invalid")
 
         arm_dof = 7 if action_space.startswith("joint") else 6
         arm_action, hand_action = self._split_arm_hand_action(action, arm_dof, action_space)
@@ -948,12 +698,6 @@ class VegaRobot:
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3] * dt, arm_action[3:6] * dt)
         else:  # cartesian_delta
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
-        target_joint_pos = np.asarray(target_joint_pos, dtype=np.float64)
-        if target_joint_pos.shape != (7,) or not np.isfinite(target_joint_pos).all():
-            raise ValueError("Resolved arm target is invalid")
-        prepared_hand_kind, prepared_hand_target = self._prepare_direct_hand_action(
-            hand_action, gripper_action_space
-        )
 
         # Log per-joint delta from IK (before smoothing/clipping)
         ik_delta = target_joint_pos - current_joint_pos
@@ -988,9 +732,7 @@ class VegaRobot:
 
         try:
             self.update_joints(target_joint_pos, velocity=False, blocking=blocking)
-            self._dispatch_prepared_direct_hand_action(
-                prepared_hand_kind, prepared_hand_target, blocking
-            )
+            self._apply_hand_action(hand_action, gripper_action_space, blocking=blocking)
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
             self._prev_command_successful = False
@@ -1018,12 +760,6 @@ class VegaRobot:
         When interpolation is disabled this falls back to the
         synchronous ``update_command()`` path.
         """
-        if action_space not in SUPPORTED_ACTION_SPACES:
-            raise ValueError(f"Unsupported action_space '{action_space}'")
-        if gripper_action_space not in ("position", "velocity"):
-            raise ValueError(
-                f"Unsupported gripper_action_space '{gripper_action_space}'"
-            )
         if self._interpolator is None:
             # No interpolation — direct execution (legacy path).
             self.update_command(command, action_space, gripper_action_space, blocking=False)
@@ -1040,96 +776,23 @@ class VegaRobot:
 
         if action_space == "joint_position":
             target_joint_pos = arm_action
-            arm_feedforward_velocity = None
         elif action_space == "joint_velocity":
             target_joint_pos = current_joint_pos + arm_action * dt
-            arm_feedforward_velocity = arm_action.copy()
         elif action_space == "joint_delta":
             target_joint_pos = current_joint_pos + arm_action
-            arm_feedforward_velocity = None
         elif action_space == "cartesian_velocity":
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3] * dt, arm_action[3:6] * dt)
-            arm_feedforward_velocity = (target_joint_pos - current_joint_pos) / dt
         else:  # cartesian_delta
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
-            arm_feedforward_velocity = None
 
+        timestamp = _time.perf_counter()
         with self._interp_lock:
-            resolved_hand_action = np.asarray(
-                hand_action, dtype=np.float64
-            ).copy()
-            if not np.isfinite(resolved_hand_action).all():
-                raise ValueError("Hand action contains non-finite values")
-            if not np.isfinite(target_joint_pos).all():
-                raise ValueError("Arm target contains non-finite values")
-            hand = getattr(self, "hand", None)
-            is_wuji = getattr(hand, "model", None) in (
-                "wuji_hand_v1",
-                "wuji_hand_v2",
-            )
-            resolved_gripper_action_space = gripper_action_space
-            if gripper_action_space == "velocity":
-                previous_target = self._latest_hand_action
-                if (
-                    is_wuji
-                    or previous_target is None
-                    or self._latest_gripper_action_space != "position"
-                    or np.asarray(previous_target).size != resolved_hand_action.size
-                ):
-                    if resolved_hand_action.size <= 1:
-                        previous_target = np.array(
-                            [self.get_cached_gripper_position()], dtype=np.float64
-                        )
-                    elif hand is not None:
-                        with self._gripper_io_lock:
-                            previous_target = np.asarray(
-                                hand.get_joint_pos(), dtype=np.float64
-                            ).reshape(-1)
-                    else:
-                        previous_target = np.zeros_like(resolved_hand_action)
-                resolved_hand_action = (
-                    np.asarray(previous_target, dtype=np.float64).reshape(-1)
-                    + resolved_hand_action * dt
-                )
-                resolved_gripper_action_space = "position"
-            if resolved_hand_action.size <= 1:
-                resolved_hand_action = np.clip(resolved_hand_action, 0.0, 1.0)
-            elif hand is not None and not is_wuji:
-                limits = getattr(hand, "joint_limits", None)
-                if np.asarray(limits).shape == (resolved_hand_action.size, 2):
-                    limits = np.asarray(limits, dtype=np.float64)
-                    resolved_hand_action = np.clip(
-                        resolved_hand_action, limits[:, 0], limits[:, 1]
-                    )
-            if not np.isfinite(resolved_hand_action).all():
-                raise ValueError("Resolved hand target contains non-finite values")
-            # Publish arm and hand together only after all fallible preparation.
-            timestamp = _time.perf_counter()
-            previous_hand = self._latest_hand_action
-            if (
-                previous_hand is not None
-                and np.asarray(previous_hand).size != resolved_hand_action.size
-            ):
-                # Interpolator history must have one stable vector schema.
-                self._interpolator.clear()
-            combined_target = np.concatenate(
-                [target_joint_pos, resolved_hand_action]
-            )
-            self._interpolator.add_point(timestamp, combined_target)
+            self._interpolator.add_point(timestamp, target_joint_pos)
             self._latest_target_joint_pos = target_joint_pos.copy()
-            self._latest_command_monotonic = timestamp
-            self._latest_arm_feedforward_velocity = (
-                None
-                if arm_feedforward_velocity is None
-                else np.asarray(arm_feedforward_velocity, dtype=np.float64).copy()
-            )
-            self._latest_hand_action = resolved_hand_action
-            self._latest_gripper_action = (
-                float(resolved_hand_action.reshape(-1)[0])
-                if resolved_hand_action.size
-                else 0.0
-            )
-            self._latest_gripper_action_space = resolved_gripper_action_space
+            # Store the full end-effector action (1 scalar gripper, or N-DoF hand).
+            self._latest_hand_action = np.asarray(hand_action, dtype=np.float64).copy()
+            self._latest_gripper_action = float(hand_action.reshape(-1)[0]) if hand_action.size else 0.0
+            self._latest_gripper_action_space = gripper_action_space
 
     def execute_interpolated_tick(self) -> bool:
         """Run one control-loop tick using interpolated position.
@@ -1138,45 +801,23 @@ class VegaRobot:
         thread.  Returns ``True`` if a command was sent, ``False`` if
         there is no data yet.
         """
-        if getattr(self, "hand", None) is not None and (
-            not self._prev_gripper_command_successful
-            or not self.hand_command_path_healthy()
-        ):
-            raise CommunicationFailedError(
-                "previous asynchronous hand dispatch or state refresh failed"
-            )
         with self._interp_lock:
             if self._latest_target_joint_pos is None:
                 return False
 
             now = _time.perf_counter()
-            # Preserve the production Vega control law: interpolate at the
-            # current dispatch time.  Delaying the query by one 20 Hz input
-            # period adds perceptible command latency and was not part of the
-            # force-calibration split.
-            query_time = now
-            combined_pos, _combined_vel = self._interpolator.interpolate(
-                query_time,
-                compute_velocity=self.use_velocity_feedforward,
-            )
+            pos, vel = self._interpolator.interpolate(now, compute_velocity=self.use_velocity_feedforward)
 
-            if combined_pos is None:
+            if pos is None:
                 # Not enough data for interpolation — use latest raw target.
-                latest_hand = self._latest_hand_action
-                if latest_hand is None:
-                    latest_hand = np.array(
-                        [self._latest_gripper_action], dtype=np.float64
-                    )
-                combined_pos = np.concatenate(
-                    [self._latest_target_joint_pos, latest_hand]
-                )
-                _combined_vel = None
+                pos = self._latest_target_joint_pos.copy()
+                vel = None
 
-            combined_pos = np.asarray(combined_pos, dtype=np.float64).reshape(-1)
-            if combined_pos.size < 8:
-                raise RuntimeError("Interpolated command is missing its hand target")
-            pos = combined_pos[:7].copy()
-            hand_action = combined_pos[7:].copy()
+            hand_action = self._latest_hand_action
+            if hand_action is None:
+                hand_action = np.array([self._latest_gripper_action], dtype=np.float64)
+            else:
+                hand_action = hand_action.copy()
             gripper_vel = self._latest_gripper_action_space == "velocity"
 
         # Apply the output filter (Butterworth / EMA) after interpolation.
@@ -1184,13 +825,13 @@ class VegaRobot:
             pos = self._output_filter.apply(pos)
 
         # Apply existing EMA 2nd-order smoothing on top if enabled.
-        if self._interpolation_ema_alpha > 0.0:
-            dt = 1.0 / max(1, self.interpolation_control_hz)
+        if self._ema_alpha > 0.0:
+            dt = 1.0 / max(1, self.control_hz)
             if self._filter_pos is None:
                 self._filter_pos = pos.copy()
                 self._filter_vel = np.zeros_like(pos)
             else:
-                alpha = self._interpolation_ema_alpha
+                alpha = self._ema_alpha
                 omega = alpha / (dt * (1.0 - alpha))
                 exp_term = np.exp(-omega * dt)
                 err = self._filter_pos - pos
@@ -1200,16 +841,11 @@ class VegaRobot:
                 pos = self._filter_pos.copy()
 
         try:
-            self.update_joints(
-                pos,
-                velocity=False,
-                blocking=False,
-            )
+            self.update_joints(pos, velocity=False, blocking=False)
             self._apply_hand_action(
                 hand_action,
                 "velocity" if gripper_vel else "position",
                 blocking=False,
-                execution_hz=self.interpolation_control_hz,
             )
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
@@ -1252,22 +888,12 @@ class VegaRobot:
         joint_pos_command: np.ndarray,
         velocity: bool = False,
         blocking: bool = False,
-        execution_hz: float | None = None,
-        feedforward_velocity: np.ndarray | None = None,
-        force_zero_feedforward: bool = False,
     ) -> None:
         run_id = f"joint-diagnostics-{self.arm_side}"
-        tick_hz = self.control_hz if execution_hz is None else execution_hz
-        interpolation_tick = execution_hz is not None
-        rate_ratio = float(self.control_hz) / float(tick_hz)
         target_joint_pos = np.asarray(joint_pos_command, dtype=np.float64)
-        if target_joint_pos.shape != (7,) or not np.isfinite(target_joint_pos).all():
-            raise ValueError("Joint command must contain seven finite values")
         if velocity:
-            dt = 1.0 / max(1, tick_hz)
+            dt = 1.0 / max(1, self.control_hz)
             current_joint_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
-            if current_joint_pos.shape != (7,) or not np.isfinite(current_joint_pos).all():
-                raise ValueError("Measured arm joint state is invalid")
             target_joint_pos = current_joint_pos + target_joint_pos * dt
 
         # Clip small IK numerical errors within tolerance before hard validation
@@ -1313,29 +939,21 @@ class VegaRobot:
         # clipping, blending a fraction of hw feedback error each step to
         # prevent drift without causing discontinuous jumps.
         hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
-        if hw_pos.shape != (7,) or not np.isfinite(hw_pos).all():
-            raise ValueError("Measured arm joint state is invalid")
         if self._last_cmd_joint_pos is not None:
             raw_error = hw_pos - self._last_cmd_joint_pos
             # Per-joint outlier rejection: skip correction for joints where
             # hw feedback jumps beyond threshold (e.g. glitchy readings).
             outlier_mask = np.abs(raw_error) > self._HW_CORRECTION_OUTLIER_THRESH
             raw_error[outlier_mask] = 0.0
-            correction_alpha = (
-                self._INTERPOLATION_HW_CORRECTION_ALPHA
-                if interpolation_tick
-                else self._HW_CORRECTION_ALPHA
-            )
-            current = self._last_cmd_joint_pos + raw_error * correction_alpha
+            current = self._last_cmd_joint_pos + raw_error * self._HW_CORRECTION_ALPHA
         else:
             current = hw_pos
         diff = target_joint_pos - current
         raw_diff = diff.copy()
-        max_delta = self._MOTOR_MAX_DELTA_RAD * rate_ratio
-        clipped_mask = np.abs(diff) > max_delta
+        clipped_mask = np.abs(diff) > self._MOTOR_MAX_DELTA_RAD
         clipped_count = int(np.count_nonzero(clipped_mask))
         if np.any(clipped_mask):
-            clipped = np.clip(diff, -max_delta, max_delta)
+            clipped = np.clip(diff, -self._MOTOR_MAX_DELTA_RAD, self._MOTOR_MAX_DELTA_RAD)
             clipped_indices = np.where(clipped_mask)[0]
             # #region agent log
             self._agent_debug_log(
@@ -1347,7 +965,7 @@ class VegaRobot:
                     "arm_side": self.arm_side,
                     "indices": clipped_indices.tolist(),
                     "raw_delta": np.round(diff[clipped_mask], 6).tolist(),
-                    "clip_limit": max_delta[clipped_mask].tolist(),
+                    "clip_limit": self._MOTOR_MAX_DELTA_RAD[clipped_mask].tolist(),
                 },
             )
             # #endregion
@@ -1355,7 +973,7 @@ class VegaRobot:
                 "[DeltaClip] joints=%s raw=%s limit=%s",
                 clipped_indices.tolist(),
                 np.round(diff[clipped_mask], 4).tolist(),
-                max_delta[clipped_mask].tolist(),
+                self._MOTOR_MAX_DELTA_RAD[clipped_mask].tolist(),
             )
             target_joint_pos = current + clipped
             diff = clipped
@@ -1366,7 +984,7 @@ class VegaRobot:
         jerk_count = 0
         if self._prev_cmd_delta is not None and self._MOTOR_MAX_JERK_RAD > 0:
             accel = diff - self._prev_cmd_delta
-            jerk_limit = self._MOTOR_MAX_JERK_RAD * rate_ratio * rate_ratio
+            jerk_limit = self._MOTOR_MAX_JERK_RAD
             jerk_mask = np.abs(accel) > jerk_limit
             jerk_count = int(np.count_nonzero(jerk_mask))
             if np.any(jerk_mask):
@@ -1379,11 +997,7 @@ class VegaRobot:
                 accel = np.clip(accel, -jerk_limit, jerk_limit)
                 diff = self._prev_cmd_delta + accel
                 target_joint_pos = current + diff
-        # Delta/jerk shaping rewrites the already validated target.  The
-        # shaped continuation can overshoot a hard limit when braking near a
-        # boundary, so the value that actually reaches hardware needs its own
-        # final validation.
-        self.validate_joint_limits(target_joint_pos)
+        self._prev_cmd_delta = diff.copy()
 
         # #region agent log
         self._agent_debug_log(
@@ -1402,35 +1016,11 @@ class VegaRobot:
         )
         # #endregion
 
-        if not np.isfinite(target_joint_pos).all():
-            raise ValueError("Refusing to send non-finite joint position to hardware")
         if self.use_velocity_feedforward and not blocking:
-            dt = 1.0 / max(1, tick_hz)
-            dispatched_velocity = (target_joint_pos - current) / dt
-            if feedforward_velocity is None:
-                raw_vel = dispatched_velocity
-            else:
-                requested_velocity = np.asarray(
-                    feedforward_velocity, dtype=np.float64
-                )
-                same_direction = requested_velocity * dispatched_velocity > 0.0
-                raw_vel = np.where(
-                    same_direction,
-                    np.sign(requested_velocity)
-                    * np.minimum(
-                        np.abs(requested_velocity),
-                        np.abs(dispatched_velocity),
-                    ),
-                    0.0,
-                )
-            if force_zero_feedforward:
-                target_joint_vel = np.zeros_like(raw_vel)
-            elif self._prev_joint_vel is not None:
-                a = (
-                    self._interpolation_vel_smoothing_alpha
-                    if interpolation_tick
-                    else self._vel_smoothing_alpha
-                )
+            dt = 1.0 / max(1, self.control_hz)
+            raw_vel = (target_joint_pos - current) / dt
+            if self._prev_joint_vel is not None:
+                a = self._vel_smoothing_alpha
                 target_joint_vel = a * raw_vel + (1.0 - a) * self._prev_joint_vel
             else:
                 target_joint_vel = raw_vel
@@ -1439,69 +1029,33 @@ class VegaRobot:
             pos_err = np.abs(target_joint_pos - current)
             damp_thresh = self._vel_damp_thresh
             damp_scale = np.clip(pos_err / damp_thresh, 0.0, 1.0)
-            with np.errstate(over="ignore", invalid="ignore"):
-                target_joint_vel = target_joint_vel * damp_scale * self._vel_ratio
-            if not np.isfinite(target_joint_vel).all():
-                raise ValueError(
-                    "Refusing to send non-finite joint velocity to hardware"
-                )
-            # EMA carries momentum across direction reversals.  Reconcile the
-            # final (post-EMA, post-ratio) feedforward with the position that
-            # will actually be dispatched so stale outward velocity cannot
-            # oppose an inward/braking position command near a joint limit.
-            coherent_direction = target_joint_vel * dispatched_velocity > 0.0
-            target_joint_vel = np.where(
-                coherent_direction,
-                np.sign(target_joint_vel)
-                * np.minimum(
-                    np.abs(target_joint_vel),
-                    np.abs(dispatched_velocity),
-                ),
-                0.0,
-            )
-            if not np.isfinite(target_joint_vel).all():
-                raise ValueError(
-                    "Refusing to send non-finite joint velocity to hardware"
-                )
+            target_joint_vel = target_joint_vel * damp_scale * self._vel_ratio
+            self._prev_joint_vel = target_joint_vel.copy()
             if self._vel_log_file is not None:
                 self._vel_log_file.write(
                     f"{_time.time()},{','.join(f'{v:.6f}' for v in target_joint_vel)}\n"
                 )
             self.arm.set_joint_pos_vel(target_joint_pos, target_joint_vel, relative=False)
-            self._prev_joint_vel = target_joint_vel.copy()
         elif blocking:
-            wait_time = 1.0 / max(1, tick_hz)
+            wait_time = 1.0 / max(1, self.control_hz)
             self.arm.set_joint_pos(target_joint_pos, wait_time=wait_time)
         else:
             self.arm._send_position_command(target_joint_pos)
-        # Commit limiter history only after the physical dispatch succeeds.
-        # A validation, log-write, or transport failure must not seed a
-        # phantom previous command that changes the next real trajectory.
-        self._prev_cmd_delta = diff.copy()
         self._last_cmd_joint_pos = target_joint_pos.copy()
         self.sync_motion_manager_with_arm(target_joint_pos)
 
-    def update_gripper(
-        self,
-        command: float,
-        velocity: bool = True,
-        blocking: bool = False,
-        execution_hz: float | None = None,
-    ) -> None:
+    def update_gripper(self, command: float, velocity: bool = True, blocking: bool = False) -> None:
         if self.hand is None:
             self._prev_gripper_command_successful = True
             return
         current = self.get_cached_gripper_position()
-        if not np.isfinite(command) or not np.isfinite(current):
-            raise ValueError("Scalar hand command/state must be finite")
-        tick_hz = self.control_hz if execution_hz is None else execution_hz
         if velocity:
-            target = current + float(command) * (1.0 / max(1, tick_hz))
+            target = current + float(command) * (1.0 / max(1, self.control_hz))
         else:
             target = float(command)
 
         target = float(np.clip(target, 0.0, 1.0))
-        wait_time = (1.0 / max(1, tick_hz)) if blocking else 0.0
+        wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
 
         if blocking:
             self._clear_gripper_command_queue()
@@ -1510,6 +1064,7 @@ class VegaRobot:
             return
 
         self._enqueue_gripper_target(target)
+        self._prev_gripper_command_successful = True
 
     def get_robot_state(self) -> tuple[dict[str, Any], dict[str, int]]:
         joint_positions = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
@@ -1567,10 +1122,7 @@ class VegaRobot:
             "cartesian_position": cartesian_position,
             "prev_controller_latency_ms": float(self._prev_controller_latency_ms),
             "prev_command_successful": bool(self._prev_command_successful),
-            "prev_gripper_command_successful": bool(
-                self._prev_gripper_command_successful
-                and self.hand_command_path_healthy()
-            ),
+            "prev_gripper_command_successful": bool(self._prev_gripper_command_successful),
         }
         for field_name, component_name in (
             ("torso_joint_positions", "torso"),
@@ -1588,12 +1140,10 @@ class VegaRobot:
         return state_dict, timestamp_dict
 
     def validate_joint_limits(self, target_joint_pos: np.ndarray) -> None:
-        target_joint_pos = np.asarray(target_joint_pos, dtype=np.float64)
-        if target_joint_pos.shape != (7,) or not np.isfinite(target_joint_pos).all():
-            raise ValueError("Joint target must contain seven finite values")
         limits = self.arm.joint_pos_limit
         if limits is None:
             return
+        target_joint_pos = np.asarray(target_joint_pos, dtype=np.float64)
         low = limits[:, 0].astype(np.float64)
         high = limits[:, 1].astype(np.float64)
         violates = np.logical_or(target_joint_pos < low, target_joint_pos > high)
@@ -1968,34 +1518,12 @@ class VegaRobot:
             self._vel_log_file.close()
             self._vel_log_file = None
         self._stop_gripper_worker()
-        errors = []
-        if (
-            not getattr(self, "_hand_shutdown_completed", False)
-            and self.gripper_type
-            in ("robotiq", "sr_gripper", "wuji_hand_v1", "wuji_hand_v2")
-            and self.hand is not None
-        ):
+        if self.gripper_type in ("robotiq", "sr_gripper", "wuji_hand_v1", "wuji_hand_v2") and self.hand is not None:
             try:
                 self.hand.shutdown()
-                self._hand_shutdown_completed = True
-            except Exception as exc:
-                errors.append(f"hand shutdown failed: {exc}")
-        # The hand adapters share lower-level process/device resources with the
-        # robot runtime.  Never close the base transport until required hand
-        # teardown has succeeded; otherwise a retry cannot finish the hand.
-        hand_shutdown_required = (
-            self.gripper_type
-            in ("robotiq", "sr_gripper", "wuji_hand_v1", "wuji_hand_v2")
-            and self.hand is not None
-        )
-        if (
-            (not hand_shutdown_required or self._hand_shutdown_completed)
-            and not getattr(self, "_robot_shutdown_completed", False)
-        ):
-            try:
-                self.robot.shutdown()
-                self._robot_shutdown_completed = True
-            except Exception as exc:
-                errors.append(f"robot shutdown failed: {exc}")
-        if errors:
-            raise RuntimeError("; ".join(errors))
+            except Exception:
+                pass
+        try:
+            self.robot.shutdown()
+        except Exception:
+            pass

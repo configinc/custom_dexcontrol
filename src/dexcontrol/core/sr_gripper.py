@@ -172,53 +172,38 @@ class SrGripperAdapter:
         self._gripper: SrGripper | None = None
         self._worker: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._command_failed = threading.Event()
         self._bringup(calibrate=True)
 
     def _bringup(self, calibrate: bool) -> None:
         """Open EtherCAT, run full_init, start worker. Shared by __init__ and reconnect()."""
         logger.info("Connecting to SR gripper on {} ...", self._comport)
-        try:
-            driver = SrGripper.__new__(SrGripper)
-            self._gripper = driver
-            driver.__init__(comport=self._comport, stroke=_STROKE_M)
-            driver.full_init(timeout=self._init_timeout, calibrate=calibrate)
+        self._gripper = SrGripper(comport=self._comport, stroke=_STROKE_M)
+        self._gripper.full_init(timeout=self._init_timeout, calibrate=calibrate)
 
-            # Cached state in driver native frame (0 = open, stroke = closed).
-            self._cached_pos = float(driver.get_pos())
+        # Cached state in driver native frame (0 = open, stroke = closed).
+        self._cached_pos = float(self._gripper.get_pos())
 
-            # Slew limit tracker — last target we issued to the firmware.
-            self._last_slew_target: float | None = None
-            # Adapter-level dedup + worker re-stream source.
-            self._last_sent_packet: bytes = b""
-            self._last_send_t: float = 0.0
+        # Slew limit tracker — last target we *issued* to the firmware
+        # (clipped if needed). The caller's requested target may be further
+        # away; subsequent set_joint_pos calls continue converging at
+        # SLEW_PER_CALL_M per tick.
+        self._last_slew_target: float | None = None
+        # Adapter-level dedup + worker re-stream source. Mirrors upstream
+        # SrGripper.sendCommand()'s dedup guard but adds a periodic
+        # force-resend floor (_FORCE_RESEND_PERIOD_S) to keep the SR
+        # firmware's application state machine alive on long holds. The
+        # worker re-streams this packet from `_resend_active`; the dedup
+        # window prevents the 50 Hz cycling that wedges the firmware.
+        self._last_sent_packet: bytes = b""
+        self._last_send_t: float = 0.0
 
-            self._stop_event = threading.Event()
-            self._worker = threading.Thread(
-                target=self._worker_loop,
-                name="sr-gripper-worker",
-                daemon=True,
-            )
-            self._worker.start()
-        except BaseException:
-            while True:
-                try:
-                    self._stop_event.set()
-                    worker = self._worker
-                    if worker is not None and worker.is_alive():
-                        worker.join(timeout=2.0)
-                        if worker.is_alive():
-                            raise RuntimeError("SR gripper worker did not stop")
-                    if self._gripper is not None:
-                        self._gripper.shutdown()
-                    break
-                except BaseException as cleanup_exc:
-                    logger.error(
-                        "SR constructor cleanup is not yet safe; retrying: {}",
-                        cleanup_exc,
-                    )
-                    time.sleep(0.1)
-            raise
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name="sr-gripper-worker",
+            daemon=True,
+        )
+        self._worker.start()
 
         logger.info("SR gripper ready (async worker started).")
 
@@ -234,14 +219,7 @@ class SrGripperAdapter:
             + (TARGET_CLOSE - TARGET_OPEN) * (pos_m / _STROKE_M)
         ))
 
-    def _commit_target(
-        self,
-        pos_m: float,
-        vel: float,
-        force: float,
-        *,
-        allow_recovery: bool = False,
-    ) -> None:
+    def _commit_target(self, pos_m: float, vel: float, force: float) -> None:
         """Build a fresh control packet for a new target and send it.
 
         Runtime path. Deliberately avoids `SrGripper.goto()` — that
@@ -253,28 +231,16 @@ class SrGripperAdapter:
         """
         raw_target = self._pos_to_raw_target(pos_m)
         packet = build_ctrl_packet(CTRL_POSITION, raw_target)
+        now = time.time()
+        # Dedup: identical packet within the force-resend window -> skip.
+        # Identical packet outside that window -> resend (firmware keep-alive).
+        # Different packet -> always send (slew progressing or new caller target).
+        if (packet == self._last_sent_packet
+                and (now - self._last_send_t) < _FORCE_RESEND_PERIOD_S):
+            return
         with self._gripper_io_lock:
-            if self._command_failed.is_set() and not allow_recovery:
-                raise RuntimeError(
-                    "SR gripper command path is latched failed; Reset is required"
-                )
-            now = time.time()
-            # Dedup and the sticky admission check share the physical-I/O
-            # lock with failure publication, so a failure cannot appear
-            # between admission and the wire send.
-            if (
-                packet == self._last_sent_packet
-                and (now - self._last_send_t) < _FORCE_RESEND_PERIOD_S
-            ):
-                return
-            try:
-                ok = self._gripper.client.sendCommand(packet)
-            except Exception:
-                self._command_failed.set()
-                raise
-            if not ok:
-                self._command_failed.set()
-                raise RuntimeError("SR gripper target transmission failed")
+            ok = self._gripper.client.sendCommand(packet)
+        if ok:
             self._last_sent_packet = packet
             self._last_send_t = now
 
@@ -288,20 +254,14 @@ class SrGripperAdapter:
         that the per-send `_clear_error_latch` SDO write does not cycle
         the motion-done state machine into the unresponsive wedge.
         """
+        if not self._last_sent_packet:
+            return
+        now = time.time()
+        if (now - self._last_send_t) < _FORCE_RESEND_PERIOD_S:
+            return
         with self._gripper_io_lock:
-            if self._command_failed.is_set() or not self._last_sent_packet:
-                return
-            now = time.time()
-            if (now - self._last_send_t) < _FORCE_RESEND_PERIOD_S:
-                return
-            try:
-                ok = self._gripper.client.sendCommand(self._last_sent_packet)
-            except Exception:
-                self._command_failed.set()
-                raise
-            if not ok:
-                self._command_failed.set()
-                raise RuntimeError("SR gripper re-stream transmission failed")
+            ok = self._gripper.client.sendCommand(self._last_sent_packet)
+        if ok:
             self._last_send_t = now
 
     def _worker_loop(self) -> None:
@@ -319,34 +279,18 @@ class SrGripperAdapter:
         """
         while not self._stop_event.is_set():
             time.sleep(_RESTREAM_PERIOD_S)
-            if self._stop_event.is_set():
-                break
             try:
-                if not self._command_failed.is_set():
-                    self._resend_active()
+                self._resend_active()
             except Exception as e:
-                self._command_failed.set()
                 logger.warning("SR worker re-stream error: {}", e)
 
             try:
-                if self._stop_event.is_set():
-                    break
                 with self._gripper_io_lock:
-                    try:
-                        status_ok = self._gripper.getStatus()
-                        if not status_ok:
-                            raise RuntimeError("SR gripper state readback failed")
-                        measured = float(self._gripper.get_pos())
-                        if not np.isfinite(measured) or not 0.0 <= measured <= _STROKE_M:
-                            raise RuntimeError("SR gripper state readback is invalid")
-                    except Exception:
-                        self._command_failed.set()
-                        raise
+                    status_ok = self._gripper.getStatus()
                 if status_ok:
                     with self._state_lock:
-                        self._cached_pos = measured
+                        self._cached_pos = float(self._gripper.get_pos())
             except Exception as e:
-                self._command_failed.set()
                 logger.warning("SR worker state refresh error: {}", e)
 
     # ------------------------------------------------------------------
@@ -380,10 +324,6 @@ class SrGripperAdapter:
                 0 = open, stroke = closed.
             wait_time: Seconds to sleep after sending the command.
         """
-        if self._command_failed.is_set():
-            raise RuntimeError(
-                "SR gripper command path is latched failed; Reset is required"
-            )
         pos_m = float(np.asarray(joint_pos, dtype=np.float64).flat[0])
         pos_m = float(np.clip(pos_m, 0.0, _STROKE_M))
 
@@ -412,9 +352,7 @@ class SrGripperAdapter:
         try:
             self._commit_target(issued, 0.05, 95)
         except Exception as e:
-            self._command_failed.set()
             logger.warning("SR set_joint_pos send error: {}", e)
-            raise
         # No optimistic _cached_pos update — the worker fights it with
         # the real 1 kHz PDO measurement otherwise, producing visible jumps.
         if wait_time > 0.0:
@@ -433,42 +371,6 @@ class SrGripperAdapter:
         if name not in _POSE_POOL:
             raise KeyError(f"Unknown predefined pose '{name}'. Available: {list(_POSE_POOL)}")
         return _POSE_POOL[name].copy()
-
-    def reset_command_state(self) -> None:
-        """Drain re-stream work and replace the active target with measured hold."""
-        self._stop_event.set()
-        worker = self._worker
-        if worker is not None and worker.is_alive():
-            worker.join(timeout=2.0)
-            if worker.is_alive():
-                raise RuntimeError("SR gripper worker did not stop within 2 seconds")
-        with self._gripper_io_lock:
-            if not self._gripper.getStatus():
-                raise RuntimeError("SR gripper measured hold readback failed")
-            measured = float(self._gripper.get_pos())
-        if not np.isfinite(measured) or not 0.0 <= measured <= _STROKE_M:
-            raise RuntimeError("SR gripper measured hold is invalid")
-        with self._state_lock:
-            self._cached_pos = measured
-        self._last_sent_packet = b""
-        self._last_send_t = 0.0
-        self._last_slew_target = measured
-        self._commit_target(measured, 0.05, 95, allow_recovery=True)
-        if not hasattr(self, "_command_failed"):
-            self._command_failed = threading.Event()
-        self._command_failed.clear()
-        self._stop_event = threading.Event()
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            name="sr-gripper-worker",
-            daemon=True,
-        )
-        self._worker.start()
-
-    @property
-    def command_path_healthy(self) -> bool:
-        failed = getattr(self, "_command_failed", None)
-        return failed is None or not failed.is_set()
 
     def reconnect(self) -> None:
         """Tear down and re-establish the SR EtherCAT connection.
@@ -499,9 +401,10 @@ class SrGripperAdapter:
         self._stop_event.set()
         if self._worker is not None and self._worker.is_alive():
             self._worker.join(timeout=2.0)
-            if self._worker.is_alive():
-                raise RuntimeError("SR gripper worker did not stop within 2 seconds")
-        self._gripper.shutdown()
+        try:
+            self._gripper.shutdown()
+        except Exception:
+            pass
 
         self._bringup(calibrate=False)
 
@@ -514,6 +417,7 @@ class SrGripperAdapter:
         self._stop_event.set()
         if self._worker is not None and self._worker.is_alive():
             self._worker.join(timeout=2.0)
-            if self._worker.is_alive():
-                raise RuntimeError("SR gripper worker did not stop within 2 seconds")
-        self._gripper.shutdown()
+        try:
+            self._gripper.shutdown()
+        except Exception:
+            pass

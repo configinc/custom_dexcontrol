@@ -79,10 +79,6 @@ class Arm(ManagedJointComponent):
             name: Component name.
             robot_info: RobotInfo instance (kept for compatibility).
         """
-        self.wrench_sensor: ArmWrenchSensor | None = None
-        self.temperature_sensor: TemperatureSensor | None = None
-        self._ee_pass_through_publisher = None
-        self._ee_pass_through_subscriber = None
         joint_names = robot_info.get_component_joints(name)
         joint_pos_limits = robot_info.get_joint_pos_limits(joint_names)
         joint_vel_limit = robot_info.get_joint_vel_limits(joint_names)
@@ -101,26 +97,24 @@ class Arm(ManagedJointComponent):
         )
         self._side = config.side
         # Initialize wrench sensor if configured
+        self.wrench_sensor: ArmWrenchSensor | None = None
         if config.wrench_sub_topic:
             wrench_sensor_name = f"{name}_wrench_sensor"
-            self.wrench_sensor = ArmWrenchSensor.__new__(ArmWrenchSensor)
-            self._subcomponents["wrench_sensor"] = self.wrench_sensor
-            ArmWrenchSensor.__init__(
-                self.wrench_sensor,
+            self.wrench_sensor = ArmWrenchSensor(
                 wrench_sensor_name,
                 config.wrench_sub_topic,
                 config.wrist_button_sub_topic,
             )
+        if self.wrench_sensor:
+            self._subcomponents["wrench_sensor"] = self.wrench_sensor
 
         # Initialize temperature sensor if configured
+        self.temperature_sensor: TemperatureSensor | None = None
         if hasattr(config, "temperature_sub_topic") and config.temperature_sub_topic:
-            self.temperature_sensor = TemperatureSensor.__new__(TemperatureSensor)
-            self._subcomponents["temperature_sensor"] = self.temperature_sensor
-            TemperatureSensor.__init__(
-                self.temperature_sensor,
-                f"{name}_temperature",
-                config.temperature_sub_topic,
+            self.temperature_sensor = TemperatureSensor(
+                f"{name}_temperature", config.temperature_sub_topic
             )
+            self._subcomponents["temperature_sensor"] = self.temperature_sensor
 
         # Initialize end effector pass through publisher and subscriber using DexComm
         self.enable_ee_pass_through = config.enable_ee_pass_through
@@ -726,11 +720,7 @@ class Arm(ManagedJointComponent):
 
     def shutdown(self) -> None:
         """Cleans up all Zenoh resources."""
-        errors: list[str] = []
-        try:
-            super().shutdown()
-        except Exception as exc:
-            errors.append(f"arm transport: {exc}")
+        super().shutdown()
         try:
             # Mode querier cleanup no longer needed with DexComm
             pass
@@ -742,35 +732,8 @@ class Arm(ManagedJointComponent):
                     f"Error undeclaring mode querier for {self.__class__.__name__}: {e}"
                 )
 
-        wrench_sensor = getattr(self, "wrench_sensor", None)
-        if wrench_sensor:
-            try:
-                wrench_sensor.shutdown()
-                self.wrench_sensor = None
-            except Exception as exc:
-                errors.append(f"wrench sensor: {exc}")
-        temperature_sensor = getattr(self, "temperature_sensor", None)
-        if temperature_sensor:
-            try:
-                temperature_sensor.shutdown()
-                self.temperature_sensor = None
-            except Exception as exc:
-                errors.append(f"temperature sensor: {exc}")
-        for label, resource in (
-            ("EE pass-through subscriber", getattr(self, "_ee_pass_through_subscriber", None)),
-            ("EE pass-through publisher", getattr(self, "_ee_pass_through_publisher", None)),
-        ):
-            if resource is not None:
-                try:
-                    resource.shutdown()
-                    if "subscriber" in label:
-                        self._ee_pass_through_subscriber = None
-                    else:
-                        self._ee_pass_through_publisher = None
-                except Exception as exc:
-                    errors.append(f"{label}: {exc}")
-        if errors:
-            raise RuntimeError("; ".join(errors))
+        if self.wrench_sensor:
+            self.wrench_sensor.shutdown()
 
     def send_ee_pass_through_message(self, message: bytes) -> None:
         """Send an end effector pass through message to the robot arm.
@@ -833,7 +796,6 @@ class ArmWrenchSensor(RobotComponent):
             state_sub_topic: Zenoh topic to subscribe to for wrench sensor data.
             button_sub_topic: Zenoh topic to subscribe to for wrist button state.
         """
-        self._button_subscriber = None
         super().__init__(
             name=name,
             state_sub_topic=state_sub_topic,
@@ -863,20 +825,9 @@ class ArmWrenchSensor(RobotComponent):
         The base class only shuts down ``_subscriber``; the button subscriber is
         owned by this class and must be torn down explicitly to avoid leaking it.
         """
-        errors: list[str] = []
-        button_subscriber = getattr(self, "_button_subscriber", None)
-        if button_subscriber:
-            try:
-                button_subscriber.shutdown()
-                self._button_subscriber = None
-            except Exception as exc:
-                errors.append(f"button subscriber: {exc}")
-        try:
-            super().shutdown()
-        except Exception as exc:
-            errors.append(f"wrench subscriber: {exc}")
-        if errors:
-            raise RuntimeError("; ".join(errors))
+        if hasattr(self, "_button_subscriber") and self._button_subscriber:
+            self._button_subscriber.shutdown()
+        super().shutdown()
 
     def _on_button_update(self, state: Any) -> None:
         """Handle incoming button updates.
@@ -898,12 +849,7 @@ class ArmWrenchSensor(RobotComponent):
         return wrench
 
     def get_wrench_sample(self) -> tuple[Float[np.ndarray, "6"], int]:
-        """Return one wrench and its sensor-acquisition timestamp atomically.
-
-        The timestamp is read from the same decoded sensor message as the wrench;
-        callers must not substitute a robot-state timestamp because the two
-        streams can advance independently.
-        """
+        """Return one wrench and its sensor-acquisition timestamp atomically."""
         state = super().get_state()
         timestamp_ns = state.get("timestamp_ns")
         if isinstance(timestamp_ns, bool) or not isinstance(timestamp_ns, int):
