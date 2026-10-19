@@ -107,7 +107,7 @@ def test_interpolated_tick_preserves_production_input_rate_dispatch():
     assert calls[1][1]["execution_hz"] == 100
 
 
-def test_interpolated_tick_propagates_physical_dispatch_failure():
+def test_interpolated_tick_preserves_production_recovery_after_dispatch_failure():
     robot = VegaRobot.__new__(VegaRobot)
     robot._interp_lock = threading.Lock()
     robot._latest_target_joint_pos = np.ones(7)
@@ -132,8 +132,7 @@ def test_interpolated_tick_propagates_physical_dispatch_failure():
     )
     robot._apply_hand_action = lambda *_args, **_kwargs: None
 
-    with pytest.raises(RuntimeError, match="transport failed"):
-        robot.execute_interpolated_tick()
+    assert robot.execute_interpolated_tick()
 
     assert robot._prev_command_successful is False
 
@@ -519,7 +518,7 @@ def test_reset_command_state_reseeds_outer_gripper_cache_from_hold():
     assert robot._prev_gripper_command_successful is True
 
 
-def test_successful_telemetry_does_not_erase_sticky_hand_dispatch_failure():
+def test_successful_telemetry_recovers_transient_hand_read_failure():
     robot = VegaRobot.__new__(VegaRobot)
     robot.hand = type(
         "Hand", (), {"get_joint_pos": lambda self: np.array([0.04])}
@@ -533,7 +532,7 @@ def test_successful_telemetry_does_not_erase_sticky_hand_dispatch_failure():
     robot._prev_gripper_command_successful = False
 
     assert robot._refresh_gripper_state() is True
-    assert robot._prev_gripper_command_successful is False
+    assert robot._prev_gripper_command_successful is True
 
 
 def test_outer_gripper_worker_drops_buffered_target_after_adapter_failure():

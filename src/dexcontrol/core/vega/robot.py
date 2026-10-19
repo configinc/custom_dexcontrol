@@ -664,6 +664,10 @@ class VegaRobot:
             with self._gripper_state_lock:
                 self._gripper_joint_pos = hand_joint_pos.copy()
                 self._gripper_position = gripper_position
+            # Match the production recovery behavior: a transient telemetry
+            # read failure must not leave the hand path permanently latched
+            # after communication is healthy again.
+            self._prev_gripper_command_successful = True
             return True
         except Exception:
             self._prev_gripper_command_successful = False
@@ -1212,11 +1216,9 @@ class VegaRobot:
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
             self._prev_command_successful = False
-            raise
         except Exception as exc:
             self._prev_command_successful = False
             _logger.error("Interpolated tick failed: %s", exc)
-            raise
 
         return True
 
