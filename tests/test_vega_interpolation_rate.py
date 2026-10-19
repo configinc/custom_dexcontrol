@@ -104,7 +104,7 @@ def test_interpolated_tick_preserves_production_input_rate_dispatch():
     assert "execution_hz" not in calls[0][1]
     assert "feedforward_velocity" not in calls[0][1]
     assert "force_zero_feedforward" not in calls[0][1]
-    assert "execution_hz" not in calls[1][1]
+    assert calls[1][1]["execution_hz"] == 100
 
 
 def test_interpolated_tick_propagates_physical_dispatch_failure():

@@ -1207,6 +1207,7 @@ class VegaRobot:
                 hand_action,
                 "velocity" if gripper_vel else "position",
                 blocking=False,
+                execution_hz=self.interpolation_control_hz,
             )
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
