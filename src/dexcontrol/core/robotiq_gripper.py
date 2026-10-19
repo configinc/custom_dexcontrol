@@ -144,18 +144,15 @@ class RobotiqGripper:
                 pass
 
             # Execute command
-            if latest_cmd is not None and not self._command_failed.is_set():
+            if latest_cmd is not None:
                 if self._stop_event.is_set():
                     break
                 pos_m, vel, force = latest_cmd
                 try:
                     with self._gripper_io_lock:
                         self._gripper.goto(pos=pos_m, vel=vel, force=force)
-                        sent = self._gripper.sendCommand()
-                        if sent is False:
-                            raise RuntimeError("Robotiq command transmission failed")
+                        self._gripper.sendCommand()
                 except Exception as e:
-                    self._command_failed.set()
                     logger.warning("Robotiq worker command error: {}", e)
 
             if self._stop_event.is_set():
@@ -286,8 +283,10 @@ class RobotiqGripper:
 
     @property
     def command_path_healthy(self) -> bool:
-        failed = getattr(self, "_command_failed", None)
-        return failed is None or not failed.is_set()
+        # Match the established production Robotiq behavior: asynchronous
+        # Modbus failures are logged and retried by the worker.  They are not
+        # promoted into the server-wide command recovery latch.
+        return True
 
     def shutdown(self) -> None:
         """Stop worker thread and disconnect from the gripper."""

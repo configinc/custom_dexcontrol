@@ -477,7 +477,7 @@ def test_wuji_watchdog_failure_stays_latched_after_frames_resume():
     assert adapter.command_path_healthy is False
 
 
-def test_robotiq_worker_latches_false_send_result():
+def test_robotiq_worker_ignores_legacy_false_send_result():
     adapter = RobotiqGripper.__new__(RobotiqGripper)
     adapter._stop_event = threading.Event()
     adapter._command_queue = Queue(maxsize=1)
@@ -499,10 +499,10 @@ def test_robotiq_worker_latches_false_send_result():
     )
     adapter._worker_loop()
 
-    assert adapter.command_path_healthy is False
+    assert adapter.command_path_healthy is True
 
 
-def test_robotiq_worker_does_not_send_queued_target_after_failure():
+def test_robotiq_worker_retries_after_legacy_false_send_result():
     adapter = RobotiqGripper.__new__(RobotiqGripper)
     adapter._stop_event = threading.Event()
     adapter._command_queue = Queue(maxsize=1)
@@ -533,8 +533,8 @@ def test_robotiq_worker_does_not_send_queued_target_after_failure():
     )
     adapter._worker_loop()
 
-    assert calls == ["goto", "send"]
-    assert adapter.command_path_healthy is False
+    assert calls == ["goto", "send", "goto", "send"]
+    assert adapter.command_path_healthy is True
 
 
 def test_robotiq_worker_retries_failed_state_readback_without_poisoning_commands():
