@@ -147,23 +147,36 @@ class StreamSubscriber(SubscriptionPolicyMixin):
         self._active = False
         self._receive_count: int = 0
 
-        # Validate and create subscriber based on transport type
-        if transport == TransportType.ZENOH:
-            self._create_zenoh_subscriber(node, topic, buffer_size)
-        elif transport == TransportType.RTC:
-            self._create_rtc_subscriber(
-                rtc_channel, width, height, codec, buffer_size
-            )
-        else:
-            raise ValueError(f"Unknown transport type: {transport}")
+        try:
+            # Validate and create subscriber based on transport type.
+            if transport == TransportType.ZENOH:
+                self._create_zenoh_subscriber(node, topic, buffer_size)
+            elif transport == TransportType.RTC:
+                self._create_rtc_subscriber(
+                    rtc_channel, width, height, codec, buffer_size
+                )
+            else:
+                raise ValueError(f"Unknown transport type: {transport}")
 
-        # Initialize policy manager for lifecycle control
-        if self._subscriber is not None:
-            self._policy_manager = SubscriptionPolicyManager(
-                self._subscriber, name=stream_name
-            )
-        else:
-            self._policy_manager = None
+            # Initialize policy manager for lifecycle control.
+            if self._subscriber is not None:
+                self._policy_manager = SubscriptionPolicyManager(
+                    self._subscriber, name=stream_name
+                )
+            else:
+                self._policy_manager = None
+        except BaseException:
+            while True:
+                try:
+                    self.shutdown()
+                    break
+                except BaseException as cleanup_exc:
+                    logger.error(
+                        "Stream constructor cleanup is not yet safe; retrying: {}",
+                        cleanup_exc,
+                    )
+                    time.sleep(0.1)
+            raise
         self._subcomponents: dict[str, object] = {}
 
     def _create_zenoh_subscriber(
@@ -446,8 +459,8 @@ class StreamSubscriber(SubscriptionPolicyMixin):
                 logger.error(
                     f"Error shutting down '{self.stream_name}': {e}"
                 )
-            finally:
-                self._subscriber = None
+                raise
+            self._subscriber = None
 
         # Clear RTC-specific state
         if self._frame_queue is not None:
@@ -603,10 +616,13 @@ class BaseCameraSensor(SubscriptionPolicyMixin, ABC):
         Thread Safety:
             This method is thread-safe.
         """
-        logger.info(f"Shutting down camera '{self._name}'")
+        logger.info(f"Shutting down camera '{getattr(self, '_name', 'partial')}'")
 
-        # Shutdown all streams
-        for stream_name, stream in self._streams.items():
+        errors: list[str] = []
+        # Shutdown all streams. Successful stream shutdowns are idempotent;
+        # failed ones retain their subscriber so constructor/service cleanup
+        # can retry instead of reporting false success.
+        for stream_name, stream in getattr(self, "_streams", {}).items():
             if stream is not None:
                 try:
                     stream.shutdown()
@@ -614,6 +630,10 @@ class BaseCameraSensor(SubscriptionPolicyMixin, ABC):
                     logger.error(
                         f"Error shutting down stream '{stream_name}': {e}"
                     )
+                    errors.append(f"{stream_name}: {e}")
+
+        if errors:
+            raise RuntimeError("camera stream shutdown failed: " + "; ".join(errors))
 
         # Shared node is shut down by Robot.shutdown() via shutdown_shared_node()
 

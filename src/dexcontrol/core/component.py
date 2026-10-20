@@ -155,6 +155,7 @@ class RobotComponent(SubscriptionPolicyMixin):
         """
         if hasattr(self, "_subscriber") and self._subscriber:
             self._subscriber.shutdown()
+            self._subscriber = None
 
     def get_timestamp_ns(self) -> int:
         """Get the timestamp (in nanoseconds) of the most recent state update.
@@ -253,13 +254,20 @@ class RobotJointComponent(RobotComponent):
 
     def shutdown(self) -> None:
         """Cleans up the raw control publisher (and the inherited subscriber)."""
-        super().shutdown()
+        errors: list[str] = []
+        try:
+            super().shutdown()
+        except Exception as e:
+            errors.append(f"subscriber: {e}")
         try:
             if hasattr(self, "_publisher") and self._publisher:
                 self._publisher.shutdown()
+                self._publisher = None
         except Exception as e:
-            logger.warning(
-                f"Error shutting down publisher for {self.__class__.__name__}: {e}"
+            errors.append(f"publisher: {e}")
+        if errors:
+            raise RuntimeError(
+                f"{self.__class__.__name__} shutdown failed: " + "; ".join(errors)
             )
 
     @property
@@ -1519,6 +1527,7 @@ class ManagedJointComponent(RobotJointComponent, MotionPluginManaged):
 
     def shutdown(self) -> None:
         """Cancel in-flight motions, then clean up motion-plugin resources."""
+        errors: list[str] = []
         # Cancel any in-flight tracked motions before destroying the target
         # publisher so the plugin stops its trajectory.
         try:
@@ -1544,27 +1553,31 @@ class ManagedJointComponent(RobotJointComponent, MotionPluginManaged):
         try:
             if hasattr(self, "_target_publisher") and self._target_publisher:
                 self._target_publisher.shutdown()
+                self._target_publisher = None
         except Exception as e:
-            logger.warning(
-                f"Error shutting down target publisher for {self.__class__.__name__}: {e}"
-            )
+            errors.append(f"target publisher: {e}")
         try:
             if hasattr(self, "_trajectory_publisher") and self._trajectory_publisher:
                 self._trajectory_publisher.shutdown()
+                self._trajectory_publisher = None
         except Exception as e:
-            logger.warning(
-                f"Error shutting down trajectory publisher for {self.__class__.__name__}: {e}"
-            )
+            errors.append(f"trajectory publisher: {e}")
         try:
             if (
                 hasattr(self, "_motion_status_subscriber")
                 and self._motion_status_subscriber
             ):
                 self._motion_status_subscriber.shutdown()
+                self._motion_status_subscriber = None
         except Exception as e:
-            logger.warning(
-                f"Error shutting down status subscriber for {self.__class__.__name__}: {e}"
-            )
+            errors.append(f"status subscriber: {e}")
 
         # Then run RobotJointComponent.shutdown (publisher + inherited subscriber).
-        super().shutdown()
+        try:
+            super().shutdown()
+        except Exception as e:
+            errors.append(f"joint transport: {e}")
+        if errors:
+            raise RuntimeError(
+                f"{self.__class__.__name__} shutdown failed: " + "; ".join(errors)
+            )

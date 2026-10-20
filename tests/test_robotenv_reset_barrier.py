@@ -1,0 +1,1286 @@
+import sys
+import threading
+import logging
+import time
+from types import ModuleType, SimpleNamespace
+
+import grpc
+import numpy as np
+import pytest
+
+# Keep this server test independent of the optional DualSense/hidapi stack.
+_base_arm_teleop = ModuleType("base_arm_teleop")
+_base_arm_teleop.BaseIKController = object
+sys.modules.setdefault("base_arm_teleop", _base_arm_teleop)
+
+import dexcontrol.core.robotenv_vega.server as server_module  # noqa: E402
+from dexcontrol.core.robotenv_vega.server import (  # noqa: E402
+    VegaRobotEnvService,
+    _shutdown_service_until_safe,
+)
+
+
+def test_serve_defers_startup_signal_until_service_has_cleanup_owner(
+    monkeypatch, tmp_path
+):
+    handlers = {}
+    calls = []
+
+    class Service:
+        def __init__(self, **_kwargs):
+            calls.append("service-created")
+            handlers[server_module.signal.SIGTERM](server_module.signal.SIGTERM, None)
+
+        def shutdown(self):
+            calls.append("service-shutdown")
+
+    monkeypatch.setattr(server_module, "VegaRobotEnvService", Service)
+    monkeypatch.setattr(
+        server_module.signal, "getsignal", lambda signum: f"old-{signum}"
+    )
+    monkeypatch.setattr(
+        server_module.signal,
+        "signal",
+        lambda signum, handler: handlers.__setitem__(signum, handler),
+    )
+    monkeypatch.setattr(
+        server_module.signal, "pthread_sigmask", lambda *_args: set()
+    )
+    monkeypatch.setattr(
+        server_module.os.path,
+        "expanduser",
+        lambda _path: str(tmp_path / "robotenv_vega.log"),
+    )
+
+    with pytest.raises(SystemExit):
+        server_module.serve(arm_side="left")
+
+    assert calls == ["service-created", "service-shutdown"]
+
+
+def test_serve_does_not_acquire_hardware_after_bootstrap_shutdown(
+    monkeypatch, tmp_path
+):
+    handlers = {}
+    calls = []
+
+    class Handler(logging.Handler):
+        def __init__(self, _path):
+            super().__init__()
+            handlers[server_module.signal.SIGTERM](server_module.signal.SIGTERM, None)
+
+    class Service:
+        def __init__(self, **_kwargs):
+            calls.append("service-created")
+
+    circular_module = sys.modules["core.robotenv_vega.circular_file_handler"]
+    monkeypatch.setattr(circular_module, "CircularFileHandler", Handler)
+    monkeypatch.setattr(server_module, "VegaRobotEnvService", Service)
+    monkeypatch.setattr(
+        server_module.signal, "getsignal", lambda signum: f"old-{signum}"
+    )
+    monkeypatch.setattr(
+        server_module.signal,
+        "signal",
+        lambda signum, handler: handlers.__setitem__(signum, handler),
+    )
+    monkeypatch.setattr(
+        server_module.signal, "pthread_sigmask", lambda *_args: set()
+    )
+    monkeypatch.setattr(
+        server_module.os.path,
+        "expanduser",
+        lambda _path: str(tmp_path / "robotenv_vega.log"),
+    )
+
+    with pytest.raises(SystemExit):
+        server_module.serve(arm_side="left")
+
+    assert calls == []
+
+
+class _Robot:
+    interpolation_enabled = False
+
+    def __init__(self):
+        self.commands = []
+        self.closed = False
+        self.command_state_resets = 0
+
+    def update_command(self, action, **kwargs):
+        self.commands.append((np.asarray(action).copy(), kwargs))
+
+    def close(self):
+        self.closed = True
+
+    def reset_filter_state(self):
+        self.command_state_resets += 1
+
+    def reset_command_state(self):
+        self.command_state_resets += 1
+
+
+def _service():
+    service = VegaRobotEnvService.__new__(VegaRobotEnvService)
+    service.arm_side = "left"
+    service._cmd_lock = threading.Lock()
+    service._command_epoch_lock = threading.Lock()
+    service._command_epoch = 0
+    service._reset_in_progress = threading.Event()
+    service._reset_state_lock = threading.Lock()
+    service._active_reset_count = 0
+    service._active_reset_cancel = None
+    service._reset_restart_control_loop = False
+    service._shutdown_started = threading.Event()
+    service._shutdown_lock = threading.Lock()
+    service._shutdown_completed = False
+    service._transport_rpc_condition = threading.Condition()
+    service._active_transport_rpcs = 0
+    service._control_loop_hz = 0
+    service._robot = _Robot()
+    service._control_loop_thread = None
+    service._force_calibration_owner_lock = threading.Lock()
+    service._force_calibration_owns_robot = threading.Event()
+    service._command_recovery_required = threading.Event()
+    service._command_recovery_error = ""
+    return service
+
+
+class _UnstoppableThread:
+    def __init__(self):
+        self.join_calls = []
+
+    def is_alive(self):
+        return True
+
+    def join(self, timeout=None):
+        self.join_calls.append(timeout)
+
+
+def test_control_loop_stop_keeps_live_thread_handle_and_fails_closed():
+    service = _service()
+    service._control_loop_stop = threading.Event()
+    thread = _UnstoppableThread()
+    service._control_loop_thread = thread
+
+    with pytest.raises(RuntimeError, match="did not stop"):
+        service._stop_control_loop()
+
+    assert service._control_loop_thread is thread
+    assert service._control_loop_stop.is_set()
+    assert thread.join_calls == [2.0]
+
+
+@pytest.mark.parametrize(
+    "control_hz", [0, -20, 0.5, 20.5, float("nan"), False, np.bool_(True)]
+)
+def test_service_rejects_invalid_control_hz_before_robot_creation(
+    monkeypatch, control_hz
+):
+    robot_calls = []
+    monkeypatch.setattr(
+        server_module, "VegaRobot", lambda **kwargs: robot_calls.append(kwargs)
+    )
+
+    with pytest.raises(ValueError, match="control_hz must be a finite positive integer"):
+        VegaRobotEnvService(arm_side="left", control_hz=control_hz)
+
+    assert robot_calls == []
+
+
+def test_service_uses_normalized_control_hz_after_validation(monkeypatch):
+    calls = []
+
+    class StopConstruction(Exception):
+        pass
+
+    class Robot:
+        def __init__(self, **kwargs):
+            calls.append(kwargs["control_hz"])
+            raise StopConstruction
+
+    monkeypatch.setattr(server_module, "VegaRobot", Robot)
+
+    with pytest.raises(StopConstruction):
+        VegaRobotEnvService(arm_side="left", control_hz="20")
+
+    assert calls == [20]
+
+
+@pytest.mark.parametrize(
+    "control_loop_hz",
+    [-1, 0.5, float("nan"), float("inf"), False, np.bool_(True)],
+)
+def test_service_rejects_invalid_control_loop_hz_before_robot_creation(
+    monkeypatch, control_loop_hz
+):
+    robot_calls = []
+    monkeypatch.setattr(
+        server_module,
+        "VegaRobot",
+        lambda **kwargs: robot_calls.append(kwargs),
+    )
+
+    with pytest.raises(
+        ValueError, match="control_loop_hz must be a finite non-negative integer"
+    ):
+        VegaRobotEnvService(arm_side="left", control_loop_hz=control_loop_hz)
+
+    assert robot_calls == []
+
+
+@pytest.mark.parametrize("control_loop_hz", ["0", "100", 100.0, np.int64(100)])
+def test_service_normalizes_control_loop_hz_before_robot_creation(
+    monkeypatch, control_loop_hz
+):
+    calls = []
+
+    class StopConstruction(Exception):
+        pass
+
+    class Robot:
+        def __init__(self, **kwargs):
+            calls.append(kwargs["interpolation_control_hz"])
+            raise StopConstruction
+
+    monkeypatch.setattr(server_module, "VegaRobot", Robot)
+
+    with pytest.raises(StopConstruction):
+        VegaRobotEnvService(
+            arm_side="left",
+            interpolation_method="linear",
+            control_loop_hz=control_loop_hz,
+        )
+
+    assert calls == [int(control_loop_hz) or 20]
+
+
+@pytest.mark.parametrize("ema_alpha", [1.0, "1.0", 2.0])
+def test_service_normalizes_ema_alpha_before_robot_creation(monkeypatch, ema_alpha):
+    calls = []
+
+    class StopConstruction(Exception):
+        pass
+
+    class Robot:
+        def __init__(self, **kwargs):
+            calls.append(kwargs["ema_alpha"])
+            raise StopConstruction
+
+    monkeypatch.setattr(server_module, "VegaRobot", Robot)
+
+    with pytest.raises(StopConstruction):
+        VegaRobotEnvService(arm_side="left", ema_alpha=ema_alpha)
+
+    assert calls == [0.99]
+
+
+@pytest.mark.parametrize(
+    "ema_alpha",
+    [float("nan"), float("inf"), "bad", True, np.bool_(True)],
+)
+def test_service_rejects_invalid_ema_alpha_before_robot_creation(
+    monkeypatch, ema_alpha
+):
+    robot_calls = []
+    monkeypatch.setattr(
+        server_module,
+        "VegaRobot",
+        lambda **kwargs: robot_calls.append(kwargs),
+    )
+
+    with pytest.raises(ValueError, match="ema_alpha must be finite"):
+        VegaRobotEnvService(arm_side="left", ema_alpha=ema_alpha)
+
+    assert robot_calls == []
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("filter_ema_alpha", float("nan")),
+        ("vel_smoothing_alpha", float("nan")),
+        ("hw_correction_alpha", float("inf")),
+        ("vel_ratio", float("inf")),
+        ("vel_ratio", -1.0),
+        ("vel_smoothing_alpha", np.bool_(True)),
+        ("max_delta_scale", float("inf")),
+        ("max_jerk", float("inf")),
+        ("vel_damp_thresh", float("nan")),
+        ("rot_sensitivity", float("inf")),
+        ("vel_ratio", 1e308),
+        ("max_delta_scale", 3.01),
+        ("max_delta_scale", 0.0),
+        ("max_jerk", 0.251),
+        ("rot_sensitivity", 2.01),
+        ("head_init_pos", [float("nan"), 0.0, 0.0]),
+        ("head_init_pos", [1e308, 0.0, 0.0]),
+        ("head_init_pos", [True, False, False]),
+        ("wuji_effort_limit", float("inf")),
+        ("wuji_effort_limit", 1.71),
+        ("interpolation_history", 1),
+        ("filter_order", 0),
+    ],
+)
+def test_service_rejects_invalid_velocity_config_before_robot_creation(
+    monkeypatch, name, value
+):
+    robot_calls = []
+    monkeypatch.setattr(
+        server_module, "VegaRobot", lambda **kwargs: robot_calls.append(kwargs)
+    )
+
+    with pytest.raises(ValueError, match=name):
+        VegaRobotEnvService(arm_side="left", **{name: value})
+
+    assert robot_calls == []
+
+
+def test_cli_default_head_position_preserves_production_view(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(server_module, "serve", lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(
+        server_module.sys,
+        "argv",
+        ["server.py", "--arm-side", "left"],
+    )
+
+    server_module.main()
+
+    assert captured["head_init_pos"] == [2.0, 0.0, -0.3]
+
+
+def test_current_reset_discards_buffered_commands():
+    class Context:
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, _code):
+            pass
+
+        def set_details(self, _details):
+            pass
+
+    service = _service()
+    service._create_observation = lambda: ({}, 1)
+
+    response = service.Reset(
+        SimpleNamespace(mode="current", params={}), Context()
+    )
+
+    assert response.status == "SUCCESS"
+    assert service._robot.command_state_resets == 2
+
+
+def test_cancel_after_async_gripper_open_drains_reset_era_command():
+    class Context:
+        def __init__(self):
+            self.callback = None
+
+        def add_callback(self, callback):
+            self.callback = callback
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    service.reset_joints = np.zeros(7)
+    service._create_observation = lambda: ({}, 1)
+    context = Context()
+
+    def cancel_after_enqueue(*_args, **_kwargs):
+        context.callback()
+
+    service._robot.update_gripper = cancel_after_enqueue
+    service._robot.get_cached_gripper_position = lambda: 0.0
+
+    response = service.Reset(
+        SimpleNamespace(
+            mode="home",
+            params={
+                "calibration_cancellable": server_module.robotenv_pb2.Value(
+                    int_value=1
+                )
+            },
+        ),
+        context,
+    )
+
+    assert response.status == ""
+    # Initial boundary plus failure/cancellation cleanup.
+    assert service._robot.command_state_resets >= 2
+
+
+def test_post_launch_smoothing_log_failure_stops_worker_and_closes_robot(
+    monkeypatch
+):
+    robots = []
+
+    class Robot:
+        interpolation_enabled = False
+
+        def __init__(self, **kwargs):
+            self.ema_alpha = kwargs["ema_alpha"]
+            self.safe_transit_pose = np.zeros(7, dtype=np.float64)
+            self.robot = type("Base", (), {"robot_name": "fake"})()
+            self.launched = False
+            self.closed = False
+            robots.append(self)
+
+        def launch_robot(self):
+            self.launched = True
+
+        def close(self):
+            self.closed = True
+
+    original_info = server_module.LOGGER.info
+
+    def fail_at_smoothing_log(message, *args, **kwargs):
+        if str(message).startswith("2nd-order smoothing"):
+            raise OSError("injected post-launch logging failure")
+        return original_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(server_module, "VegaRobot", Robot)
+    monkeypatch.setattr(server_module.LOGGER, "info", fail_at_smoothing_log)
+
+    with pytest.raises(OSError, match="injected post-launch"):
+        VegaRobotEnvService(arm_side="left", ema_alpha=1.0)
+
+    assert len(robots) == 1
+    assert robots[0].ema_alpha == pytest.approx(0.99)
+    assert robots[0].launched
+    assert robots[0].closed
+
+
+def test_force_calibration_claim_rolls_back_if_control_loop_does_not_stop():
+    service = _service()
+    service._control_loop_stop = threading.Event()
+    service._control_loop_thread = _UnstoppableThread()
+
+    with pytest.raises(RuntimeError, match="did not stop"):
+        service._claim_robot_for_force_calibration()
+
+    assert service._force_calibration_owns_robot.is_set() is False
+    assert service._force_calibration_restart_control_loop is False
+
+
+def test_force_calibration_ownership_discards_commands_on_claim_and_release():
+    service = _service()
+    service._force_calibration_restart_control_loop = False
+
+    assert service._claim_robot_for_force_calibration() is True
+    assert service._robot.command_state_resets == 1
+
+    service._release_robot_from_force_calibration()
+    assert service._robot.command_state_resets == 2
+    assert service._force_calibration_owns_robot.is_set() is False
+
+
+def test_force_calibration_claim_waits_for_inflight_control_tick():
+    service = _service()
+    service._force_calibration_restart_control_loop = False
+    service._cmd_lock.acquire()
+
+    def finish_tick():
+        time.sleep(0.05)
+        service._cmd_lock.release()
+
+    tick = threading.Thread(target=finish_tick)
+    tick.start()
+    try:
+        assert service._claim_robot_for_force_calibration() is True
+    finally:
+        tick.join(timeout=1.0)
+
+    assert service._robot.command_state_resets == 1
+    assert service._force_calibration_owns_robot.is_set() is True
+
+
+def test_force_calibration_claim_drain_failure_restores_prior_loop_state():
+    class RunningThread:
+        def is_alive(self):
+            return True
+
+    service = _service()
+    service._control_loop_thread = RunningThread()
+    calls = []
+
+    def stop_loop():
+        calls.append("stop")
+        service._control_loop_thread = None
+
+    def start_loop():
+        calls.append("start")
+        service._control_loop_thread = RunningThread()
+
+    service._stop_control_loop = stop_loop
+    service._start_control_loop = start_loop
+    service._robot.reset_command_state = lambda: (_ for _ in ()).throw(
+        RuntimeError("drain failed")
+    )
+
+    with pytest.raises(RuntimeError, match="drain failed"):
+        service._claim_robot_for_force_calibration()
+
+    assert calls == ["stop", "start"]
+    assert service._force_calibration_owns_robot.is_set() is False
+    assert service._force_calibration_restart_control_loop is False
+    assert service._command_recovery_required.is_set()
+
+
+def test_command_recovery_drain_does_not_clear_interlock_before_reset_commit():
+    service = _service()
+    attempts = []
+
+    def reset():
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise RuntimeError("hardware busy")
+
+    service._robot.reset_command_state = reset
+
+    with pytest.raises(RuntimeError, match="hardware busy"):
+        service._reset_robot_command_state()
+    assert service._command_recovery_required.is_set()
+
+    service._reset_robot_command_state()
+    assert service._command_recovery_required.is_set()
+
+
+def test_failed_recovery_reset_keeps_interlock_latched():
+    class Context:
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    service._command_recovery_required.set()
+    service.reset_joints = np.zeros(7)
+    service._execute_reset_sequence = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(RuntimeError("arm transport still failed"))
+    )
+    context = Context()
+
+    service.Reset(SimpleNamespace(mode="home", params={}), context)
+
+    assert service._command_recovery_required.is_set()
+    assert context.code == grpc.StatusCode.INTERNAL
+
+
+def test_partial_reset_failure_latches_recovery_from_healthy_state():
+    class Context:
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    service.reset_joints = np.zeros(7)
+    service._execute_reset_sequence = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(RuntimeError("partial arm reset failure"))
+    )
+    context = Context()
+
+    service.Reset(SimpleNamespace(mode="home", params={}), context)
+
+    assert service._command_recovery_required.is_set()
+    assert "Reset did not complete safely" in service._command_recovery_error
+
+
+def test_successful_current_reset_commits_recovery_clear():
+    class Context:
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, _code):
+            pass
+
+        def set_details(self, _details):
+            pass
+
+    service = _service()
+    service._command_recovery_required.set()
+    service._command_recovery_error = "old dispatch failure"
+    service._create_observation = lambda: ({}, 1)
+
+    response = service.Reset(
+        SimpleNamespace(mode="current", params={}), Context()
+    )
+
+    assert response.status == "SUCCESS"
+    assert service._command_recovery_required.is_set() is False
+    assert service._command_recovery_error == ""
+
+
+def test_reset_does_not_commit_if_restarted_hand_worker_fails_during_observation():
+    class Context:
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    healthy = [True]
+    service._robot.hand_command_path_healthy = lambda: healthy[0]
+
+    def observation():
+        healthy[0] = False
+        return {}, 1
+
+    service._create_observation = observation
+    context = Context()
+
+    response = service.Reset(
+        SimpleNamespace(mode="current", params={}), context
+    )
+
+    assert response.status == ""
+    assert service._command_recovery_required.is_set()
+    assert context.code == grpc.StatusCode.INTERNAL
+
+
+def test_reset_clear_cannot_erase_failure_registered_during_commit():
+    class Context:
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    class FailingClearEvent:
+        def __init__(self, robot):
+            self._set = True
+            self._robot = robot
+
+        def is_set(self):
+            return self._set
+
+        def set(self):
+            self._set = True
+
+        def clear(self):
+            self._set = False
+            self._robot._prev_gripper_command_successful = False
+
+    service = _service()
+    service._robot.hand_command_path_healthy = lambda: bool(
+        service._robot._prev_gripper_command_successful
+    )
+    service._robot._prev_gripper_command_successful = True
+    service._command_recovery_required = FailingClearEvent(service._robot)
+    service._create_observation = lambda: ({}, 1)
+    context = Context()
+
+    response = service.Reset(
+        SimpleNamespace(mode="current", params={}), context
+    )
+
+    assert response.status == ""
+    assert service._command_recovery_required.is_set()
+    assert context.code == grpc.StatusCode.INTERNAL
+
+
+def test_control_loop_dispatch_failure_latches_recovery_and_stops_dispatch():
+    service = _service()
+    service._control_loop_hz = 1000
+    service._control_loop_stop = threading.Event()
+    calls = []
+
+    def fail_once():
+        calls.append(True)
+        service._control_loop_stop.set()
+        raise RuntimeError("arm transport failed")
+
+    service._robot.execute_interpolated_tick = fail_once
+    service._control_loop_run()
+
+    assert calls == [True]
+    assert service._command_recovery_required.is_set()
+    assert "arm transport failed" in service._command_recovery_error
+
+
+def test_interpolated_step_rejects_sticky_adapter_failure_before_buffering():
+    service = _service()
+    service._control_loop_hz = 200
+    service._robot.interpolation_enabled = True
+    service._robot.hand_command_path_healthy = lambda: False
+    service._robot._prev_gripper_command_successful = True
+    service._robot.add_command_point = lambda *_args, **_kwargs: pytest.fail(
+        "failed hand path must not buffer arm command"
+    )
+
+    with pytest.raises(
+        server_module.CommunicationFailedError, match="hand dispatch failed"
+    ):
+        service._dispatch_step_command(
+            np.zeros(8),
+            action_space="joint_position",
+            gripper_action_space="position",
+            command_epoch=0,
+        )
+
+    assert service._command_recovery_required.is_set()
+
+
+def test_health_check_reports_command_recovery_interlock():
+    service = _service()
+    service._robot.get_robot_state = lambda: ({}, {})
+    service._load_version_info = lambda: {"tag": "test"}
+    service._command_recovery_error = "interpolated dispatch failed"
+    service._command_recovery_required.set()
+
+    response = service.HealthCheck(None, SimpleNamespace())
+
+    assert response.status == "UNHEALTHY"
+    assert "command recovery required" in response.message
+
+
+def test_health_check_latches_idle_adapter_dispatch_failure_without_state_read():
+    service = _service()
+    service._load_version_info = lambda: {"tag": "test"}
+    service._robot.hand_command_path_healthy = lambda: False
+    service._robot.get_robot_state = lambda: pytest.fail(
+        "known adapter failure must fail before transport read"
+    )
+
+    response = service.HealthCheck(None, SimpleNamespace())
+
+    assert response.status == "UNHEALTHY"
+    assert service._command_recovery_required.is_set()
+    assert "hand dispatch failed" in response.message
+
+
+def test_health_check_latches_idle_outer_gripper_failure_without_state_read():
+    service = _service()
+    service._load_version_info = lambda: {"tag": "test"}
+    service._robot.hand_command_path_healthy = lambda: bool(
+        service._robot._prev_gripper_command_successful
+    )
+    service._robot._prev_gripper_command_successful = False
+    service._robot.get_robot_state = lambda: pytest.fail(
+        "known outer gripper failure must fail before transport read"
+    )
+
+    response = service.HealthCheck(None, SimpleNamespace())
+
+    assert response.status == "UNHEALTHY"
+    assert service._command_recovery_required.is_set()
+    assert "hand dispatch failed" in response.message
+
+
+def test_cancelled_reset_clears_buffered_commands_before_return():
+    service = _service()
+    calls = []
+    service._robot.reset_filter_state = lambda: calls.append("cleared")
+    cancelled = threading.Event()
+    cancelled.set()
+
+    service._execute_reset_sequence(
+        np.zeros(7), cancelled=cancelled, interruptible_gripper=True
+    )
+
+    assert calls == ["cleared"]
+
+
+def test_shutdown_closes_admission_before_draining_and_rejects_motion_rpcs():
+    service = _service()
+    service._control_loop_stop = threading.Event()
+    manager_calls = []
+    service._force_calibration_manager = SimpleNamespace(
+        shutdown=lambda: manager_calls.append(service._shutdown_started.is_set())
+    )
+    context = SimpleNamespace(code=None, details="")
+    context.set_code = lambda code: setattr(context, "code", code)
+    context.set_details = lambda details: setattr(context, "details", details)
+
+    service.shutdown()
+
+    assert manager_calls == [True]
+    assert service._shutdown_completed is True
+    assert service._robot.closed is True
+    assert service._claim_robot_for_force_calibration() is False
+
+    assert service.Reset(SimpleNamespace(mode="home", params={}), context).status == ""
+    assert context.code == grpc.StatusCode.UNAVAILABLE
+    context.code = None
+    assert service.Step(SimpleNamespace(), context).status == ""
+    assert context.code == grpc.StatusCode.UNAVAILABLE
+
+
+def test_shutdown_waits_for_admitted_current_reset_observation_before_close():
+    class Context:
+        def __init__(self):
+            self.code = None
+            self.details = ""
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    service._control_loop_stop = threading.Event()
+    service._force_calibration_manager = SimpleNamespace(shutdown=lambda: None)
+    service._force_calibration_owns_robot.set()
+    observation_started = threading.Event()
+    release_observation = threading.Event()
+
+    def observation():
+        observation_started.set()
+        assert release_observation.wait(timeout=1.0)
+        return {}, 1
+
+    service._create_observation = observation
+    reset_response = {}
+    reset_thread = threading.Thread(
+        target=lambda: reset_response.setdefault(
+            "value",
+            service.Reset(SimpleNamespace(mode="current", params={}), Context()),
+        )
+    )
+    shutdown_thread = threading.Thread(target=service.shutdown)
+
+    reset_thread.start()
+    assert observation_started.wait(timeout=1.0)
+    shutdown_thread.start()
+    threading.Event().wait(0.05)
+    assert service._shutdown_started.is_set()
+    assert service._robot.closed is False
+    assert shutdown_thread.is_alive()
+
+    release_observation.set()
+    reset_thread.join(timeout=1.0)
+    shutdown_thread.join(timeout=1.0)
+
+    assert reset_response["value"].status == "SUCCESS"
+    assert service._robot.closed is True
+    assert service._active_transport_rpcs == 0
+
+
+def test_shutdown_runner_retries_without_returning_after_fail_closed_error():
+    calls = []
+    sleeps = []
+
+    class Service:
+        def shutdown(self):
+            calls.append("shutdown")
+            if len(calls) == 1:
+                raise RuntimeError("worker still active")
+
+    _shutdown_service_until_safe(
+        Service(), retry_delay_s=0.25, sleep_fn=sleeps.append
+    )
+
+    assert calls == ["shutdown", "shutdown"]
+    assert sleeps == [0.25]
+
+
+def test_step_dispatch_uses_normal_path_when_no_reset_owns_robot():
+    service = _service()
+
+    service._dispatch_step_command(
+        np.ones(7),
+        action_space="cartesian_delta",
+        gripper_action_space="position",
+        command_epoch=0,
+    )
+
+    assert len(service._robot.commands) == 1
+
+
+def test_step_dispatch_is_rejected_while_force_calibration_owns_robot():
+    service = _service()
+    service._force_calibration_owns_robot.set()
+
+    with pytest.raises(RuntimeError, match="force calibration"):
+        service._dispatch_step_command(
+            np.ones(7),
+            action_space="cartesian_delta",
+            gripper_action_space="position",
+            command_epoch=0,
+        )
+
+    assert service._robot.commands == []
+
+
+def test_motion_reset_is_rejected_while_force_calibration_owns_robot():
+    service = _service()
+    service._force_calibration_owns_robot.set()
+    context = SimpleNamespace(code=None, details="")
+    context.set_code = lambda code: setattr(context, "code", code)
+    context.set_details = lambda details: setattr(context, "details", details)
+
+    response = service.Reset(SimpleNamespace(mode="home", params={}), context)
+
+    assert response.status == ""
+    assert context.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert "force calibration" in context.details
+    assert service._reset_in_progress.is_set() is False
+
+
+def test_reset_epoch_rejects_step_that_was_queued_before_reset():
+    service = _service()
+    entered = threading.Event()
+    outcome = SimpleNamespace(error=None)
+    service._cmd_lock.acquire()
+
+    def dispatch():
+        entered.set()
+        try:
+            service._dispatch_step_command(
+                np.ones(7),
+                action_space="cartesian_delta",
+                gripper_action_space="position",
+                command_epoch=0,
+            )
+        except Exception as exc:
+            outcome.error = exc
+
+    worker = threading.Thread(target=dispatch)
+    worker.start()
+    assert entered.wait(timeout=1.0)
+    service._reset_in_progress.set()
+    with service._command_epoch_lock:
+        service._command_epoch += 1
+    service._cmd_lock.release()
+    worker.join(timeout=1.0)
+
+    assert worker.is_alive() is False
+    assert isinstance(outcome.error, RuntimeError)
+    assert "superseded" in str(outcome.error)
+    assert service._robot.commands == []
+
+
+def test_step_is_rejected_while_reset_is_in_progress():
+    service = _service()
+    service._reset_in_progress.set()
+
+    with pytest.raises(RuntimeError, match="superseded"):
+        service._dispatch_step_command(
+            np.ones(7),
+            action_space="cartesian_delta",
+            gripper_action_space="position",
+            command_epoch=0,
+        )
+
+    assert service._robot.commands == []
+
+
+def test_cancelled_step_is_rejected_even_if_it_captures_post_reset_epoch():
+    service = _service()
+    service._command_epoch = 7
+    rpc_cancelled = threading.Event()
+    rpc_cancelled.set()
+
+    with pytest.raises(RuntimeError, match="superseded"):
+        service._dispatch_step_command(
+            np.ones(7),
+            action_space="cartesian_delta",
+            gripper_action_space="position",
+            command_epoch=7,
+            rpc_cancelled=rpc_cancelled,
+        )
+
+    assert service._robot.commands == []
+
+
+def test_uncancelled_step_admitted_during_reset_cannot_run_after_reset():
+    service = _service()
+    service._command_epoch = 1
+    service._reset_in_progress.set()
+    service._cmd_lock.acquire()
+    outcome = SimpleNamespace(error=None)
+
+    def dispatch():
+        try:
+            service._dispatch_step_command(
+                np.ones(7),
+                action_space="cartesian_delta",
+                gripper_action_space="position",
+                command_epoch=1,
+                reset_active_at_entry=True,
+            )
+        except Exception as exc:
+            outcome.error = exc
+
+    worker = threading.Thread(target=dispatch)
+    worker.start()
+    service._reset_in_progress.clear()
+    service._cmd_lock.release()
+    worker.join(timeout=1.0)
+
+    assert worker.is_alive() is False
+    assert isinstance(outcome.error, RuntimeError)
+    assert service._robot.commands == []
+
+
+def test_step_admitted_during_reset_fails_before_reading_robot_state():
+    service = _service()
+    service._reset_in_progress.set()
+    service._robot.hand = None
+    service._robot.get_robot_state = lambda: (_ for _ in ()).throw(
+        AssertionError("reset-active Step must fail before touching robot state")
+    )
+    request = SimpleNamespace(
+        action_space="cartesian_delta",
+        action=np.zeros(7),
+        gripper_action_space="position",
+    )
+    context = SimpleNamespace(add_callback=lambda _callback: True)
+
+    response = service.Step(request, context)
+
+    assert response.status == "ERROR"
+    assert "reset was active" in response.message
+    assert service._robot.commands == []
+
+
+def test_current_reset_remains_available_without_waiting_for_motion_lock():
+    class Context:
+        def __init__(self):
+            self.callback = None
+
+        def add_callback(self, callback):
+            self.callback = callback
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    service._force_calibration_owns_robot.set()
+    service._create_observation = lambda: ({}, 1)
+    context = Context()
+    result = SimpleNamespace(response=None)
+    service._cmd_lock.acquire()
+
+    def reset():
+        result.response = service.Reset(SimpleNamespace(mode="current", params={}), context)
+
+    worker = threading.Thread(target=reset)
+    worker.start()
+    worker.join(timeout=1.0)
+
+    assert worker.is_alive() is False
+    assert result.response.status == "SUCCESS"
+    assert service._reset_in_progress.is_set() is False
+    service._cmd_lock.release()
+
+
+def test_overlapping_resets_keep_loop_paused_until_newest_reset_finishes():
+    class Context:
+        def add_callback(self, callback):
+            self.callback = callback
+            return True
+
+        def set_code(self, _code):
+            pass
+
+        def set_details(self, _details):
+            pass
+
+    class RunningThread:
+        def is_alive(self):
+            return True
+
+    service = _service()
+    service._control_loop_thread = RunningThread()
+    stop_calls = []
+    start_calls = []
+    entered_observation = threading.Event()
+    release_observation = threading.Event()
+
+    def stop_loop():
+        stop_calls.append(True)
+        service._control_loop_thread = None
+
+    def start_loop():
+        start_calls.append(True)
+        service._control_loop_thread = RunningThread()
+
+    def observation():
+        entered_observation.set()
+        assert service._reset_in_progress.is_set()
+        assert start_calls == []
+        assert release_observation.wait(timeout=1.0)
+        return {}, 1
+
+    service._stop_control_loop = stop_loop
+    service._start_control_loop = start_loop
+    service._create_observation = observation
+    service._cmd_lock.acquire()
+    results = []
+
+    def reset(context):
+        results.append(service.Reset(SimpleNamespace(mode="current", params={}), context))
+
+    first = threading.Thread(target=reset, args=(Context(),))
+    second = threading.Thread(target=reset, args=(Context(),))
+    first.start()
+    for _ in range(100):
+        if service._active_reset_count == 1:
+            break
+        threading.Event().wait(0.01)
+    second.start()
+    for _ in range(100):
+        if service._active_reset_count == 2:
+            break
+        threading.Event().wait(0.01)
+    service._cmd_lock.release()
+    assert entered_observation.wait(timeout=1.0)
+    release_observation.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert first.is_alive() is False and second.is_alive() is False
+    assert len(stop_calls) == 1
+    assert len(start_calls) == 1
+    assert service._reset_in_progress.is_set() is False
+
+
+def test_superseded_reset_returns_aborted_instead_of_empty_success():
+    class Context:
+        def __init__(self):
+            self.callback = None
+            self.code = None
+            self.details = None
+
+        def add_callback(self, callback):
+            self.callback = callback
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    service._create_observation = lambda: ({}, 1)
+    first_context = Context()
+    second_context = Context()
+    service._cmd_lock.acquire()
+    responses = {}
+
+    first = threading.Thread(
+        target=lambda: responses.setdefault(
+            "first",
+            service.Reset(SimpleNamespace(mode="current", params={}), first_context),
+        )
+    )
+    second = threading.Thread(
+        target=lambda: responses.setdefault(
+            "second",
+            service.Reset(SimpleNamespace(mode="current", params={}), second_context),
+        )
+    )
+    first.start()
+    for _ in range(100):
+        if service._active_reset_count == 1:
+            break
+        threading.Event().wait(0.01)
+    second.start()
+    for _ in range(100):
+        if service._active_reset_count == 2:
+            break
+        threading.Event().wait(0.01)
+    service._cmd_lock.release()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert first_context.code == grpc.StatusCode.ABORTED
+    assert "superseded" in first_context.details
+    assert responses["first"].status == ""
+    assert second_context.code is None
+    assert responses["second"].status == "SUCCESS"
+
+
+def test_reset_superseded_while_building_observation_cannot_return_success():
+    class Context:
+        def __init__(self):
+            self.code = None
+            self.details = None
+
+        def add_callback(self, _callback):
+            return True
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    service = _service()
+    observation_entered = threading.Event()
+    release_first_observation = threading.Event()
+    observation_calls = 0
+    observation_lock = threading.Lock()
+
+    def observation():
+        nonlocal observation_calls
+        with observation_lock:
+            observation_calls += 1
+            call = observation_calls
+        if call == 1:
+            observation_entered.set()
+            assert release_first_observation.wait(timeout=1.0)
+        return {}, call
+
+    service._create_observation = observation
+    first_context = Context()
+    second_context = Context()
+    responses = {}
+    first = threading.Thread(
+        target=lambda: responses.setdefault(
+            "first",
+            service.Reset(SimpleNamespace(mode="current", params={}), first_context),
+        )
+    )
+    second = threading.Thread(
+        target=lambda: responses.setdefault(
+            "second",
+            service.Reset(SimpleNamespace(mode="current", params={}), second_context),
+        )
+    )
+
+    first.start()
+    assert observation_entered.wait(timeout=1.0)
+    second.start()
+    for _ in range(100):
+        if service._active_reset_count == 2:
+            break
+        threading.Event().wait(0.01)
+    assert service._active_reset_count == 2
+    release_first_observation.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert first_context.code == grpc.StatusCode.ABORTED
+    assert "superseded" in first_context.details
+    assert responses["first"].status == ""
+    assert second_context.code is None
+    assert responses["second"].status == "SUCCESS"

@@ -16,13 +16,15 @@ their own. This mirrors dexcomm's global singleton session pattern.
 
 import threading
 
-from dexcomm import Node
+from dexcomm import Node, cleanup_session
 
 _shared_node: Node | None = None
 # Number of live top-level owners (each Robot / RobotQueryInterface). The Node
 # is only torn down once the last owner releases it, so a standalone interface
 # closing cannot destroy the Node still in use by another live instance.
 _owner_count: int = 0
+_shutdown_pending: bool = False
+_node_shutdown_completed: bool = False
 # Reentrant so a holder can call get_shared_node() while already holding the lock.
 _lock = threading.RLock()
 
@@ -42,6 +44,8 @@ def get_shared_node() -> Node:
     """
     global _shared_node
     with _lock:
+        if _shutdown_pending:
+            raise RuntimeError("shared DexComm Node shutdown is pending retry")
         if _shared_node is None:
             _shared_node = Node(name="dexcontrol")
         return _shared_node
@@ -63,19 +67,38 @@ def acquire_shared_node() -> Node:
         return node
 
 
-def shutdown_shared_node() -> None:
+def shutdown_shared_node(*, release_owner: bool = True) -> bool:
     """Release one top-level owner's hold on the shared Node.
 
     The underlying Node is shut down and the singleton reset only when the last
     owner releases it. This prevents one instance's teardown from destroying a
     Node that other live components in the same process still depend on.
+
+    Node teardown and process-global session teardown are one admission
+    transaction under ``_lock``. New owners cannot enter between them.
+    Returns ``True`` only when this call completes that final transaction.
     """
-    global _shared_node, _owner_count
+    global _shared_node, _owner_count, _shutdown_pending
+    global _node_shutdown_completed
     with _lock:
         if _shared_node is None:
-            return
-        _owner_count -= 1
+            _shutdown_pending = False
+            _node_shutdown_completed = False
+            return False
+        if release_owner and _owner_count > 0:
+            _owner_count -= 1
         if _owner_count <= 0:
             _owner_count = 0
-            _shared_node.shutdown()
+            try:
+                if not _node_shutdown_completed:
+                    _shared_node.shutdown()
+                    _node_shutdown_completed = True
+                cleanup_session()
+            except Exception:
+                _shutdown_pending = True
+                raise
             _shared_node = None
+            _shutdown_pending = False
+            _node_shutdown_completed = False
+            return True
+        return False

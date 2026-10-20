@@ -779,7 +779,13 @@ class Arm(ManagedJointComponent):
 class ArmWrenchSensor(RobotComponent):
     """Wrench sensor reader for the robot arm.
 
-    This class provides methods to read wrench sensor data through Zenoh communication.
+    The upstream sensor contract is ``wrench_on_robot``: the environment's wrench
+    acting on the robot, expressed in source-native sensor axes and referenced at
+    the physical F/T sensor measurement origin. Components are ordered
+    ``[Fx, Fy, Fz, Tx, Ty, Tz]`` with force in N and torque in Nm.
+
+    This reader copies the decoded sensor values without axis reordering, sign
+    changes, rotation, or reference-point translation.
     """
 
     def __init__(self, name: str, state_sub_topic: str, button_sub_topic: str) -> None:
@@ -833,13 +839,22 @@ class ArmWrenchSensor(RobotComponent):
             self._latest_button_state = state
 
     def get_wrench_state(self) -> Float[np.ndarray, "6"]:
-        """Get the current wrench sensor reading.
+        """Get the current upstream ``wrench_on_robot`` reading unchanged.
 
         Returns:
-            Array of wrench values [fx, fy, fz, tx, ty, tz].
+            Source-native sensor-axis wrench ``[Fx, Fy, Fz, Tx, Ty, Tz]`` at the
+            physical sensor measurement origin. Force is in N and torque is in Nm.
         """
+        wrench, _ = self.get_wrench_sample()
+        return wrench
+
+    def get_wrench_sample(self) -> tuple[Float[np.ndarray, "6"], int]:
+        """Return one wrench and its sensor-acquisition timestamp atomically."""
         state = super().get_state()
-        return np.array(state["wrench"], dtype=np.float32)
+        timestamp_ns = state.get("timestamp_ns")
+        if isinstance(timestamp_ns, bool) or not isinstance(timestamp_ns, int):
+            raise ServiceUnavailableError("Wrench sensor timestamp is unavailable")
+        return np.array(state["wrench"], dtype=np.float32), timestamp_ns
 
     def get_button_state(self) -> dict[str, bool]:
         """Get the state of the wrench sensor buttons.

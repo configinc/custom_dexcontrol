@@ -503,6 +503,33 @@
       retries: 12
       delay: 5
       until: health_left.rc == 0
+      failed_when: false
+
+    - name: Capture robot-server startup diagnostics when left arm is unavailable
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        echo '=== processes ==='
+        pgrep -af '[r]obotenv_vega/server\.py' || true
+        echo '=== tmux panes ==='
+        tmux list-panes -t robot-server -F '#{pane_index} #{pane_dead} #{pane_dead_status} #{pane_current_command}' 2>&1 || true
+        echo '=== left pane ==='
+        tmux capture-pane -p -S -200 -t robot-server.0 2>&1 || true
+        echo '=== right pane ==='
+        tmux capture-pane -p -S -200 -t robot-server.1 2>&1 || true
+        ENDSSH
+      args:
+        executable: /bin/bash
+      register: left_startup_diagnostics
+      become: false
+      changed_when: false
+      when: health_left.rc != 0
+
+    - name: Fail with left robot-server startup diagnostics
+      fail:
+        msg: >-
+          Left Vega robot server did not open port 50061.
+          {{ left_startup_diagnostics.stdout | default('No startup diagnostics were captured.') }}
+      when: health_left.rc != 0
 
     - name: Wait for right arm server (port 50063)
       shell: |
@@ -515,6 +542,33 @@
       retries: 12
       delay: 5
       until: health_right.rc == 0
+      failed_when: false
+
+    - name: Capture robot-server startup diagnostics when right arm is unavailable
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        echo '=== processes ==='
+        pgrep -af '[r]obotenv_vega/server\.py' || true
+        echo '=== tmux panes ==='
+        tmux list-panes -t robot-server -F '#{pane_index} #{pane_dead} #{pane_dead_status} #{pane_current_command}' 2>&1 || true
+        echo '=== left pane ==='
+        tmux capture-pane -p -S -200 -t robot-server.0 2>&1 || true
+        echo '=== right pane ==='
+        tmux capture-pane -p -S -200 -t robot-server.1 2>&1 || true
+        ENDSSH
+      args:
+        executable: /bin/bash
+      register: right_startup_diagnostics
+      become: false
+      changed_when: false
+      when: health_right.rc != 0
+
+    - name: Fail with right robot-server startup diagnostics
+      fail:
+        msg: >-
+          Right Vega robot server did not open port 50063.
+          {{ right_startup_diagnostics.stdout | default('No startup diagnostics were captured.') }}
+      when: health_right.rc != 0
 
     - name: Display success
       debug:

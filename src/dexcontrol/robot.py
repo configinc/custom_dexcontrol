@@ -23,6 +23,7 @@ control.
 import os
 import signal
 import sys
+import threading
 import time
 import weakref
 from pathlib import Path
@@ -32,7 +33,7 @@ import numpy as np
 from dexbot_utils import HandType, RobotInfo
 from dexbot_utils.cfg_modifier import runtime_override_robot_config
 from dexbot_utils.configs import BaseRobotConfig
-from dexcomm import RateLimiter, cleanup_session
+from dexcomm import RateLimiter
 from loguru import logger
 from rich.console import Console
 from rich.table import Table
@@ -174,7 +175,9 @@ class Robot(RobotQueryInterface):
             ConfigurationError: If the communication config is not set or the file is unreadable.
         """
         self._shutdown_called: bool = False
+        self._shutdown_lock = threading.RLock()
         self._components: list[RobotComponent] = []
+        self._initialized_component_ids: set[int] = set()
 
         self._robot_info: RobotInfo = RobotInfo(configs=configs)
         self._robot_name = self._robot_info.robot_name
@@ -183,23 +186,36 @@ class Robot(RobotQueryInterface):
         # Early validation - fail fast with clear errors
         self._validate_configuration()
 
-        super().__init__(configs=self._configs)
+        try:
+            super().__init__(configs=self._configs)
 
-        self._pv_components: list[str] = self._robot_info.get_pv_components()
-        self._hand_types: dict[str, HandType] = {}
+            self._pv_components: list[str] = self._robot_info.get_pv_components()
+            self._hand_types: dict[str, HandType] = {}
 
-        # Register for automatic shutdown on signals if enabled
-        if auto_shutdown:
-            _register_signal_handlers()
-            _active_robots.add(self)
+            # Register for automatic shutdown on signals if enabled
+            if auto_shutdown:
+                _register_signal_handlers()
+                _active_robots.add(self)
 
-        self._print_initialization_info()
-
-        # Initialize robot components with safe error handling
-        self._safe_initialize_components()
-
-        # Check version compatibility using new JSON interface
-        self._check_version_compatibility()
+            self._print_initialization_info()
+            self._safe_initialize_components()
+            self._check_version_compatibility()
+        except BaseException:
+            # Once the shared communication owner exists, a constructor that
+            # never returns has no external cleanup handle. Keep retrying the
+            # same phase-aware shutdown until every acquired resource is safe,
+            # then preserve the original construction failure.
+            if hasattr(self, "_node"):
+                while not self._shutdown_called:
+                    try:
+                        self.shutdown()
+                    except BaseException as cleanup_exc:  # pylint: disable=broad-except
+                        logger.error(
+                            "Robot constructor cleanup is not yet safe; retrying: {}",
+                            cleanup_exc,
+                        )
+                        time.sleep(0.1)
+            raise
 
     @property
     def robot_model(self) -> str:
@@ -381,10 +397,19 @@ class Robot(RobotQueryInterface):
                 continue
 
             component_class = component_mapping[config_cls]
-            component_instances[component_name] = component_class(
+            # Publish the instance before __init__: real component constructors
+            # acquire base subscribers first and may fail while adding later
+            # wrench/temperature/pass-through transports. The outer Robot
+            # rollback must retain a handle even in that partial state.
+            component_instance = component_class.__new__(component_class)
+            self._components.append(component_instance)
+            component_class.__init__(
+                component_instance,
                 name=component_name,
                 robot_info=self._robot_info,
             )
+            self._initialized_component_ids.add(id(component_instance))
+            component_instances[component_name] = component_instance
 
         # Phase 2: Wait for all components to receive first state update
         for component_name, component_instance in component_instances.items():
@@ -465,7 +490,8 @@ class Robot(RobotQueryInterface):
                 if component := getattr(self, name, None):
                     if component.wait_for_active(timeout=timeout_sec):
                         actives.append(True)
-                        self._components.append(component)
+                        if component not in self._components:
+                            self._components.append(component)
                     else:
                         actives.append(False)
         finally:
@@ -797,7 +823,20 @@ class Robot(RobotQueryInterface):
 
         return status
 
+    def close(self) -> None:
+        """Close a Robot through the full component-first shutdown path."""
+        self.shutdown()
+
     def shutdown(self) -> None:
+        """Serialize idempotent physical teardown for concurrent callers."""
+        lock = getattr(self, "_shutdown_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._shutdown_lock = lock
+        with lock:
+            self._shutdown_once()
+
+    def _shutdown_once(self) -> None:
         """Cleans up and closes all component connections.
 
         This method ensures proper cleanup of all components and communication
@@ -809,11 +848,26 @@ class Robot(RobotQueryInterface):
             return
 
         logger.info("Shutting down robot components...")
-        self._shutdown_called = True
+        errors = []
+        stopped_ids = getattr(self, "_shutdown_stopped_component_ids", set())
+        shutdown_ids = getattr(self, "_shutdown_component_ids", set())
+        initialized_ids = getattr(
+            self,
+            "_initialized_component_ids",
+            {id(component) for component in self._components if component is not None},
+        )
+        self._shutdown_stopped_component_ids = stopped_ids
+        self._shutdown_component_ids = shutdown_ids
 
         # Stop idle monitor
-        if hasattr(self, "_idle_monitor"):
-            self._idle_monitor.stop()
+        if hasattr(self, "_idle_monitor") and not getattr(
+            self, "_shutdown_idle_monitor_completed", False
+        ):
+            try:
+                self._idle_monitor.stop()
+                self._shutdown_idle_monitor_completed = True
+            except Exception as exc:  # pylint: disable=broad-except
+                errors.append(f"idle monitor stop failed: {exc}")
 
         try:
             _active_robots.discard(self)
@@ -825,45 +879,78 @@ class Robot(RobotQueryInterface):
         # quiet; the component may still be holding torque at its last commanded
         # target, so it must be stopped regardless of pause state.
         for component in self._components:
-            if component is not None:
+            component_id = id(component)
+            if component is not None and component_id not in stopped_ids:
                 try:
                     if hasattr(component, "stop") and callable(component.stop):
                         component.stop()
+                    stopped_ids.add(component_id)
+                    component._robot_shutdown_stop_confirmed = True
                 except Exception as e:  # pylint: disable=broad-except
                     logger.error(
                         f"Error stopping component {component.__class__.__name__}: {e}"
                     )
+                    errors.append(
+                        f"stop {component.__class__.__name__} failed: {e}"
+                    )
 
         # Phase 2: Release resources — shutdown ALL components and sensors.
-        try:
-            if hasattr(self, "sensors") and self.sensors is not None:
+        if (
+            not getattr(self, "_shutdown_sensors_completed", False)
+            and hasattr(self, "sensors")
+            and self.sensors is not None
+        ):
+            try:
                 self.sensors.shutdown()
+                self._shutdown_sensors_completed = True
                 time.sleep(0.2)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.error(f"Error shutting down sensors: {e}")
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error(f"Error shutting down sensors: {e}")
+                errors.append(f"sensor shutdown failed: {e}")
 
         for component in reversed(self._components):
-            if component is not None:
+            component_id = id(component)
+            if (
+                component is not None
+                and (
+                    component_id in stopped_ids
+                    or component_id not in initialized_ids
+                )
+                and component_id not in shutdown_ids
+            ):
                 try:
+                    # Resource release is independent from a graceful stop.
+                    # A constructor can fail after acquiring only part of a
+                    # composite component; its operational stop() may then be
+                    # unavailable, but shutdown() must still get a chance to
+                    # release the resources that do exist.
                     component.shutdown()
+                    shutdown_ids.add(component_id)
+                    if component_id not in initialized_ids:
+                        stopped_ids.add(component_id)
                 except Exception as e:  # pylint: disable=broad-except
                     logger.error(
                         f"Error shutting down component {component.__class__.__name__}: {e}"
                     )
+                    errors.append(
+                        f"shutdown {component.__class__.__name__} failed: {e}"
+                    )
+
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
         # Brief delay to allow component shutdown to complete
         time.sleep(0.1)
 
-        # Release this instance's hold on the shared node (only fully shut down
-        # once the last owner releases it) and clean up the DexComm session.
-        try:
-            self._release_shared_node()
-        except Exception as e:
-            logger.debug(f"Shared node cleanup note: {e}")
-        try:
-            cleanup_session()
-        except Exception as e:
-            logger.debug(f"Session cleanup note: {e}")
+        # Release this instance's hold on the shared Node. The shared owner
+        # transaction performs final Node + global session teardown atomically.
+        if not getattr(self, "_shutdown_shared_node_completed", False):
+            try:
+                self._release_shared_node()
+                self._shutdown_shared_node_completed = True
+            except Exception as e:
+                raise RuntimeError(f"shared node cleanup failed: {e}") from e
+        self._shutdown_called = True
         logger.info("Robot shutdown complete")
 
     def is_shutdown(self) -> bool:

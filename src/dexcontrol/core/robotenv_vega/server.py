@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import os
 import signal
 import sys
 import threading
 import time
+import uuid
 from concurrent import futures
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,16 +27,62 @@ _this = Path(__file__).resolve()
 sys.path.insert(0, str(_this.parents[2]))  # src/dexcontrol/ -> "from core.vega..."
 sys.path.insert(0, str(_this.parents[4]))  # <repo>/          -> "from proto..."
 
+from core.robotenv_vega.force_calibration import (  # noqa: E402
+    wrist_ft_calibration_from_snapshot,
+)
+from core.robotenv_vega.force_calibration_lifecycle import (  # noqa: E402
+    BilateralCalibrationPlan,
+    ForceCalibrationLifecycle,
+)
+from core.robotenv_vega.vega_force_calibration import (  # noqa: E402
+    DesiredNormalResetJointPositionsRad,
+    VegaForceCalibrationFitInputs,
+    VegaForceCalibrationManager,
+    VegaRobotCalibrationAdapter,
+    parameters_json,
+    quality_json,
+)
+from core.robotenv_vega.wrench_contract import (  # noqa: E402
+    VEGA_COMPANY_WRIST_ORIGIN_FROM_SENSOR_M,
+    shift_wrench_reference,
+    vega_wrench_frame_rotations,
+)
 from core.vega.robot import (  # noqa: E402
     CommunicationFailedError,
     IKFailedError,
     JointLimitExceededError,
     VegaRobot,
 )
+
 from proto import robotenv_pb2, robotenv_pb2_grpc  # noqa: E402
 
-
 LOGGER = logging.getLogger("robotenv_vega")
+
+
+def _track_transport_rpc(response_type):
+    """Keep the robot transport alive for the full lifetime of an RPC."""
+
+    def decorate(method):
+        @functools.wraps(method)
+        def wrapped(self, request, context):
+            condition = self._transport_rpc_condition
+            with condition:
+                if self._shutdown_started.is_set():
+                    context.set_code(grpc.StatusCode.UNAVAILABLE)
+                    context.set_details("robot server is shutting down")
+                    return response_type()
+                self._active_transport_rpcs += 1
+            try:
+                return method(self, request, context)
+            finally:
+                with condition:
+                    self._active_transport_rpcs -= 1
+                    if self._active_transport_rpcs == 0:
+                        condition.notify_all()
+
+        return wrapped
+
+    return decorate
 
 
 def _to_proto_value(val: Any) -> robotenv_pb2.Value:
@@ -65,6 +114,10 @@ _RESET_MIDDLE_JOINTS = {
 class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     """RobotEnv service implementation for one Vega arm."""
 
+    _WRENCH_WARNING_INTERVAL_SECONDS = 10.0
+    _WRENCH_ROBOT_MAX_SKEW_SECONDS = 0.25
+    _WRENCH_SAMPLE_MAX_STALL_SECONDS = 0.25
+
     def __init__(
         self,
         robot_model: str = "vega_1",
@@ -74,6 +127,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         control_hz: int = 20,
         use_velocity_feedforward: bool = False,
         base_frame_rotation: Optional[list[float]] = None,
+        external_wrench_sensor_to_wrist_yaw_degrees: float | None = None,
         ik_solver_type: str = "pink",
         robotiq_comport: str = "/dev/ttyUSB0",
         wuji_sn: Optional[str] = None,
@@ -97,7 +151,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         rot_sensitivity: float = 1.0,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
-        head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),  # head_j1 limit: ±1.483 rad
+        head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
+        force_calibration_gripper_mass_kg: float = 1.2,
+        force_calibration_gripper_com_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.072),
+        force_calibration_storage_directory: str | None = None,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -121,115 +178,398 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self.arm_side = arm_side
         self.gripper_type = gripper_type
         self.frame_type = frame_type
-        self.control_hz = int(control_hz)
+        try:
+            normalized_control_hz = int(control_hz)
+            finite_control_hz = np.isfinite(float(control_hz))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("control_hz must be a finite positive integer") from exc
+        if (
+            isinstance(control_hz, (bool, np.bool_))
+            or not finite_control_hz
+            or normalized_control_hz <= 0
+            or float(control_hz) != normalized_control_hz
+        ):
+            raise ValueError("control_hz must be a finite positive integer")
+        self.control_hz = normalized_control_hz
+
+        def _finite_float(name: str, value: object) -> float:
+            try:
+                normalized = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{name} must be finite") from exc
+            if isinstance(value, (bool, np.bool_)) or not np.isfinite(normalized):
+                raise ValueError(f"{name} must be finite")
+            return normalized
+
+        normalized_rot_sensitivity = _finite_float(
+            "rot_sensitivity", rot_sensitivity
+        )
+        if not 0.0 <= normalized_rot_sensitivity <= 2.0:
+            raise ValueError("rot_sensitivity must be between 0 and 2")
+        raw_head_init_pos = np.asarray(head_init_pos)
+        if raw_head_init_pos.shape == (3,) and any(
+            isinstance(value, (bool, np.bool_)) for value in raw_head_init_pos.flat
+        ):
+            raise ValueError("head_init_pos must contain numeric radians, not booleans")
+        normalized_head_init_pos = np.asarray(head_init_pos, dtype=np.float64)
+        if (
+            normalized_head_init_pos.shape != (3,)
+            or not np.isfinite(normalized_head_init_pos).all()
+        ):
+            raise ValueError("head_init_pos must contain three finite values")
+        with np.errstate(over="ignore", invalid="ignore"):
+            head_init_pos_float32 = normalized_head_init_pos.astype(np.float32)
+        if not np.isfinite(head_init_pos_float32).all():
+            raise ValueError("head_init_pos must remain finite in the hardware float32 format")
+        normalized_wuji_effort_limit = None
+        if wuji_effort_limit is not None:
+            normalized_wuji_effort_limit = _finite_float(
+                "wuji_effort_limit", wuji_effort_limit
+            )
+            if not 0.0 < normalized_wuji_effort_limit <= 1.7:
+                raise ValueError("wuji_effort_limit must be between 0 and 1.7")
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
         self.base_frame_rotation = base_frame_rotation
-        self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(
-            self.control_hz, rot_sensitivity=rot_sensitivity,
+        self.external_wrench_sensor_to_wrist_yaw_degrees = (
+            None
+            if external_wrench_sensor_to_wrist_yaw_degrees is None
+            else float(external_wrench_sensor_to_wrist_yaw_degrees)
         )
+        if (
+            self.external_wrench_sensor_to_wrist_yaw_degrees is not None
+            and not np.isfinite(self.external_wrench_sensor_to_wrist_yaw_degrees)
+        ):
+            raise ValueError(
+                "external_wrench_sensor_to_wrist_yaw_degrees must be finite"
+            )
+        if self.external_wrench_sensor_to_wrist_yaw_degrees is None:
+            LOGGER.info(
+                "publishing source-native external_wrench_sensor_raw; "
+                "RobotEnv publishes calibrated wrist/world after calibration"
+            )
+        else:
+            LOGGER.warning(
+                "ignoring deprecated sensor-to-wrist yaw %.6f degrees; "
+                "RobotEnv owns the calibrated wrist/world transform",
+                self.external_wrench_sensor_to_wrist_yaw_degrees,
+            )
+        self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(
+            self.control_hz, rot_sensitivity=normalized_rot_sensitivity,
+        )
+        prepared_base_rotation = None
+        if base_frame_rotation is not None:
+            values = np.asarray(base_frame_rotation, dtype=np.float64)
+            if values.shape != (3,) or not np.all(np.isfinite(values)):
+                raise ValueError(
+                    "base_frame_rotation must contain exactly three finite XYZ angles"
+                )
+            prepared_base_rotation = R.from_euler(
+                "XYZ", values, degrees=True
+            ).as_matrix()
+        try:
+            normalized_control_loop_hz = int(control_loop_hz)
+            finite_control_loop_hz = np.isfinite(float(control_loop_hz))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "control_loop_hz must be a finite non-negative integer"
+            ) from exc
+        if (
+            isinstance(control_loop_hz, (bool, np.bool_))
+            or not finite_control_loop_hz
+            or normalized_control_loop_hz < 0
+            or float(control_loop_hz) != normalized_control_loop_hz
+        ):
+            raise ValueError("control_loop_hz must be a finite non-negative integer")
+        try:
+            raw_ema_alpha = float(ema_alpha)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("ema_alpha must be finite") from exc
+        if isinstance(ema_alpha, (bool, np.bool_)) or not np.isfinite(raw_ema_alpha):
+            raise ValueError("ema_alpha must be finite")
+        normalized_ema_alpha = float(np.clip(raw_ema_alpha, 0.0, 0.99))
+
+        normalized_filter_ema_alpha = float(
+            np.clip(_finite_float("filter_ema_alpha", filter_ema_alpha), 0.0, 1.0)
+        )
+        normalized_vel_smoothing_alpha = float(
+            np.clip(
+                _finite_float("vel_smoothing_alpha", vel_smoothing_alpha),
+                0.0,
+                1.0,
+            )
+        )
+        normalized_hw_correction_alpha = float(
+            np.clip(
+                _finite_float("hw_correction_alpha", hw_correction_alpha),
+                0.0,
+                1.0,
+            )
+        )
+        normalized_vel_ratio = _finite_float("vel_ratio", vel_ratio)
+        if not 0.0 <= normalized_vel_ratio <= 1.0:
+            raise ValueError("vel_ratio must be between 0 and 1")
+        normalized_max_delta_scale = _finite_float(
+            "max_delta_scale", max_delta_scale
+        )
+        normalized_max_jerk = _finite_float("max_jerk", max_jerk)
+        normalized_vel_damp_thresh = _finite_float(
+            "vel_damp_thresh", vel_damp_thresh
+        )
+        if not 0.1 <= normalized_max_delta_scale <= 3.0:
+            raise ValueError("max_delta_scale must be between 0.1 and 3")
+        if not 0.0 <= normalized_max_jerk <= 0.25:
+            raise ValueError("max_jerk must be between 0 and 0.25")
+        if normalized_vel_damp_thresh <= 0.0:
+            raise ValueError("vel_damp_thresh must be positive")
+        interpolation_tick_hz = (
+            normalized_control_loop_hz
+            if interpolation_method != "none" and normalized_control_loop_hz > 0
+            else self.control_hz
+        )
+        if interpolation_method not in ("none", "linear", "cubic"):
+            raise ValueError("interpolation_method must be none, linear, or cubic")
+        try:
+            normalized_interpolation_history = int(interpolation_history)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("interpolation_history must be an integer from 2 to 64") from exc
+        if (
+            isinstance(interpolation_history, (bool, np.bool_))
+            or float(interpolation_history) != normalized_interpolation_history
+            or not 2 <= normalized_interpolation_history <= 64
+        ):
+            raise ValueError("interpolation_history must be an integer from 2 to 64")
+        if filter_type not in ("none", "butterworth", "ema"):
+            raise ValueError("filter_type must be none, butterworth, or ema")
+        normalized_filter_cutoff_freq = _finite_float(
+            "filter_cutoff_freq", filter_cutoff_freq
+        )
+        try:
+            normalized_filter_order = int(filter_order)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("filter_order must be an integer from 1 to 8") from exc
+        if (
+            isinstance(filter_order, (bool, np.bool_))
+            or float(filter_order) != normalized_filter_order
+            or not 1 <= normalized_filter_order <= 8
+        ):
+            raise ValueError("filter_order must be an integer from 1 to 8")
+        if filter_type == "butterworth" and not (
+            0.0 < normalized_filter_cutoff_freq < interpolation_tick_hz / 2.0
+        ):
+            raise ValueError(
+                "filter_cutoff_freq must be positive and below the control Nyquist rate"
+            )
 
         self._robot = VegaRobot(
             robot_model=robot_model,
             arm_side=arm_side,
-            control_hz=control_hz,
+            control_hz=self.control_hz,
             use_velocity_feedforward=use_velocity_feedforward,
             gripper_type=gripper_type,
             ik_solver_type=ik_solver_type,
             robotiq_comport=robotiq_comport,
             wuji_sn=wuji_sn,
-            wuji_effort_limit=wuji_effort_limit,
-            ema_alpha=ema_alpha,
+            wuji_effort_limit=normalized_wuji_effort_limit,
+            ema_alpha=normalized_ema_alpha,
             interpolation_method=interpolation_method,
-            interpolation_history=interpolation_history,
+            interpolation_history=normalized_interpolation_history,
             filter_type=filter_type,
-            filter_cutoff_freq=filter_cutoff_freq,
-            filter_order=filter_order,
-            filter_ema_alpha=filter_ema_alpha,
-            vel_smoothing_alpha=vel_smoothing_alpha,
-            hw_correction_alpha=hw_correction_alpha,
-            max_delta_scale=max_delta_scale,
-            max_jerk=max_jerk,
-            vel_ratio=vel_ratio,
-            vel_damp_thresh=vel_damp_thresh,
-            head_init_pos=head_init_pos,
+            filter_cutoff_freq=normalized_filter_cutoff_freq,
+            filter_order=normalized_filter_order,
+            filter_ema_alpha=normalized_filter_ema_alpha,
+            vel_smoothing_alpha=normalized_vel_smoothing_alpha,
+            hw_correction_alpha=normalized_hw_correction_alpha,
+            max_delta_scale=normalized_max_delta_scale,
+            max_jerk=normalized_max_jerk,
+            vel_ratio=normalized_vel_ratio,
+            vel_damp_thresh=normalized_vel_damp_thresh,
+            head_init_pos=normalized_head_init_pos,
         )
-        self._robot.launch_robot()
+        try:
+            self._robot.launch_robot()
+        except BaseException:
+            self._retry_failed_construction_cleanup()
+            raise
 
-        # --- Background control loop for interpolation-based upsampling ---
-        # When interpolation is active, gRPC Step() buffers commands at
-        # input rate and this thread dispatches them to hardware at
-        # control_loop_hz (typically 100 Hz).
-        self._control_loop_hz = control_loop_hz if control_loop_hz > 0 else 0
-        self._control_loop_thread: Optional[threading.Thread] = None
-        self._control_loop_stop = threading.Event()
-        if self._robot.interpolation_enabled and self._control_loop_hz > 0:
-            self._start_control_loop()
+        try:
+            # --- Background control loop for interpolation-based upsampling ---
+            # When interpolation is active, gRPC Step() buffers commands at
+            # input rate and this thread dispatches them to hardware at
+            # control_loop_hz (typically 100 Hz).
+            self._control_loop_hz = normalized_control_loop_hz
+            self._control_loop_thread: Optional[threading.Thread] = None
+            self._control_loop_stop = threading.Event()
+            # Override home position with per-arm init joints.
+            self.reset_joints = _INIT_JOINTS[arm_side].copy()
+            self.reset_middle_joints = _RESET_MIDDLE_JOINTS[arm_side].copy()
+            self.safe_transit_pose = self._robot.safe_transit_pose.copy()
+
+            if prepared_base_rotation is not None:
+                self.R_world_to_robot = prepared_base_rotation.T
+                self.R_robot_to_world = prepared_base_rotation
+            else:
+                self.R_world_to_robot = None
+                self.R_robot_to_world = None
+
+            # Serialize all robot commands — prevents concurrent Reset/Step from
+            # sending conflicting position commands to the same arm.
+            self._cmd_lock = threading.Lock()
+            self._command_epoch_lock = threading.Lock()
+            self._force_calibration_owner_lock = threading.Lock()
+            self._force_calibration_owns_robot = threading.Event()
+            self._command_recovery_required = threading.Event()
+            self._command_recovery_error = ""
+            self._force_calibration_applier_lock = threading.Lock()
+            self._force_calibration_applier = None
+            self._force_calibration_expires_at_timestamp_us = 0
+            self._command_epoch = 0
+            self._reset_in_progress = threading.Event()
+            self._reset_state_lock = threading.Lock()
+            self._active_reset_count = 0
+            self._active_reset_cancel = None
+            self._reset_restart_control_loop = False
+            self._shutdown_started = threading.Event()
+            self._shutdown_lock = threading.Lock()
+            self._shutdown_completed = False
+            self._transport_rpc_condition = threading.Condition()
+            self._active_transport_rpcs = 0
+            if self._robot.interpolation_enabled and self._control_loop_hz > 0:
+                self._start_control_loop()
+                LOGGER.info(
+                    "Control loop thread started: %d Hz (input≈%d Hz → control=%d Hz)",
+                    self._control_loop_hz,
+                    self.control_hz,
+                    self._control_loop_hz,
+                )
             LOGGER.info(
-                "Control loop thread started: %d Hz (input≈%d Hz → control=%d Hz)",
-                self._control_loop_hz,
-                control_hz,
-                self._control_loop_hz,
+                "Initialized VegaRobotEnvService model=%s arm=%s gripper=%s frame=%s hz=%s",
+                robot_model,
+                arm_side,
+                gripper_type,
+                frame_type,
+                self.control_hz,
             )
-
-        # Override home position with per-arm init joints.
-        self.reset_joints = _INIT_JOINTS[arm_side].copy()
-        self.reset_middle_joints = _RESET_MIDDLE_JOINTS[arm_side].copy()
-        self.safe_transit_pose = self._robot.safe_transit_pose.copy()
-
-        if base_frame_rotation is not None:
-            rot = R.from_euler("XYZ", base_frame_rotation, degrees=True).as_matrix()
-            self.R_world_to_robot = rot.T
-            self.R_robot_to_world = rot
-        else:
-            self.R_world_to_robot = None
-            self.R_robot_to_world = None
-
-        # Serialize all robot commands — prevents concurrent Reset/Step from
-        # sending conflicting position commands to the same arm.
-        self._cmd_lock = threading.Lock()
-        # Set by a new Reset to cancel any in-progress _move_incremental loop.
-        self._cancel_move = threading.Event()
-
-        LOGGER.info(
-            "Initialized VegaRobotEnvService model=%s arm=%s gripper=%s frame=%s hz=%s",
-            robot_model,
-            arm_side,
-            gripper_type,
-            frame_type,
-            control_hz,
-        )
-        LOGGER.info(
-            "Joint command mode: %s",
-            "position+velocity feedforward" if self.use_velocity_feedforward else "position-only",
-        )
-        LOGGER.info(
-            "IK config: solver=%s damping(default=%.6f torso=%.1f arm_j2=%.1f arm_j3=%.1f)",
-            ik_solver_type,
-            ik_damping_default,
-            ik_damping_torso,
-            ik_damping_arm_j2,
-            ik_damping_arm_j3,
-        )
-        LOGGER.info(
-            "Cartesian velocity normalization enabled: max_lin_delta=%.6f max_rot_delta=%.6f",
-            self._max_lin_delta,
-            self._max_rot_delta,
-        )
-        if ema_alpha > 0:
-            _omega = ema_alpha / ((1.0 / max(1, control_hz)) * (1.0 - ema_alpha))
             LOGGER.info(
-                "2nd-order smoothing: enabled (alpha=%.3f, omega=%.1f rad/s, critically damped)",
-                ema_alpha, _omega,
+                "Joint command mode: %s",
+                "position+velocity feedforward" if self.use_velocity_feedforward else "position-only",
             )
-        else:
-            LOGGER.info("Smoothing: disabled (alpha=0.0)")
+            LOGGER.info(
+                "IK config: solver=%s damping(default=%.6f torso=%.1f arm_j2=%.1f arm_j3=%.1f)",
+                ik_solver_type,
+                ik_damping_default,
+                ik_damping_torso,
+                ik_damping_arm_j2,
+                ik_damping_arm_j3,
+            )
+            LOGGER.info(
+                "Cartesian velocity normalization enabled: max_lin_delta=%.6f max_rot_delta=%.6f",
+                self._max_lin_delta,
+                self._max_rot_delta,
+            )
+            if normalized_ema_alpha > 0:
+                _omega = normalized_ema_alpha / (
+                    (1.0 / self.control_hz) * (1.0 - normalized_ema_alpha)
+                )
+                LOGGER.info(
+                    "2nd-order smoothing: enabled (alpha=%.3f, omega=%.1f rad/s, critically damped)",
+                    normalized_ema_alpha, _omega,
+                )
+            else:
+                LOGGER.info("Smoothing: disabled (alpha=0.0)")
 
-        # Move to init position on startup.
-        LOGGER.info("Moving to init position on startup (arm=%s)", arm_side)
-        self._execute_reset_sequence(self.reset_joints)
+            # Preserve the production startup behavior. Calibration is layered
+            # on top of the existing controller and does not redefine startup.
+            LOGGER.info("Moving to init position on startup (arm=%s)", arm_side)
+            self._execute_reset_sequence(self.reset_joints)
 
-        # Fetch and cache robot firmware version once at startup.
-        self._firmware_version = self._fetch_firmware_version()
+            # Fetch and cache robot firmware version once at startup.
+            self._firmware_version = self._fetch_firmware_version()
+            firmware_cache_identity = self._firmware_version
+            if not firmware_cache_identity:
+                # An unreadable firmware identity is not evidence that the
+                # physical/software stack is unchanged. A per-boot token makes
+                # such a cache deliberately non-reusable after restart.
+                firmware_cache_identity = f"unverified:{uuid.uuid4()}"
+
+            plan_path = (
+                Path(__file__).resolve().parent
+                / "force_calibration"
+                / "vega_bilateral_plan_v1.json"
+            )
+            calibration_storage = Path(
+                force_calibration_storage_directory
+                or Path.home()
+                / ".config"
+                / "dexcontrol"
+                / "force-calibration"
+                / arm_side
+            ).expanduser()
+            plan = BilateralCalibrationPlan.load(plan_path, arm_side)
+            lifecycle = ForceCalibrationLifecycle(
+                plan=plan,
+                server_identity={
+                    "robot_model": self.robot_model,
+                    "arm_side": self.arm_side,
+                    "gripper_type": self.gripper_type,
+                    "frame_type": self.frame_type,
+                    "firmware_version": firmware_cache_identity,
+                    "robot_name": str(
+                        getattr(self._robot.robot, "robot_name", "")
+                    ),
+                    "cartesian_position_frame_id": (
+                        "L_ee" if self.arm_side == "left" else "R_ee"
+                    ),
+                    "force_sensor_frame_id": (
+                        "L_arm_l8" if self.arm_side == "left" else "R_arm_l8"
+                    ),
+                    "force_sensor_mount_convention": "dexmate_urdf_link8_v1",
+                    "tcp_to_company_wrist_yaw_degrees": 165.0,
+                    "company_wrist_origin_from_sensor_m": [0.0, 0.0, 0.0185],
+                    "gripper_mass_kg": float(force_calibration_gripper_mass_kg),
+                    "gripper_com_sensor_m": [
+                        float(value) for value in force_calibration_gripper_com_m
+                    ],
+                },
+                storage_directory=calibration_storage,
+                calibration_kind="vega_wrist_ft_v1",
+                reference_point_id="physical_ft_sensor_measurement_origin",
+                validate_parameters=lambda value: wrist_ft_calibration_from_snapshot(value),
+            )
+            adapter = VegaRobotCalibrationAdapter(
+                service=self,
+                gripper_mass_kg=force_calibration_gripper_mass_kg,
+                gripper_com_sensor_m=np.asarray(
+                    force_calibration_gripper_com_m, dtype=np.float64
+                ),
+            )
+            self._force_calibration_manager = VegaForceCalibrationManager(
+                lifecycle=lifecycle,
+                adapter=adapter,
+                claim_robot=self._claim_robot_for_force_calibration,
+                release_robot=self._release_robot_from_force_calibration,
+            )
+        except BaseException:
+            self._retry_failed_construction_cleanup()
+            raise
+
+    def _retry_failed_construction_cleanup(self) -> None:
+        """Stop partial service workers and close hardware before init escapes."""
+        while True:
+            try:
+                thread = getattr(self, "_control_loop_thread", None)
+                if thread is not None:
+                    self._control_loop_stop.set()
+                    thread.join(timeout=2.0)
+                    if thread.is_alive():
+                        raise RuntimeError("control loop did not stop")
+                    self._control_loop_thread = None
+                self._robot.close()
+                return
+            except Exception:  # pylint: disable=broad-except
+                LOGGER.exception(
+                    "Vega service constructor cleanup is not yet safe; retrying"
+                )
+                time.sleep(0.1)
 
     # ------------------------------------------------------------------
     # Background control loop (for interpolation upsampling)
@@ -261,13 +601,73 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         while not self._control_loop_stop.is_set():
             t0 = time.perf_counter()
             try:
-                self._robot.execute_interpolated_tick()
+                if not self._reset_in_progress.is_set():
+                    self._robot.execute_interpolated_tick()
             except Exception as exc:
                 LOGGER.error("Control loop tick error: %s", exc)
             elapsed = time.perf_counter() - t0
             sleep_time = dt - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
+
+    def _claim_robot_for_force_calibration(self) -> bool:
+        with self._force_calibration_owner_lock:
+            if self._shutdown_started.is_set():
+                return False
+            if self._force_calibration_owns_robot.is_set() or self._reset_in_progress.is_set():
+                return False
+            # A 200 Hz interpolation tick briefly owns this lock every 5 ms.
+            # Treat that normal overlap as a handoff, not as a busy robot.
+            # The bounded wait still fails closed if Reset or a physical
+            # command is genuinely stuck.
+            if not self._cmd_lock.acquire(timeout=1.0):
+                return False
+            try:
+                if self._reset_in_progress.is_set():
+                    return False
+                self._force_calibration_restart_control_loop = bool(
+                    self._control_loop_thread is not None
+                )
+                if self._force_calibration_restart_control_loop:
+                    try:
+                        self._stop_control_loop()
+                    except Exception:
+                        self._force_calibration_restart_control_loop = False
+                        self._force_calibration_owns_robot.clear()
+                        raise
+                self._force_calibration_owns_robot.set()
+                return True
+            finally:
+                self._cmd_lock.release()
+
+    def _release_robot_from_force_calibration(self) -> None:
+        with self._force_calibration_owner_lock:
+            restart_control_loop = bool(
+                getattr(self, "_force_calibration_restart_control_loop", False)
+            )
+            self._force_calibration_owns_robot.clear()
+            if restart_control_loop:
+                if not self._shutdown_started.is_set():
+                    self._start_control_loop()
+                self._force_calibration_restart_control_loop = False
+
+    def _set_force_calibration_applier(
+        self, applier, *, expires_at_timestamp_us: int | None = None
+    ) -> None:
+        with self._force_calibration_applier_lock:
+            self._force_calibration_applier = applier
+            if expires_at_timestamp_us is not None:
+                self._force_calibration_expires_at_timestamp_us = int(
+                    expires_at_timestamp_us
+                )
+
+    def _reject_if_shutting_down(self, context) -> bool:
+        shutting_down = getattr(self, "_shutdown_started", None)
+        if shutting_down is None or not shutting_down.is_set():
+            return False
+        context.set_code(grpc.StatusCode.UNAVAILABLE)
+        context.set_details("robot server is shutting down")
+        return True
 
     @staticmethod
     def _compute_cartesian_delta_limits(
@@ -301,6 +701,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         converted[3:6] = rot_vel * self._max_rot_delta
         return converted
 
+    @_track_transport_rpc(robotenv_pb2.ObservationSpec)
     def GetObservationSpec(self, request, context):
         del request, context
         spec = robotenv_pb2.ObservationSpec(
@@ -312,6 +713,23 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "gripper_type": self.gripper_type,
                 "frame_type": self.frame_type,
                 "control_hz": str(self.control_hz),
+                "force_signal_provider_kind": "wrist_force_torque",
+                "force_signal_provider_schema_version": "2",
+                "force_calibration_owner": "robot_server",
+                "force_signal_stream_id": f"{self.robot_model}:{self.arm_side}:wrist_ft",
+                "external_wrench_world_frame_id": self.frame_type,
+                "cartesian_position_reference_frame": (
+                    "L_ee" if self.arm_side == "left" else "R_ee"
+                ),
+                "external_wrench_sensor_frame_id": (
+                    "L_arm_l8" if self.arm_side == "left" else "R_arm_l8"
+                ),
+                "external_wrench_output_reference_point_id": (
+                    "robotiq_mount_origin"
+                ),
+                "external_wrench_sensor_to_output_reference_translation_m": (
+                    "0,0,0.0185"
+                ),
             },
         )
 
@@ -388,15 +806,91 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 dtype="float64",
                 shape=[6],
                 required=True,
-                description="End-effector pose [x, y, z, roll, pitch, yaw]",
+                description=(
+                    f"{('L_ee' if self.arm_side == 'left' else 'R_ee')} Cartesian "
+                    "pose [x, y, z, roll, pitch, yaw]"
+                ),
             )
         )
-        spec.fields["wrench_state"].CopyFrom(
+        spec.fields["external_wrench_sensor_raw"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="float64",
                 shape=[6],
                 required=False,
-                description="Wrench state [fx, fy, fz, tx, ty, tz]",
+                description=(
+                    "Source-native uncalibrated F/T sample expressed in sensor axes "
+                    "at the physical sensor origin [fx, fy, fz, tx, ty, tz] "
+                    "(N, N, N, Nm, Nm, Nm); wrench_on_robot sign"
+                ),
+            )
+        )
+        spec.fields["external_wrench_sensor_raw_reference_point"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="string",
+                shape=[],
+                required=False,
+                description="Physical reference point of external_wrench_sensor_raw",
+            )
+        )
+        spec.fields["external_wrench_sensor_raw_timestamp_ns"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="int64",
+                shape=[],
+                required=False,
+                description=(
+                    "Acquisition timestamp from the same source message as "
+                    "external_wrench_sensor_raw"
+                ),
+            )
+        )
+        for field_name, description in (
+            (
+                "external_wrench_wrist_from_sensor_rotation",
+                "3x3 row-major rotation from physical sensor axes to company wrist axes",
+            ),
+            (
+                "external_wrench_world_from_sensor_rotation",
+                "3x3 row-major rotation from physical sensor axes to configured world axes",
+            ),
+        ):
+            spec.fields[field_name].CopyFrom(
+                robotenv_pb2.FieldSpec(
+                    dtype="float64", shape=[9], required=False, description=description
+                )
+            )
+        for field_name, description in (
+            (
+                "external_wrench_wrist",
+                "Calibrated gripper-compensated wrench in company wrist axes at the RobotiQ mounting-plane origin",
+            ),
+            (
+                "external_wrench_world",
+                "Calibrated gripper-compensated wrench in configured world axes at the RobotiQ mounting-plane origin",
+            ),
+        ):
+            spec.fields[field_name].CopyFrom(
+                robotenv_pb2.FieldSpec(
+                    dtype="float64", shape=[6], required=False, description=description
+                )
+            )
+            spec.fields[f"{field_name}_reference_point"].CopyFrom(
+                robotenv_pb2.FieldSpec(
+                    dtype="string",
+                    shape=[],
+                    required=False,
+                    description="RobotiQ mounting-plane origin, 18.5 mm along sensor/link-8 +Z",
+                )
+            )
+        spec.fields["torso_joint_positions"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64", shape=[3], required=False,
+                description="Measured torso_j1..torso_j3 positions in radians",
+            )
+        )
+        spec.fields["head_joint_positions"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64", shape=[3], required=False,
+                description="Measured head_j1..head_j3 positions in radians",
             )
         )
         spec.fields["prev_controller_latency_ms"].CopyFrom(
@@ -485,58 +979,322 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "robot_model": self.robot_model,
                 "control_hz": str(self.control_hz),
                 "arm_side": self.arm_side,
+                "force_signal_provider_kind": "wrist_force_torque",
+                "force_signal_provider_schema_version": "2",
+                "force_calibration_owner": "robot_server",
+                "force_signal_stream_id": f"{self.robot_model}:{self.arm_side}:wrist_ft",
+                "external_wrench_world_frame_id": self.frame_type,
+                "cartesian_position_reference_frame": (
+                    "L_ee" if self.arm_side == "left" else "R_ee"
+                ),
+                "external_wrench_sensor_frame_id": (
+                    "L_arm_l8" if self.arm_side == "left" else "R_arm_l8"
+                ),
+                "external_wrench_output_reference_point_id": (
+                    "robotiq_mount_origin"
+                ),
+                "external_wrench_sensor_to_output_reference_translation_m": (
+                    "0,0,0.0185"
+                ),
+                "external_wrench_sensor_to_wrist_yaw_degrees": (
+                    "unset"
+                    if self.external_wrench_sensor_to_wrist_yaw_degrees is None
+                    else str(self.external_wrench_sensor_to_wrist_yaw_degrees)
+                ),
             },
         )
 
+    _FORCE_CALIBRATION_STATE_PROTO = {
+        name: getattr(robotenv_pb2, f"FORCE_CALIBRATION_STATE_{name}")
+        for name in (
+            "IDLE",
+            "READY_FOR_STAGE",
+            "MOVING",
+            "SETTLING",
+            "COLLECTING",
+            "FITTING",
+            "APPLYING",
+            "RETURNING",
+            "SUCCEEDED",
+            "FAILED",
+            "CANCELLING",
+            "CANCELLED",
+            "READY_TO_APPLY",
+        )
+    }
+
+    @classmethod
+    def _force_calibration_status_proto(cls, status):
+        return robotenv_pb2.ForceCalibrationStatus(
+            state=cls._FORCE_CALIBRATION_STATE_PROTO[status.state],
+            run_id=status.run_id,
+            current_stage_index=status.current_stage_index,
+            completed_stages=status.completed_stages,
+            total_stages=status.total_stages,
+            message=status.message,
+            arm_name=status.arm_name,
+            plan_id=status.plan_id,
+            plan_sha256=status.plan_sha256,
+            stage_id=status.stage_id,
+            server_instance_id=status.server_instance_id,
+            cache_reused=status.cache_reused,
+            command_deadline_timestamp_us=status.command_deadline_timestamp_us,
+        )
+
+    @staticmethod
+    def _set_force_calibration_rpc_error(context, exc: BaseException) -> None:
+        lifecycle_code = getattr(exc, "code", None)
+        if isinstance(lifecycle_code, str) and hasattr(grpc.StatusCode, lifecycle_code):
+            code = getattr(grpc.StatusCode, lifecycle_code)
+        elif isinstance(exc, (TypeError, ValueError)):
+            code = grpc.StatusCode.INVALID_ARGUMENT
+        else:
+            code = grpc.StatusCode.INTERNAL
+        context.set_code(code)
+        context.set_details(str(exc) or type(exc).__name__)
+
+    def StartForceCalibration(self, request, context):
+        if self._reject_if_shutting_down(context):
+            return robotenv_pb2.ForceCalibrationStatus()
+        try:
+            fit_inputs = VegaForceCalibrationFitInputs(
+                gripper_mass_kg=request.gripper_mass_kg,
+                gripper_com_sensor_m=tuple(request.gripper_com_sensor_m),
+            )
+            desired_normal_reset_joint_positions_rad = (
+                DesiredNormalResetJointPositionsRad(
+                    tuple(request.normal_reset_joint_positions_rad)
+                )
+                if request.normal_reset_joint_positions_rad
+                else None
+            )
+            status = self._force_calibration_manager.start(
+                request.run_id,
+                bool(request.force_recalibrate),
+                fit_inputs,
+                desired_normal_reset_joint_positions_rad,
+            )
+            return self._force_calibration_status_proto(status)
+        except BaseException as exc:
+            LOGGER.exception("StartForceCalibration failed: %s", exc)
+            self._set_force_calibration_rpc_error(context, exc)
+            return robotenv_pb2.ForceCalibrationStatus()
+
+    def AdvanceForceCalibration(self, request, context):
+        if self._reject_if_shutting_down(context):
+            return robotenv_pb2.ForceCalibrationStatus()
+        try:
+            status = self._force_calibration_manager.advance(
+                request.run_id, int(request.stage_index), request.stage_id
+            )
+            return self._force_calibration_status_proto(status)
+        except BaseException as exc:
+            LOGGER.exception("AdvanceForceCalibration failed: %s", exc)
+            self._set_force_calibration_rpc_error(context, exc)
+            return robotenv_pb2.ForceCalibrationStatus()
+
+    def CommitForceCalibration(self, request, context):
+        if self._reject_if_shutting_down(context):
+            return robotenv_pb2.ForceCalibrationStatus()
+        try:
+            status = self._force_calibration_manager.commit(
+                request.run_id, request.plan_sha256
+            )
+            return self._force_calibration_status_proto(status)
+        except BaseException as exc:
+            LOGGER.exception("CommitForceCalibration failed: %s", exc)
+            self._set_force_calibration_rpc_error(context, exc)
+            return robotenv_pb2.ForceCalibrationStatus()
+
+    def GetForceCalibrationStatus(self, request, context):
+        try:
+            return self._force_calibration_status_proto(
+                self._force_calibration_manager.status(request.run_id)
+            )
+        except BaseException as exc:
+            self._set_force_calibration_rpc_error(context, exc)
+            return robotenv_pb2.ForceCalibrationStatus()
+
+    def CancelForceCalibration(self, request, context):
+        if not request.run_id:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details("unknown calibration run_id")
+            return robotenv_pb2.ForceCalibrationStatus()
+        try:
+            status = self._force_calibration_manager.request_cancel(
+                request.run_id,
+                safe_return=not request.skip_safe_return,
+            )
+            return self._force_calibration_status_proto(status)
+        except BaseException as exc:
+            LOGGER.exception("CancelForceCalibration failed: %s", exc)
+            self._set_force_calibration_rpc_error(context, exc)
+            return robotenv_pb2.ForceCalibrationStatus()
+
+    def GetForceCalibrationResult(self, request, context):
+        try:
+            result = self._force_calibration_manager.result(request.run_id)
+            if not result.get("available"):
+                return robotenv_pb2.ForceCalibrationResult(
+                    available=False,
+                    run_id=result.get("run_id", ""),
+                    message=result.get("message", ""),
+                )
+            return robotenv_pb2.ForceCalibrationResult(
+                available=True,
+                calibrated_at_timestamp_us=result["calibrated_at_timestamp_us"],
+                expires_at_timestamp_us=result["expires_at_timestamp_us"],
+                calibration_kind=result["calibration_kind"],
+                parameters_json=parameters_json(result),
+                quality_json=quality_json(result),
+                message=result.get("message", ""),
+                run_id=result["run_id"],
+                schema_version=result["schema_version"],
+                reference_point_id=result["reference_point_id"],
+                arm_name=result["arm_name"],
+                plan_id=result["plan_id"],
+                plan_sha256=result["plan_sha256"],
+                server_instance_id=result["server_instance_id"],
+                source_run_id=result["source_run_id"],
+                was_committed=result["was_committed"],
+            )
+        except BaseException as exc:
+            self._set_force_calibration_rpc_error(context, exc)
+            return robotenv_pb2.ForceCalibrationResult()
+
+    @_track_transport_rpc(robotenv_pb2.ResetResponse)
     def Reset(self, request, context):
+        if self._force_calibration_owns_robot.is_set():
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details("force calibration owns robot commands")
+            return robotenv_pb2.ResetResponse(
+                status="BUSY", message="force calibration owns robot commands"
+            )
         mode = request.mode or "home"
         LOGGER.info("Reset requested: mode=%s arm=%s", mode, self.arm_side)
+        rpc_cancelled = threading.Event()
+        motion_cancelled = threading.Event()
 
-        # Cancel any in-progress _move_incremental from a previous Reset.
-        self._cancel_move.set()
+        def cancel_reset_motion() -> None:
+            rpc_cancelled.set()
+            motion_cancelled.set()
 
-        # Pause the control loop during reset to prevent conflicting commands.
-        was_running = self._control_loop_thread is not None and self._control_loop_thread.is_alive()
-        if was_running:
-            self._stop_control_loop()
+        if hasattr(context, "add_callback") and not context.add_callback(cancel_reset_motion):
+            cancel_reset_motion()
 
-        with self._cmd_lock:
-            self._cancel_move.clear()
-            try:
+        # Establish reset ownership before waiting for the command lock. A new
+        # reset cancels the previous reset's local motion loop, while the
+        # shared in-progress event stays set until every superseded handler has
+        # unwound.
+        with self._reset_state_lock:
+            if self._active_reset_cancel is not None:
+                self._active_reset_cancel.set()
+            self._active_reset_cancel = motion_cancelled
+            self._active_reset_count += 1
+            self._reset_in_progress.set()
+            with self._command_epoch_lock:
+                self._command_epoch += 1
+
+        was_running = False
+        try:
+            with self._cmd_lock:
+                if motion_cancelled.is_set():
+                    raise RuntimeError("Reset was cancelled before robot motion started")
+                calibration_cancellable = bool(
+                    request.params.get("calibration_cancellable", robotenv_pb2.Value()).int_value
+                )
+                # Pause the control loop while this reset owns robot commands.
+                was_running = self._control_loop_thread is not None and self._control_loop_thread.is_alive()
+                if was_running:
+                    with self._reset_state_lock:
+                        self._reset_restart_control_loop = True
+                    self._stop_control_loop()
                 if mode == "home":
                     target_joints = self.reset_joints
-                    self._execute_reset_sequence(target_joints)
+                    self._execute_reset_sequence(
+                        target_joints,
+                        cancelled=motion_cancelled,
+                        interruptible_gripper=calibration_cancellable,
+                    )
                 elif mode == "target":
                     target_joints = self._extract_target_joints(request)
-                    self._execute_reset_sequence(target_joints)
+                    self._execute_reset_sequence(
+                        target_joints,
+                        cancelled=motion_cancelled,
+                        interruptible_gripper=calibration_cancellable,
+                    )
                 elif mode == "random":
                     target_joints = self._sample_random_target()
-                    self._execute_reset_sequence(target_joints)
+                    self._execute_reset_sequence(
+                        target_joints,
+                        cancelled=motion_cancelled,
+                        interruptible_gripper=calibration_cancellable,
+                    )
                 elif mode == "current":
                     pass
                 else:
                     context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                     context.set_details(f"Unknown reset mode: {mode}")
                     return robotenv_pb2.ResetResponse()
+                if motion_cancelled.is_set():
+                    raise RuntimeError("Reset was cancelled during robot motion")
 
                 observation, timestamp_us = self._create_observation()
-                return robotenv_pb2.ResetResponse(
-                    observation=observation,
-                    status="SUCCESS",
-                    message=f"Reset to {mode}",
-                    timestamp_us=timestamp_us,
-                )
-            except Exception as exc:
-                LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
+                # Linearize success against registration of a newer Reset.
+                # A newer owner either sets our cancellation event before
+                # acquiring the command lock or cannot register until after
+                # this response has been committed as the current owner.
+                with self._reset_state_lock:
+                    if (
+                        motion_cancelled.is_set()
+                        or self._active_reset_cancel is not motion_cancelled
+                    ):
+                        raise RuntimeError("Reset was superseded before its response was committed")
+                    return robotenv_pb2.ResetResponse(
+                        observation=observation,
+                        status="SUCCESS",
+                        message=f"Reset to {mode}",
+                        timestamp_us=timestamp_us,
+                    )
+        except Exception as exc:
+            LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
+            if rpc_cancelled.is_set():
+                pass
+            elif motion_cancelled.is_set():
+                context.set_code(grpc.StatusCode.ABORTED)
+                context.set_details("Reset was superseded by a newer reset request")
+            else:
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(f"Reset failed: {exc}")
-                return robotenv_pb2.ResetResponse()
-            finally:
-                # Restart control loop if it was running before reset.
-                if was_running:
-                    self._start_control_loop()
+            return robotenv_pb2.ResetResponse()
+        finally:
+            restart_control_loop = False
+            with self._reset_state_lock:
+                self._active_reset_count -= 1
+                if self._active_reset_cancel is motion_cancelled:
+                    self._active_reset_cancel = None
+                if self._active_reset_count == 0:
+                    self._reset_in_progress.clear()
+                    restart_control_loop = self._reset_restart_control_loop
+                    self._reset_restart_control_loop = False
+            if restart_control_loop:
+                self._start_control_loop()
 
+    @_track_transport_rpc(robotenv_pb2.StepResponse)
     def Step(self, request, context):
+        if self._force_calibration_owns_robot.is_set():
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details("force calibration owns robot commands")
+            return robotenv_pb2.StepResponse(
+                status="BUSY", message="force calibration owns robot commands"
+            )
+        rpc_cancelled = threading.Event()
+        if hasattr(context, "add_callback") and not context.add_callback(rpc_cancelled.set):
+            rpc_cancelled.set()
+        with self._reset_state_lock:
+            reset_active_at_entry = self._reset_in_progress.is_set()
+            with self._command_epoch_lock:
+                command_epoch = self._command_epoch
         action_space = request.action_space
         action_space_for_robot = action_space
         action = np.asarray(request.action, dtype=np.float64)
@@ -545,6 +1303,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             gripper_action_space = "velocity" if "velocity" in action_space else "position"
 
         try:
+            if reset_active_at_entry:
+                raise RuntimeError("Step was admitted while robot reset was active")
             # -- gripper debug --
             if self._robot.hand is not None:
                 _cur_grip_joint = self._robot.get_cached_gripper_joint_pos()
@@ -597,21 +1357,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 np.round(np.asarray(pre_action_state["cartesian_position"], dtype=np.float64), 4).tolist(),
             )
 
-            if self._robot.interpolation_enabled and self._control_loop_hz > 0:
-                # Interpolation mode: buffer command; control loop dispatches.
-                self._robot.add_command_point(
-                    action,
-                    action_space=action_space_for_robot,
-                    gripper_action_space=gripper_action_space,
-                )
-            else:
-                # Legacy synchronous path.
-                self._robot.update_command(
-                    action,
-                    action_space=action_space_for_robot,
-                    gripper_action_space=gripper_action_space,
-                    blocking=False,
-                )
+            self._dispatch_step_command(
+                action,
+                action_space=action_space_for_robot,
+                gripper_action_space=gripper_action_space,
+                command_epoch=command_epoch,
+                rpc_cancelled=rpc_cancelled,
+                reset_active_at_entry=reset_active_at_entry,
+            )
             t_after_cmd = time.time()
 
             # Build comprehensive action_info using the original request action_space
@@ -659,6 +1412,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 message=str(exc),
                 timestamp_us=timestamp_us,
             )
+
         except IKFailedError as exc:
             observation, timestamp_us = self._safe_observation()
             return robotenv_pb2.StepResponse(
@@ -685,6 +1439,42 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 timestamp_us=timestamp_us,
             )
 
+    def _dispatch_step_command(
+        self,
+        action: np.ndarray,
+        *,
+        action_space: str,
+        gripper_action_space: str,
+        command_epoch: int,
+        rpc_cancelled: threading.Event | None = None,
+        reset_active_at_entry: bool = False,
+    ) -> None:
+        """Serialize physical Step dispatch with Reset and reject stale work."""
+        with self._cmd_lock:
+            with self._command_epoch_lock:
+                reset_superseded_command = command_epoch != self._command_epoch
+            if (
+                self._reset_in_progress.is_set()
+                or reset_superseded_command
+                or reset_active_at_entry
+                or (rpc_cancelled is not None and rpc_cancelled.is_set())
+            ):
+                raise RuntimeError("Step was superseded by robot reset")
+            if self._robot.interpolation_enabled and self._control_loop_hz > 0:
+                self._robot.add_command_point(
+                    action,
+                    action_space=action_space,
+                    gripper_action_space=gripper_action_space,
+                )
+            else:
+                self._robot.update_command(
+                    action,
+                    action_space=action_space,
+                    gripper_action_space=gripper_action_space,
+                    blocking=False,
+                )
+
+    @_track_transport_rpc(robotenv_pb2.HealthCheckResponse)
     def HealthCheck(self, request, context):
         del request, context
         try:
@@ -794,9 +1584,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             "cartesian_position": robotenv_pb2.Value(
                 float_array=robotenv_pb2.FloatArray(values=cartesian_position.tolist())
             ),
-            "wrench_state": robotenv_pb2.Value(
-                float_array=robotenv_pb2.FloatArray(values=np.asarray(state_dict["wrench_state"]).tolist())
-            ),
             "prev_controller_latency_ms": robotenv_pb2.Value(
                 float_value=float(state_dict.get("prev_controller_latency_ms", 0.0))
             ),
@@ -810,6 +1597,180 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 int_value=int(timestamp_us)
             ),
         }
+        wrench_sensor = getattr(getattr(self._robot, "arm", None), "wrench_sensor", None)
+        if wrench_sensor is not None:
+            try:
+                sensor_wrench_raw, sensor_timestamp_ns = (
+                    wrench_sensor.get_wrench_sample()
+                )
+                sensor_wrench = np.asarray(sensor_wrench_raw, dtype=np.float64)
+                if sensor_wrench.shape != (6,) or not np.all(np.isfinite(sensor_wrench)):
+                    raise ValueError("sensor wrench must contain six finite values")
+                if (
+                    isinstance(sensor_timestamp_ns, bool)
+                    or not isinstance(sensor_timestamp_ns, (int, np.integer))
+                    or int(sensor_timestamp_ns) <= 0
+                ):
+                    raise ValueError("sensor wrench timestamp must be a positive integer")
+                sensor_timestamp_ns = int(sensor_timestamp_ns)
+            except Exception as exc:
+                now = time.monotonic()
+                last_warning = getattr(
+                    self, "_last_wrench_warning_monotonic", float("-inf")
+                )
+                if now - last_warning >= self._WRENCH_WARNING_INTERVAL_SECONDS:
+                    LOGGER.warning(
+                        "Omitting unavailable or malformed source-native F/T "
+                        "sample; expected six finite values (%s: %s)",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    self._last_wrench_warning_monotonic = now
+            else:
+                reference_point = "physical F/T sensor measurement origin"
+                observation["external_wrench_sensor_raw"] = robotenv_pb2.Value(
+                    float_array=robotenv_pb2.FloatArray(
+                        values=sensor_wrench.tolist()
+                    )
+                )
+                observation["external_wrench_sensor_raw_reference_point"] = (
+                    robotenv_pb2.Value(
+                        string_value=reference_point
+                    )
+                )
+                observation["external_wrench_sensor_raw_timestamp_ns"] = (
+                    robotenv_pb2.Value(int_value=sensor_timestamp_ns)
+                )
+                robot_timestamp_ns = int(timestamp_us) * 1_000
+                sample_pair = (sensor_timestamp_ns, robot_timestamp_ns)
+                now_monotonic = time.monotonic()
+                if getattr(self, "_last_wrench_sample_pair", None) != sample_pair:
+                    self._last_wrench_sample_pair = sample_pair
+                    self._last_wrench_sample_progress_monotonic = now_monotonic
+                stalled_for = now_monotonic - getattr(
+                    self,
+                    "_last_wrench_sample_progress_monotonic",
+                    now_monotonic,
+                )
+                timing_valid = (
+                    robot_timestamp_ns > 0
+                    and abs(sensor_timestamp_ns - robot_timestamp_ns)
+                    <= int(self._WRENCH_ROBOT_MAX_SKEW_SECONDS * 1_000_000_000)
+                    and stalled_for <= self._WRENCH_SAMPLE_MAX_STALL_SECONDS
+                )
+                if not timing_valid:
+                    if now_monotonic - getattr(
+                        self, "_last_wrench_timing_warning_monotonic", float("-inf")
+                    ) >= self._WRENCH_WARNING_INTERVAL_SECONDS:
+                        LOGGER.warning(
+                            "Omitting calibrated external wrench because source and "
+                            "robot-state timestamps are stale or misaligned"
+                        )
+                        self._last_wrench_timing_warning_monotonic = now_monotonic
+                    continue_wrench_processing = False
+                else:
+                    continue_wrench_processing = True
+                if not continue_wrench_processing:
+                    wrist_from_sensor = world_from_sensor = None
+                else:
+                    try:
+                        wrist_from_sensor, world_from_sensor = vega_wrench_frame_rotations(
+                            cartesian_position,
+                            arm_side=self.arm_side,
+                            gripper_type=self.gripper_type,
+                        )
+                    except ValueError as exc:
+                        LOGGER.warning("Omitting unsupported wrench frame rotations: %s", exc)
+                        wrist_from_sensor = world_from_sensor = None
+                if wrist_from_sensor is not None and world_from_sensor is not None:
+                    observation["external_wrench_wrist_from_sensor_rotation"] = (
+                        robotenv_pb2.Value(
+                            float_array=robotenv_pb2.FloatArray(
+                                values=wrist_from_sensor.reshape(-1).tolist()
+                            )
+                        )
+                    )
+                    observation["external_wrench_world_from_sensor_rotation"] = (
+                        robotenv_pb2.Value(
+                            float_array=robotenv_pb2.FloatArray(
+                                values=world_from_sensor.reshape(-1).tolist()
+                            )
+                        )
+                    )
+                    applier_lock = getattr(
+                        self, "_force_calibration_applier_lock", None
+                    )
+                    with applier_lock if applier_lock is not None else nullcontext():
+                        applier = getattr(self, "_force_calibration_applier", None)
+                        expires_at_us = getattr(
+                            self, "_force_calibration_expires_at_timestamp_us", 0
+                        )
+                        if (
+                            applier is not None
+                            and expires_at_us > 0
+                            and int(time.time() * 1_000_000) >= expires_at_us
+                        ):
+                            self._force_calibration_applier = None
+                            applier = None
+                        if applier is not None:
+                            try:
+                                wrist_wrench = (
+                                    applier.measured_sensor_raw_to_calibrated_wrist(
+                                        sensor_wrench,
+                                        world_from_sensor,
+                                        wrist_from_sensor,
+                                        reference_point=reference_point,
+                                    )
+                                )
+                                wrist_wrench = shift_wrench_reference(
+                                    wrist_wrench,
+                                    target_from_source_translation=(
+                                        wrist_from_sensor
+                                        @ VEGA_COMPANY_WRIST_ORIGIN_FROM_SENSOR_M
+                                    ),
+                                )
+                                world_wrench = (
+                                    applier.measured_sensor_raw_to_calibrated_world(
+                                        sensor_wrench,
+                                        world_from_sensor,
+                                        reference_point=reference_point,
+                                    )
+                                )
+                                world_wrench = shift_wrench_reference(
+                                    world_wrench,
+                                    target_from_source_translation=(
+                                        world_from_sensor
+                                        @ VEGA_COMPANY_WRIST_ORIGIN_FROM_SENSOR_M
+                                    ),
+                                )
+                            except (TypeError, ValueError, np.linalg.LinAlgError) as exc:
+                                LOGGER.warning(
+                                    "Omitting calibrated external wrench: %s", exc
+                                )
+                            else:
+                                anchor = (
+                                    "RobotiQ mounting-plane origin "
+                                    "(+18.5 mm sensor/link-8 Z)"
+                                )
+                                for name, values in (
+                                    ("external_wrench_wrist", wrist_wrench),
+                                    ("external_wrench_world", world_wrench),
+                                ):
+                                    observation[name] = robotenv_pb2.Value(
+                                        float_array=robotenv_pb2.FloatArray(
+                                            values=values.tolist()
+                                        )
+                                    )
+                                    observation[f"{name}_reference_point"] = (
+                                        robotenv_pb2.Value(string_value=anchor)
+                                    )
+        for field_name in ("torso_joint_positions", "head_joint_positions"):
+            if field_name in state_dict:
+                observation[field_name] = robotenv_pb2.Value(
+                    float_array=robotenv_pb2.FloatArray(
+                        values=np.asarray(state_dict[field_name], dtype=np.float64).tolist()
+                    )
+                )
         # Hand tactile, present only when the hand streams it. Added as a
         # float_array under its own key when get_robot_state() supplied it;
         # scalar grippers never set "hand_tactile" so the observation is
@@ -856,24 +1817,52 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     _RESET_CMD_HZ = 100.0
     _RESET_MAX_STEP_RAD = 0.2
     _RESET_SETTLE_S = 0.5
+    _RESET_GRIPPER_TIMEOUT_S = 5.0
+    _RESET_GRIPPER_TOLERANCE = 0.05
 
-    def _execute_reset_sequence(self, target_joints: np.ndarray) -> None:
+    def _execute_reset_sequence(
+        self,
+        target_joints: np.ndarray,
+        *,
+        cancelled: threading.Event | None = None,
+        interruptible_gripper: bool = False,
+    ) -> None:
         t0 = time.time()
-        LOGGER.info("Reset[%s]: starting gripper open", self.arm_side)
-        self._robot.update_gripper(0.0, velocity=False, blocking=True)
-        LOGGER.info("Reset[%s]: gripper done (%.2fs), starting reset motion", self.arm_side, time.time() - t0)
+        # Reset owns the command path at this point. Clear all buffered targets
+        # before any cancellable wait so a cancelled reset cannot restart the
+        # previous interpolation/feedforward command.
         self._robot.reset_filter_state()
-
+        if cancelled is not None and cancelled.is_set():
+            return
+        LOGGER.info("Reset[%s]: starting gripper open", self.arm_side)
+        self._robot.update_gripper(
+            0.0,
+            velocity=False,
+            blocking=not interruptible_gripper,
+        )
+        if interruptible_gripper:
+            gripper_deadline = time.monotonic() + self._RESET_GRIPPER_TIMEOUT_S
+            while abs(float(self._robot.get_cached_gripper_position())) > (
+                self._RESET_GRIPPER_TOLERANCE
+            ):
+                if cancelled is not None and cancelled.is_set():
+                    return
+                if time.monotonic() >= gripper_deadline:
+                    raise RuntimeError("Vega gripper did not open before reset motion")
+                time.sleep(0.02)
+        if cancelled is not None and cancelled.is_set():
+            return
+        LOGGER.info("Reset[%s]: gripper done (%.2fs), starting reset motion", self.arm_side, time.time() - t0)
         # Move to middle waypoint to avoid collisions.
         middle_f64 = np.asarray(self.reset_middle_joints, dtype=np.float64)
         LOGGER.info("Reset[%s]: moving to middle waypoint", self.arm_side)
-        self._move_incremental(middle_f64)
+        self._move_incremental(middle_f64, cancelled=cancelled)
         LOGGER.info("Reset[%s]: middle waypoint reached (%.2fs)", self.arm_side, time.time() - t0)
 
         # Then move to the final target (home/init position).
         target_f64 = np.asarray(target_joints, dtype=np.float64)
         LOGGER.info("Reset[%s]: moving to target", self.arm_side)
-        self._move_incremental(target_f64)
+        self._move_incremental(target_f64, cancelled=cancelled)
         LOGGER.info("Reset[%s]: target reached (%.2fs), syncing motion manager", self.arm_side, time.time() - t0)
 
         self._robot.reset_filter_state()
@@ -889,6 +1878,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         target: np.ndarray,
         tolerance: float | None = None,
         timeout: float | None = None,
+        cancelled: threading.Event | None = None,
     ) -> None:
         """Move to target in incremental steps respecting motor delta limit."""
         tol = tolerance if tolerance is not None else self._RESET_TOLERANCE_RAD
@@ -903,7 +1893,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         _tick = 0  # [BUG PROBE]
 
         while time.time() < deadline:
-            if self._cancel_move.is_set():
+            if cancelled is not None and cancelled.is_set():
                 LOGGER.info("_move_incremental cancelled by new request")
                 return
 
@@ -1005,6 +1995,51 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         state[3:6] = (R_base * R_state).as_euler("xyz")
         return state
 
+    def shutdown(self) -> None:
+        """Safely stop calibration, command loops, and the robot transport."""
+        with self._shutdown_lock:
+            if self._shutdown_completed:
+                return
+            # Close admission before inspecting any owner.  In-flight RPCs
+            # either observe this flag before physical dispatch or are drained
+            # by the ownership barriers below.
+            self._shutdown_started.set()
+            with self._command_epoch_lock:
+                self._command_epoch += 1
+            with self._reset_state_lock:
+                if self._active_reset_cancel is not None:
+                    self._active_reset_cancel.set()
+            manager = getattr(self, "_force_calibration_manager", None)
+            if manager is not None:
+                manager.shutdown()
+            with self._transport_rpc_condition:
+                while self._active_transport_rpcs:
+                    self._transport_rpc_condition.wait()
+            # Reset and Step perform physical dispatch while holding this lock.
+            # Acquiring it here proves that every admitted command has unwound.
+            with self._cmd_lock:
+                self._stop_control_loop()
+                self._robot.close()
+            self._shutdown_completed = True
+
+
+def _shutdown_service_until_safe(
+    service: "VegaRobotEnvService",
+    *,
+    retry_delay_s: float = 1.0,
+    sleep_fn=time.sleep,
+) -> None:
+    """Retry fail-closed shutdown without letting daemon I/O workers vanish."""
+    while True:
+        try:
+            service.shutdown()
+            return
+        except Exception:
+            LOGGER.exception(
+                "Vega shutdown is not yet safe; retrying while RPC admission remains closed"
+            )
+            sleep_fn(retry_delay_s)
+
 
 def serve(
     grpc_port: int = 50061,
@@ -1015,6 +2050,7 @@ def serve(
     control_hz: int = 20,
     use_velocity_feedforward: bool = False,
     base_frame_rotation: Optional[list[float]] = None,
+    external_wrench_sensor_to_wrist_yaw_degrees: float | None = None,
     ik_solver_type: str = "pink",
     robotiq_comport: str = "/dev/ttyUSB0",
     wuji_sn: Optional[str] = None,
@@ -1039,32 +2075,82 @@ def serve(
     vel_ratio: float = 1.0,
     vel_damp_thresh: float = 0.05,
     head_init_pos: tuple[float, ...] | list[float] = (1.48, 0.0, -0.3),
+    force_calibration_gripper_mass_kg: float = 1.2,
+    force_calibration_gripper_com_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.072),
+    force_calibration_storage_directory: str | None = None,
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
-    hand_type = kwargs.pop("hand_type", None)
-    if kwargs:
-        unexpected = ", ".join(sorted(kwargs.keys()))
-        raise TypeError(f"Unexpected keyword arguments: {unexpected}")
-    if hand_type is not None and gripper_type == "default":
-        gripper_type = hand_type
+    managed_signals = {signal.SIGINT, signal.SIGTERM}
+    previous_signal_handlers = {
+        signum: signal.getsignal(signum) for signum in managed_signals
+    }
+    deferred_shutdown = threading.Event()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    def defer_shutdown_signal(signum, frame):
+        del signum, frame
+        deferred_shutdown.set()
 
-    _log_path = os.path.expanduser("~/custom_dexcontrol/src/dexcontrol/logs/robotenv_vega.log")
-    os.makedirs(os.path.dirname(_log_path), exist_ok=True)
-    from core.robotenv_vega.circular_file_handler import CircularFileHandler
-    _file_handler = CircularFileHandler(_log_path)
-    _file_handler.setLevel(logging.getLogger().level)
-    _file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)-8s %(name)s [%(filename)s:%(lineno)d]: %(message)s"
-    ))
-    logging.getLogger().addHandler(_file_handler)
+    # pthread_sigmask only protects the calling thread. Install a process-wide
+    # non-destructive disposition first so an existing native/daemon thread
+    # cannot receive SIGTERM with SIG_DFL while hardware is being acquired.
+    for signum in managed_signals:
+        signal.signal(signum, defer_shutdown_signal)
+    previous_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, managed_signals)
+    signals_unblocked = False
+    _file_handler = None
+    try:
+        hand_type = kwargs.pop("hand_type", None)
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs.keys()))
+            raise TypeError(f"Unexpected keyword arguments: {unexpected}")
+        if hand_type is not None and gripper_type == "default":
+            gripper_type = hand_type
 
-    service = VegaRobotEnvService(
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+
+        _log_path = os.path.expanduser(
+            "~/custom_dexcontrol/src/dexcontrol/logs/robotenv_vega.log"
+        )
+        os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+        from core.robotenv_vega.circular_file_handler import CircularFileHandler
+
+        _file_handler = CircularFileHandler(_log_path)
+        _file_handler.setLevel(logging.getLogger().level)
+        _file_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)-8s %(name)s "
+                "[%(filename)s:%(lineno)d]: %(message)s"
+            )
+        )
+        logging.getLogger().addHandler(_file_handler)
+    except BaseException:
+        for signum, previous_handler in previous_signal_handlers.items():
+            signal.signal(signum, previous_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        if _file_handler is not None:
+            logging.getLogger().removeHandler(_file_handler)
+            _file_handler.close()
+        raise
+
+    # A shutdown requested during logging/bootstrap must not be followed by
+    # hardware acquisition. Restore caller process state while the harmless
+    # deferring disposition is still installed, then exit cleanly.
+    pending_managed_signals = signal.sigpending().intersection(managed_signals)
+    if deferred_shutdown.is_set() or pending_managed_signals:
+        if _file_handler is not None:
+            logging.getLogger().removeHandler(_file_handler)
+            _file_handler.close()
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        for signum, previous_handler in previous_signal_handlers.items():
+            signal.signal(signum, previous_handler)
+        raise SystemExit(0)
+
+    try:
+        service = VegaRobotEnvService(
         robot_model=robot_model,
         arm_side=arm_side,
         gripper_type=gripper_type,
@@ -1072,6 +2158,9 @@ def serve(
         control_hz=control_hz,
         use_velocity_feedforward=use_velocity_feedforward,
         base_frame_rotation=base_frame_rotation,
+        external_wrench_sensor_to_wrist_yaw_degrees=(
+            external_wrench_sensor_to_wrist_yaw_degrees
+        ),
         ik_solver_type=ik_solver_type,
         robotiq_comport=robotiq_comport,
         wuji_sn=wuji_sn,
@@ -1096,39 +2185,87 @@ def serve(
         vel_ratio=vel_ratio,
         vel_damp_thresh=vel_damp_thresh,
         head_init_pos=head_init_pos,
-    )
+        force_calibration_gripper_mass_kg=force_calibration_gripper_mass_kg,
+        force_calibration_gripper_com_m=force_calibration_gripper_com_m,
+        force_calibration_storage_directory=force_calibration_storage_directory,
+        )
+    except BaseException:
+        for signum, previous_handler in previous_signal_handlers.items():
+            signal.signal(signum, previous_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        if _file_handler is not None:
+            logging.getLogger().removeHandler(_file_handler)
+            _file_handler.close()
+        raise
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    robotenv_pb2_grpc.add_RobotEnvServicer_to_server(service, server)
-
-    server_address = f"0.0.0.0:{grpc_port}"
-    server.add_insecure_port(server_address)
-
-    server.start()
-    LOGGER.info(
-        "Vega RobotEnv server started on %s (arm=%s, model=%s)",
-        server_address,
-        arm_side,
-        robot_model,
-    )
+    server = None
+    service_shutdown_completed = False
+    shutdown_signal_lock = threading.Lock()
 
     def shutdown_handler(signum, frame):
+        nonlocal service_shutdown_completed
         del signum, frame
+        if not shutdown_signal_lock.acquire(blocking=False):
+            LOGGER.warning(
+                "Vega shutdown already in progress; ignoring repeated signal"
+            )
+            return
         LOGGER.info("Shutting down Vega RobotEnv server")
         try:
-            service._stop_control_loop()
-        except Exception:
-            pass
-        try:
-            service._robot.close()
-        except Exception:
-            pass
-        server.stop(grace=5)
-        sys.exit(0)
+            if server is not None:
+                server.stop(grace=0)
+        finally:
+            _shutdown_service_until_safe(service)
+            service_shutdown_completed = True
+        raise SystemExit(0)
 
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    server.wait_for_termination()
+    try:
+        for signum in managed_signals:
+            signal.signal(signum, shutdown_handler)
+        # If another thread received a termination signal while the service
+        # constructor owned hardware, honor it now under the full safe handler.
+        if deferred_shutdown.is_set():
+            shutdown_handler(signal.SIGTERM, None)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        signals_unblocked = True
+
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+        robotenv_pb2_grpc.add_RobotEnvServicer_to_server(service, server)
+
+        server_address = f"0.0.0.0:{grpc_port}"
+        bound_port = server.add_insecure_port(server_address)
+        if not bound_port:
+            raise RuntimeError(f"failed to bind Vega RobotEnv server at {server_address}")
+
+        server.start()
+        LOGGER.info(
+            "Vega RobotEnv server started on %s (arm=%s, model=%s)",
+            server_address,
+            arm_side,
+            robot_model,
+        )
+
+        server.wait_for_termination()
+    finally:
+        try:
+            if server is not None:
+                server.stop(grace=0)
+        finally:
+            try:
+                if not service_shutdown_completed:
+                    _shutdown_service_until_safe(service)
+            finally:
+                for signum, previous_handler in previous_signal_handlers.items():
+                    signal.signal(signum, previous_handler)
+                if not signals_unblocked:
+                    # Keep pending termination signals blocked until physical
+                    # cleanup is complete; only then restore caller state.
+                    signal.pthread_sigmask(
+                        signal.SIG_SETMASK, previous_signal_mask
+                    )
+                if _file_handler is not None:
+                    logging.getLogger().removeHandler(_file_handler)
+                    _file_handler.close()
 
 
 def main() -> None:
@@ -1179,6 +2316,15 @@ def main() -> None:
         default=None,
         metavar=("ROLL", "PITCH", "YAW"),
         help="Custom base-frame rotation in degrees",
+    )
+    parser.add_argument(
+        "--external-wrench-sensor-to-wrist-yaw-degrees",
+        type=float,
+        default=None,
+        help=(
+            "Deprecated compatibility option. RobotEnv owns the calibrated "
+            "wrist/world transform and ignores this override."
+        ),
     )
     parser.add_argument(
         "--ik-solver",
@@ -1346,7 +2492,27 @@ def main() -> None:
         default=[2.0, 0.0, -0.3],
         metavar=("YAW", "PITCH", "ROLL"),
         help="Head joint init position in radians [yaw, pitch, roll]. "
-             "Defaults to [1.48, 0.0, -0.3] (head_j1 limit: ±1.483 rad).",
+             "Defaults to [2.0, 0.0, -0.3].",
+    )
+    parser.add_argument(
+        "--force-calibration-gripper-mass-kg",
+        type=float,
+        default=1.2,
+        help="Installed RobotiQ/tool mass used by server-owned force calibration",
+    )
+    parser.add_argument(
+        "--force-calibration-gripper-com-m",
+        type=float,
+        nargs=3,
+        default=[0.0, 0.0, 0.072],
+        metavar=("X", "Y", "Z"),
+        help="Installed RobotiQ/tool center of mass in sensor axes, metres",
+    )
+    parser.add_argument(
+        "--force-calibration-storage-directory",
+        type=str,
+        default=None,
+        help="Durable per-arm force-calibration state directory",
     )
     args = parser.parse_args()
 
@@ -1364,6 +2530,9 @@ def main() -> None:
         control_hz=args.control_hz,
         use_velocity_feedforward=args.use_velocity_feedforward,
         base_frame_rotation=args.base_frame_rotation,
+        external_wrench_sensor_to_wrist_yaw_degrees=(
+            args.external_wrench_sensor_to_wrist_yaw_degrees
+        ),
         ik_solver_type=args.ik_solver,
         robotiq_comport=gripper_addr,
         wuji_sn=args.wuji_sn,
@@ -1388,6 +2557,9 @@ def main() -> None:
         vel_ratio=args.vel_ratio,
         vel_damp_thresh=args.vel_damp_thresh,
         head_init_pos=args.head_init_pos,
+        force_calibration_gripper_mass_kg=args.force_calibration_gripper_mass_kg,
+        force_calibration_gripper_com_m=args.force_calibration_gripper_com_m,
+        force_calibration_storage_directory=args.force_calibration_storage_directory,
     )
 
 

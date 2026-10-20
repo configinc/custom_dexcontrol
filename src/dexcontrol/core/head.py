@@ -57,6 +57,7 @@ class Head(ManagedJointComponent):
             robot_info: RobotInfo instance that provides joint names, limits,
                 and the component configuration.
         """
+        self.temperature_sensor: TemperatureSensor | None = None
         joint_names = robot_info.get_component_joints(name)
         joint_pos_limits = robot_info.get_joint_pos_limits(joint_names)
         joint_vel_limits = robot_info.get_joint_vel_limits(joint_names)
@@ -84,12 +85,14 @@ class Head(ManagedJointComponent):
         assert self._joint_vel_limit is not None, "joint_vel_limit is not set"
 
         # Initialize temperature sensor if configured
-        self.temperature_sensor: TemperatureSensor | None = None
         if config.temperature_sub_topic:
-            self.temperature_sensor = TemperatureSensor(
-                f"{name}_temperature", config.temperature_sub_topic
-            )
+            self.temperature_sensor = TemperatureSensor.__new__(TemperatureSensor)
             self._subcomponents["temperature_sensor"] = self.temperature_sensor
+            TemperatureSensor.__init__(
+                self.temperature_sensor,
+                f"{name}_temperature",
+                config.temperature_sub_topic,
+            )
 
     def set_joint_pos(
         self,
@@ -262,7 +265,20 @@ class Head(ManagedJointComponent):
 
     def shutdown(self) -> None:
         """Clean up Zenoh resources for the head component."""
-        super().shutdown()
+        errors: list[str] = []
+        try:
+            super().shutdown()
+        except Exception as exc:
+            errors.append(f"head transport: {exc}")
+        temperature_sensor = getattr(self, "temperature_sensor", None)
+        if temperature_sensor is not None:
+            try:
+                temperature_sensor.shutdown()
+                self.temperature_sensor = None
+            except Exception as exc:
+                errors.append(f"temperature sensor: {exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
     def _process_joint_velocities(
         self,

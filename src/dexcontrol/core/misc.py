@@ -160,11 +160,14 @@ class Battery(RobotComponent):
 
     def shutdown(self) -> None:
         """Shuts down the battery component and stops monitoring thread."""
-        self._shutdown_event.set()
-        if self._monitor_thread and self._monitor_thread.is_alive():
-            self._monitor_thread.join(timeout=2.0)  # Extended timeout
-            if self._monitor_thread.is_alive():
-                logger.warning("Battery monitor thread did not terminate cleanly")
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        if shutdown_event is not None:
+            shutdown_event.set()
+        monitor_thread = getattr(self, "_monitor_thread", None)
+        if monitor_thread and monitor_thread.is_alive():
+            monitor_thread.join(timeout=2.0)  # Extended timeout
+            if monitor_thread.is_alive():
+                raise RuntimeError("Battery monitor thread did not terminate cleanly")
         super().shutdown()
 
     @staticmethod
@@ -395,12 +398,15 @@ class EStop(RobotComponent):
 
     def shutdown(self) -> None:
         """Shuts down the EStop component and stops monitoring thread."""
-        if self._monitoring:
-            self._shutdown_event.set()
-            if self._monitor_thread and self._monitor_thread.is_alive():
-                self._monitor_thread.join(timeout=2.0)  # Extended timeout
-                if self._monitor_thread.is_alive():
-                    logger.warning("EStop monitor thread did not terminate cleanly")
+        if getattr(self, "_monitoring", False):
+            shutdown_event = getattr(self, "_shutdown_event", None)
+            if shutdown_event is not None:
+                shutdown_event.set()
+            monitor_thread = getattr(self, "_monitor_thread", None)
+            if monitor_thread and monitor_thread.is_alive():
+                monitor_thread.join(timeout=2.0)  # Extended timeout
+                if monitor_thread.is_alive():
+                    raise RuntimeError("EStop monitor thread did not terminate cleanly")
         super().shutdown()
 
     def show(self) -> None:
@@ -611,7 +617,10 @@ class Heartbeat:
 
     def shutdown(self) -> None:
         """Shuts down the heartbeat monitor and stops monitoring thread."""
-        self._monitor.shutdown()
+        monitor = getattr(self, "_monitor", None)
+        if monitor is not None:
+            monitor.shutdown()
+            self._monitor = None
 
     def show(self) -> None:
         """Displays the current heartbeat status as a formatted table with color indicators."""

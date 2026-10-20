@@ -89,6 +89,67 @@ try:
 except ImportError:  # pragma: no cover - older SDK
     _WujiException = Exception
 
+
+def _wait_for_worker_exit_during_constructor_rollback(
+    worker: threading.Thread,
+    stop_event: threading.Event,
+    *,
+    join_timeout_s: float = 2.0,
+) -> None:
+    """Keep the constructing process alive until SDK I/O has really stopped."""
+    stop_event.set()
+    while worker.is_alive():
+        worker.join(timeout=join_timeout_s)
+        if worker.is_alive():
+            logger.error(
+                "Wuji constructor rollback is waiting for its I/O worker to stop"
+            )
+
+
+def _validate_tactile_override(raw_value: str) -> str:
+    value = raw_value.strip().lower()
+    if value and value not in _TACTILE_ENV_VALUES:
+        raise ValueError(
+            f"WUJI_TACTILE={value!r} is not a recognised value "
+            f"(use one of {sorted(_TACTILE_ENV_VALUES)}, or unset it to "
+            "follow the per-model default)"
+        )
+    return value
+
+
+def _retry_constructor_cleanup_until_safe(
+    shutdown_fn,
+    *,
+    retry_delay_s: float = 1.0,
+    sleep_fn=time.sleep,
+) -> None:
+    while True:
+        try:
+            shutdown_fn()
+            return
+        except BaseException:
+            logger.exception(
+                "Wuji constructor rollback cleanup is not yet safe; retrying"
+            )
+            sleep_fn(retry_delay_s)
+
+
+def _cleanup_connected_hand_until_safe(hand, manager) -> None:
+    """Retry pre-worker motor/session cleanup without repeating completed work."""
+    disabled = False
+    disconnected = False
+
+    def cleanup() -> None:
+        nonlocal disabled, disconnected
+        if not disabled:
+            hand.disable()
+            disabled = True
+        if not disconnected:
+            manager.disconnect_all()
+            disconnected = True
+
+    _retry_constructor_cleanup_until_safe(cleanup)
+
 # Runtime reconnect policy (worker thread). After the link watchdog declares
 # the hand dead, wait _RECONNECT_AFTER_S for a plain stream hiccup to clear,
 # then rebuild the SDK session every _RECONNECT_INTERVAL_S until frames flow
@@ -345,6 +406,11 @@ class WujiHandAdapter:
         # motor. Joints never reported are seeded from the target since
         # nothing drives them anyway.
         self._state_seen_mask = np.zeros(_N_JOINTS, dtype=bool)
+        # Monotonic count of state frames actually consumed from the SDK.
+        # Ownership boundaries use this to prove their hold is based on a
+        # post-drain measurement, not merely a recently cached pre-command
+        # sample.
+        self._state_generation = 0
         # Per-joint time of the last FINITE measurement (anchored at the
         # joint's first report). The link watchdog is judged per joint over
         # the reported joints, so one healthy joint can never mask another
@@ -357,30 +423,31 @@ class WujiHandAdapter:
         self._ctrl_params = dict(effort_limit=effort_limit, mit_kp=mit_kp, mit_kd=mit_kd,
                                  lowpass_cutoff_hz=lowpass_cutoff_hz, init_timeout=init_timeout)
         self._stop_event = threading.Event()
+        # Validate the operator-facing switch before claiming the physical
+        # device. Model-specific defaults are resolved after connection.
+        _tactile_env = _validate_tactile_override(
+            os.environ.get("WUJI_TACTILE", "")
+        )
         self._hand = self._connect(sn, init_timeout)
-        # Reconnects (startup retries and runtime) always target THIS serial —
-        # never the map / auto-selection again.
-        self._bound_sn = self.serial_number
-        self._is_hand2 = isinstance(self._hand, WujiHand2)
-        self._command_hz = self._resolve_command_hz(self._command_hz_arg, self._is_hand2)
-        # Tactile: per-model default from TACTILE_BY_MODEL (resolved here,
-        # after connect, once the model is known); WUJI_TACTILE=on/off is an
-        # explicit override. When enabled, a missing/dead tactile stream is a
-        # hard startup error (see _setup_tactile) — never a silent skip.
-        _tactile_env = os.environ.get("WUJI_TACTILE", "").strip().lower()
-        if _tactile_env in _TACTILE_ENV_VALUES:
-            self._tactile_enabled = _TACTILE_ENV_VALUES[_tactile_env]
-        elif _tactile_env:
-            # Never fall back to the table on an unrecognised value: silently
-            # reading "WUJI_TACTILE=yes" as OFF is exactly the "collected a
-            # dataset believing tactile was on" failure this design forbids.
-            raise ValueError(
-                f"WUJI_TACTILE={_tactile_env!r} is not a recognised value "
-                f"(use one of {sorted(_TACTILE_ENV_VALUES)}, or unset it to "
-                f"follow the per-model default)"
+        try:
+            # Reconnects (startup retries and runtime) always target THIS
+            # serial — never the map / auto-selection again.
+            self._bound_sn = self.serial_number
+            self._is_hand2 = isinstance(self._hand, WujiHand2)
+            self._command_hz = self._resolve_command_hz(
+                self._command_hz_arg, self._is_hand2
             )
-        else:
-            self._tactile_enabled = TACTILE_BY_MODEL.get(self.model, False)
+            # Tactile: per-model default from TACTILE_BY_MODEL (resolved here,
+            # after connect, once the model is known).
+            if _tactile_env in _TACTILE_ENV_VALUES:
+                self._tactile_enabled = _TACTILE_ENV_VALUES[_tactile_env]
+            else:
+                self._tactile_enabled = TACTILE_BY_MODEL.get(self.model, False)
+        except BaseException:
+            # The constructor has not reached its normal strict-shutdown state
+            # yet, but the physical hand is already connected.
+            _cleanup_connected_hand_until_safe(self._hand, self._manager)
+            raise
 
         # Everything below can touch live hardware; a failure part-way must
         # not leave motors enabled / channels open with no owner.
@@ -418,6 +485,7 @@ class WujiHandAdapter:
             self._command_queue: Queue[np.ndarray] = Queue(maxsize=1)
             self._latest_target: np.ndarray | None = None
             self._connected = True
+            self._command_failed = threading.Event()
             self._disconnected_since: float | None = None
             self._next_reconnect_at = 0.0
             self._reconnects = 0
@@ -430,7 +498,7 @@ class WujiHandAdapter:
             # Tactile opted in → it must actually flow before we report ready.
             if self._tactile_enabled:
                 self._wait_first_tactile_frame()
-        except Exception:
+        except BaseException:
             # Stop the worker BEFORE tearing channels down. Once the worker is
             # running (the tactile first-frame wait is the one failure that can
             # happen after that), teardown nulls the very SDK handles it polls
@@ -439,20 +507,18 @@ class WujiHandAdapter:
             # the native SDK.
             self._connected = False
             _stop = getattr(self, "_stop_event", None)
-            if _stop is not None:
-                _stop.set()
             _worker = getattr(self, "_worker", None)
-            if _worker is not None and _worker.is_alive():
-                _worker.join(timeout=2.0)
-            self._teardown_channels()
-            try:
-                self._hand.disable()
-            except Exception:
-                pass
-            try:
-                self._manager.disconnect_all()
-            except Exception:
-                pass
+            if _stop is not None and _worker is not None:
+                _wait_for_worker_exit_during_constructor_rollback(_worker, _stop)
+            elif _worker is None:
+                # Normalize a pre-worker construction failure so strict
+                # shutdown can safely execute the same cleanup path.
+                self._command_queue = Queue(maxsize=1)
+                self._worker = threading.Thread()
+            # Use the same strict, retry-aware cleanup contract as normal
+            # shutdown.  If cleanup itself fails, its exception retains the
+            # original constructor failure as context.
+            _retry_constructor_cleanup_until_safe(self.shutdown)
             raise
 
         logger.info(
@@ -530,10 +596,16 @@ class WujiHandAdapter:
             if sn is not None:
                 match = [d for d in devices if d.sn == sn]
                 if match:
-                    return self._manager.connect(
-                        sn=sn, device_name=f"wuji_hand_{self._handedness}",
-                        **self._connect_kwargs(),
-                    )
+                    try:
+                        return self._manager.connect(
+                            sn=sn, device_name=f"wuji_hand_{self._handedness}",
+                            **self._connect_kwargs(),
+                        )
+                    except BaseException:
+                        _retry_constructor_cleanup_until_safe(
+                            self._manager.disconnect_all
+                        )
+                        raise
                 if (sn_from_map and devices
                         and time.monotonic() >= map_grace_deadline):
                     logger.warning(
@@ -571,12 +643,18 @@ class WujiHandAdapter:
                             self._handedness,
                         )
                 for dev in candidates:
+                    hand = None
                     try:
                         hand = self._manager.connect(
                             sn=dev.sn, device_name=f"wuji_hand_{self._handedness}",
                             **self._connect_kwargs(),
                         )
-                    except Exception as e:
+                    except BaseException as e:
+                        _retry_constructor_cleanup_until_safe(
+                            self._manager.disconnect_all
+                        )
+                        if not isinstance(e, Exception):
+                            raise
                         # Auto-selection has to open a hand to ask which side it
                         # is, so with both arm servers starting at once each can
                         # be probing the other's hand when it claims the USB
@@ -592,7 +670,27 @@ class WujiHandAdapter:
                     # device answers. Hand 2 does not implement it — its side
                     # lives in the SN convention instead (the same convention
                     # the SDK's own connect-by-handedness filters by).
-                    reported = getattr(hand, "handedness_name", lambda: None)()
+                    try:
+                        reported = getattr(
+                            hand, "handedness_name", lambda: None
+                        )()
+                    except BaseException as exc:
+                        # Connection succeeded, so a verification failure must
+                        # release the candidate before probing another one or
+                        # propagating the startup failure.
+                        _cleanup_connected_hand_until_safe(
+                            hand, self._manager
+                        )
+                        if not isinstance(exc, Exception):
+                            raise
+                        logger.warning(
+                            "Wuji hand sn={} could not report handedness while "
+                            "looking for the {} hand ({}); retrying.",
+                            dev.sn,
+                            self._handedness,
+                            exc,
+                        )
+                        continue
                     normalized = str(reported).lower() if reported is not None else ""
                     if normalized == self._handedness:
                         # SDO-verified: pin it in the hand map so the next
@@ -627,7 +725,7 @@ class WujiHandAdapter:
                                 dev.sn, reported, self._handedness,
                             )
                             return hand
-                        self._manager.disconnect_all()
+                        _cleanup_connected_hand_until_safe(hand, self._manager)
                         raise ConnectionError(
                             f"Wuji hand sn={dev.sn} reports handedness {reported!r} and "
                             f"{len(devices)} hands are attached, so the {self._handedness} "
@@ -639,7 +737,7 @@ class WujiHandAdapter:
                         "Wuji hand sn={} reports handedness {!r}, want {!r}; skipping.",
                         dev.sn, reported, self._handedness,
                     )
-                    self._manager.disconnect_all()
+                    _cleanup_connected_hand_until_safe(hand, self._manager)
             _stop = getattr(self, "_stop_event", None)
             if _stop is not None and _stop.is_set():
                 raise ConnectionError("Wuji hand connect aborted: shutting down")
@@ -947,6 +1045,8 @@ class WujiHandAdapter:
                     target = self._command_queue.get_nowait()
             except Empty:
                 pass
+            if self._stop_event.is_set():
+                break
             if target is not None:
                 self._latest_target = target
 
@@ -955,20 +1055,28 @@ class WujiHandAdapter:
             # seeds from the measured pose, so a command must never be computed
             # from a pre-state or non-finite cache.
             self._refresh_state()
+            if self._stop_event.is_set():
+                break
             self._refresh_tactile()
+            if self._stop_event.is_set():
+                break
             _now = time.monotonic()
             self._check_watchdog(_now)
             self._maybe_reconnect(_now)
+            if self._stop_event.is_set():
+                break
 
             # Republish the latest target (continuous stream keeps Hand 2 MIT
             # commands flowing and doubles as a keepalive). Skipped while the
             # watchdog says the sensor is dead, and for Hand 2 HELD until a
             # finite seed exists for every joint that has ever reported.
             if (self._latest_target is not None and self._connected
+                    and not self._command_failed.is_set()
                     and (not self._is_hand2 or self._hand2_ready_to_send())):
                 try:
                     self._send(self._latest_target)
                 except Exception as e:
+                    self._command_failed.set()
                     logger.warning("Wuji hand worker command error: {}", e)
 
             dt = time.monotonic() - t0
@@ -1001,6 +1109,7 @@ class WujiHandAdapter:
             stale = (now - self._last_state_time) > self._STALE_S
         if stale and self._connected:
             self._connected = False
+            self._command_failed.set()
             logger.warning(
                 "Wuji hand ({}): no valid joint_states for >{}s{} — link lost or "
                 "sensor fault? Pausing command stream until valid frames resume.",
@@ -1014,7 +1123,11 @@ class WujiHandAdapter:
             # have moved (or been power-cycled) while we were silent.
             self._cmd_pos = None
             self._last_send_time = None
-            logger.info("Wuji hand ({}): valid joint_states resumed.", self._handedness)
+            logger.info(
+                "Wuji hand ({}): valid joint_states resumed; command path remains "
+                "latched until Reset establishes a fresh measured hold.",
+                self._handedness,
+            )
 
     def _hand2_ready_to_send(self) -> bool:
         """Hand 2 only: may a command go out this tick?
@@ -1172,6 +1285,8 @@ class WujiHandAdapter:
             # not a live link, and must pause the command stream like silence.
             if any_valid:
                 self._last_state_time = now
+            with self._state_lock:
+                self._state_generation += 1
             if self._is_hand2 and getattr(self, "_current_summary", None) is not None:
                 # Observe the existing subscription only; never connect a second
                 # SDK client or change stream rates while teleop owns the hand.
@@ -1330,6 +1445,79 @@ class WujiHandAdapter:
         """Move to the power-grasp curl pose (non-blocking)."""
         self.set_joint_pos(_POSE_POOL["close"], wait_time=wait_time)
 
+    def reset_command_state(self) -> None:
+        """Drain the command stream and resume with a measured-position hold."""
+        self._stop_event.set()
+        while True:
+            try:
+                self._command_queue.get_nowait()
+            except Empty:
+                break
+        if self._worker.is_alive():
+            self._worker.join(timeout=2.0)
+            if self._worker.is_alive():
+                raise RuntimeError("Wuji hand worker did not stop within 2 seconds")
+        # Drain frames queued before the boundary first. They may describe the
+        # pose before the just-finished command and cannot authorize the hold.
+        self._refresh_state()
+        with self._state_lock:
+            generation_before = self._state_generation
+        boundary_started_at = time.monotonic()
+        deadline = boundary_started_at + 0.25
+        measured = None
+        while time.monotonic() < deadline:
+            self._refresh_state()
+            with self._state_lock:
+                candidate = self._cached_pos.copy()
+                all_joints_observed = bool(self._state_seen_mask.all())
+                generation_after = self._state_generation
+                last_valid_time = self._last_valid_time.copy()
+            if (
+                generation_after > generation_before
+                and all_joints_observed
+                and bool(np.isfinite(candidate).all())
+                and bool(np.all(last_valid_time >= boundary_started_at))
+                and time.monotonic() - self._last_state_time <= self._STALE_S
+            ):
+                measured = candidate
+                break
+            time.sleep(0.005)
+        if measured is None:
+            raise RuntimeError(
+                "Wuji fresh post-boundary finite measured hold is unavailable"
+            )
+        # A valid frame received after the old worker stopped is authoritative
+        # recovery evidence even when the watchdog had previously marked the
+        # link disconnected. Do this only after the complete-state checks.
+        self._connected = True
+        self._disconnected_since = None
+        self._latest_target = measured
+        self._cmd_pos = measured.copy()
+        self._last_send_time = None
+        if self._connected:
+            # Establish the hold before returning the ownership boundary; do
+            # not rely on the replacement worker being scheduled promptly.
+            self._send(measured)
+        if not hasattr(self, "_command_failed"):
+            self._command_failed = threading.Event()
+        self._command_failed.clear()
+        self._command_queue = Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name=f"wuji-hand-{self._handedness}",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @property
+    def command_path_healthy(self) -> bool:
+        failed = getattr(self, "_command_failed", None)
+        return bool(
+            getattr(self, "_connected", False)
+            and (failed is None or not failed.is_set())
+        )
+
     def get_predefined_pose(self, name: str) -> np.ndarray:
         """Return a predefined pose by name ('open' or 'close')."""
         if name not in _POSE_POOL:
@@ -1396,52 +1584,71 @@ class WujiHandAdapter:
                 sn = "unknown"
         return str(sn)
 
-    def _teardown_channels(self) -> None:
+    def _teardown_channels(self, *, strict: bool = False) -> None:
         """Best-effort close of every subscription/command channel."""
-        for sub in self._tactile_subs.values():
+        errors = []
+        failed_tactile = {}
+        for name, sub in list(self._tactile_subs.items()):
             try:
                 sub.close()
-            except Exception:
-                pass
-        self._tactile_subs.clear()
+            except Exception as exc:
+                errors.append(f"tactile subscription {name} close failed: {exc}")
+                failed_tactile[name] = sub
+        self._tactile_subs = failed_tactile if strict else {}
         if self._glove_frame_sub is not None:
             try:
                 self._glove_frame_sub.close()
-            except Exception:
-                pass
-            self._glove_frame_sub = None
+                self._glove_frame_sub = None
+            except Exception as exc:
+                errors.append(f"glove subscription close failed: {exc}")
+                if not strict:
+                    self._glove_frame_sub = None
         if self._state_sub is not None:
             try:
                 self._state_sub.close()
-            except Exception:
-                pass
-            self._state_sub = None
-        try:
-            if self._publisher is not None:
+                self._state_sub = None
+            except Exception as exc:
+                errors.append(f"state subscription close failed: {exc}")
+                if not strict:
+                    self._state_sub = None
+        if self._publisher is not None:
+            try:
                 self._publisher.close()
-        except Exception:
-            pass
-        self._publisher = None
-        try:
-            if self._rt_ctx is not None:
+                self._publisher = None
+            except Exception as exc:
+                errors.append(f"publisher close failed: {exc}")
+                if not strict:
+                    self._publisher = None
+        if self._rt_ctx is not None:
+            try:
                 self._rt_ctx.__exit__(None, None, None)
-        except Exception:
-            pass
-        self._rt_ctx = None
-        self._rt = None
+                self._rt_ctx = None
+                self._rt = None
+            except Exception as exc:
+                errors.append(f"runtime context close failed: {exc}")
+                if not strict:
+                    self._rt_ctx = None
+                    self._rt = None
+        if strict and errors:
+            raise RuntimeError("; ".join(errors))
 
     def shutdown(self) -> None:
         """Stop the worker, close channels, and disable the motors."""
         self._stop_event.set()
+        while True:
+            try:
+                self._command_queue.get_nowait()
+            except Empty:
+                break
         if self._worker.is_alive():
             self._worker.join(timeout=2.0)
-        self._teardown_channels()
-        try:
+            if self._worker.is_alive():
+                raise RuntimeError("Wuji hand worker did not stop within 2 seconds")
+        self._teardown_channels(strict=True)
+        if not getattr(self, "_shutdown_motors_disabled", False):
             self._hand.disable()
-        except Exception:
-            pass
-        try:
+            self._shutdown_motors_disabled = True
+        if not getattr(self, "_shutdown_manager_disconnected", False):
             self._manager.disconnect_all()
-        except Exception:
-            pass
+            self._shutdown_manager_disconnected = True
         logger.info("Wuji hand ({}) shut down.", self._handedness)

@@ -64,13 +64,27 @@ class Sensors:
             configs: Configuration for all sensors (VegaSensorsConfig or DictConfig).
         """
         self._sensors: list[Any] = []
+        self._shutdown_sensor_ids: set[int] = set()
         self._config_sensor_names: set[str] = set(configs.keys())
-
-        for sensor_name, sensor_config in configs.items():
-            sensor = self._create_sensor(sensor_config, str(sensor_name))
-            if sensor is not None:
-                setattr(self, str(sensor_name), sensor)
-                self._sensors.append(sensor)
+        try:
+            for sensor_name, sensor_config in configs.items():
+                sensor = self._create_sensor(sensor_config, str(sensor_name))
+                if sensor is not None:
+                    setattr(self, str(sensor_name), sensor)
+                    if not any(existing is sensor for existing in self._sensors):
+                        self._sensors.append(sensor)
+        except BaseException:
+            while True:
+                try:
+                    self.shutdown()
+                    break
+                except BaseException as exc:  # pylint: disable=broad-except
+                    logger.error(
+                        "Sensor constructor cleanup is not yet safe; retrying: {}",
+                        exc,
+                    )
+                    time.sleep(0.1)
+            raise
 
     def __getattr__(self, name: str) -> Any:
         """Provide clear error messages when accessing unavailable sensors.
@@ -133,24 +147,62 @@ class Sensors:
             return None
 
         sensor_class = sensor_mapping[type(config)]
-        sensor = sensor_class(name=name, configs=config)
+        # Retain ownership before __init__. Multi-stream sensors can acquire an
+        # early subscriber and then fail while creating a later one.
+        sensor = sensor_class.__new__(sensor_class)
+        self._sensors.append(sensor)
+        try:
+            sensor_class.__init__(sensor, name=name, configs=config)
+        except BaseException:
+            self._shutdown_sensor_until_safe(sensor)
+            self._sensors.remove(sensor)
+            raise
 
-        if hasattr(sensor, "start"):
-            sensor.start()
+        try:
+            if hasattr(sensor, "start"):
+                sensor.start()
+        except BaseException:
+            self._shutdown_sensor_until_safe(sensor)
+            self._sensors.remove(sensor)
+            raise
 
         return sensor
+
+    @staticmethod
+    def _shutdown_sensor_until_safe(sensor: Any) -> None:
+        shutdown = getattr(sensor, "shutdown", None)
+        if not callable(shutdown):
+            return
+        while True:
+            try:
+                shutdown()
+                return
+            except BaseException as cleanup_exc:
+                logger.error(
+                    "Sensor rollback is not yet safe; retrying: {}", cleanup_exc
+                )
+                time.sleep(0.1)
 
     def shutdown(self) -> None:
         """Shuts down all active sensors."""
         logger.info("Shutting down all sensors...")
+        errors = []
         for sensor in self._sensors:
+            sensor_id = id(sensor)
+            if sensor_id in self._shutdown_sensor_ids:
+                continue
             try:
                 if hasattr(sensor, "shutdown"):
                     sensor.shutdown()
+                    self._shutdown_sensor_ids.add(sensor_id)
                     # Small delay between each sensor shutdown to prevent race conditions
                     time.sleep(0.05)
             except Exception as e:
                 logger.error(f"Error shutting down sensor: {e}")
+                errors.append(str(e))
+
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
         # Additional delay to ensure all sensor subscribers have been undeclared
         time.sleep(0.1)
