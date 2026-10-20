@@ -43,6 +43,8 @@ from core.robotenv_vega.vega_force_calibration import (  # noqa: E402
     quality_json,
 )
 from core.robotenv_vega.wrench_contract import (  # noqa: E402
+    VEGA_COMPANY_WRIST_ORIGIN_FROM_SENSOR_M,
+    shift_wrench_reference,
     vega_wrench_frame_rotations,
 )
 from core.vega.robot import (  # noqa: E402
@@ -514,7 +516,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     "robot_name": str(
                         getattr(self._robot.robot, "robot_name", "")
                     ),
-                    "sensor_to_wrist_yaw_degrees": 165.0,
+                    "cartesian_position_frame_id": (
+                        "L_ee" if self.arm_side == "left" else "R_ee"
+                    ),
+                    "force_sensor_frame_id": (
+                        "L_arm_l8" if self.arm_side == "left" else "R_arm_l8"
+                    ),
+                    "force_sensor_mount_convention": "dexmate_urdf_link8_v1",
+                    "tcp_to_company_wrist_yaw_degrees": 165.0,
+                    "company_wrist_origin_from_sensor_m": [0.0, 0.0, 0.0185],
                     "gripper_mass_kg": float(force_calibration_gripper_mass_kg),
                     "gripper_com_sensor_m": [
                         float(value) for value in force_calibration_gripper_com_m
@@ -708,6 +718,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "force_calibration_owner": "robot_server",
                 "force_signal_stream_id": f"{self.robot_model}:{self.arm_side}:wrist_ft",
                 "external_wrench_world_frame_id": self.frame_type,
+                "cartesian_position_reference_frame": (
+                    "L_ee" if self.arm_side == "left" else "R_ee"
+                ),
+                "external_wrench_sensor_frame_id": (
+                    "L_arm_l8" if self.arm_side == "left" else "R_arm_l8"
+                ),
+                "external_wrench_output_reference_point_id": (
+                    "robotiq_mount_origin"
+                ),
+                "external_wrench_sensor_to_output_reference_translation_m": (
+                    "0,0,0.0185"
+                ),
             },
         )
 
@@ -784,7 +806,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 dtype="float64",
                 shape=[6],
                 required=True,
-                description="End-effector pose [x, y, z, roll, pitch, yaw]",
+                description=(
+                    f"{('L_ee' if self.arm_side == 'left' else 'R_ee')} Cartesian "
+                    "pose [x, y, z, roll, pitch, yaw]"
+                ),
             )
         )
         spec.fields["external_wrench_sensor_raw"].CopyFrom(
@@ -836,11 +861,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         for field_name, description in (
             (
                 "external_wrench_wrist",
-                "Calibrated gripper-compensated wrench in company wrist axes at the configured TCP anchor",
+                "Calibrated gripper-compensated wrench in company wrist axes at the RobotiQ mounting-plane origin",
             ),
             (
                 "external_wrench_world",
-                "Calibrated gripper-compensated wrench in configured world axes at the configured TCP anchor",
+                "Calibrated gripper-compensated wrench in configured world axes at the RobotiQ mounting-plane origin",
             ),
         ):
             spec.fields[field_name].CopyFrom(
@@ -853,7 +878,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     dtype="string",
                     shape=[],
                     required=False,
-                    description="Configured TCP anchor; rotation only, no moment translation",
+                    description="RobotiQ mounting-plane origin, 18.5 mm along sensor/link-8 +Z",
                 )
             )
         spec.fields["torso_joint_positions"].CopyFrom(
@@ -959,6 +984,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "force_calibration_owner": "robot_server",
                 "force_signal_stream_id": f"{self.robot_model}:{self.arm_side}:wrist_ft",
                 "external_wrench_world_frame_id": self.frame_type,
+                "cartesian_position_reference_frame": (
+                    "L_ee" if self.arm_side == "left" else "R_ee"
+                ),
+                "external_wrench_sensor_frame_id": (
+                    "L_arm_l8" if self.arm_side == "left" else "R_arm_l8"
+                ),
+                "external_wrench_output_reference_point_id": (
+                    "robotiq_mount_origin"
+                ),
+                "external_wrench_sensor_to_output_reference_translation_m": (
+                    "0,0,0.0185"
+                ),
                 "external_wrench_sensor_to_wrist_yaw_degrees": (
                     "unset"
                     if self.external_wrench_sensor_to_wrist_yaw_degrees is None
@@ -1638,7 +1675,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 else:
                     try:
                         wrist_from_sensor, world_from_sensor = vega_wrench_frame_rotations(
-                            cartesian_position, gripper_type=self.gripper_type
+                            cartesian_position,
+                            arm_side=self.arm_side,
+                            gripper_type=self.gripper_type,
                         )
                     except ValueError as exc:
                         LOGGER.warning("Omitting unsupported wrench frame rotations: %s", exc)
@@ -1683,6 +1722,13 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                                         reference_point=reference_point,
                                     )
                                 )
+                                wrist_wrench = shift_wrench_reference(
+                                    wrist_wrench,
+                                    target_from_source_translation=(
+                                        wrist_from_sensor
+                                        @ VEGA_COMPANY_WRIST_ORIGIN_FROM_SENSOR_M
+                                    ),
+                                )
                                 world_wrench = (
                                     applier.measured_sensor_raw_to_calibrated_world(
                                         sensor_wrench,
@@ -1690,15 +1736,22 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                                         reference_point=reference_point,
                                     )
                                 )
+                                world_wrench = shift_wrench_reference(
+                                    world_wrench,
+                                    target_from_source_translation=(
+                                        world_from_sensor
+                                        @ VEGA_COMPANY_WRIST_ORIGIN_FROM_SENSOR_M
+                                    ),
+                                )
                             except (TypeError, ValueError, np.linalg.LinAlgError) as exc:
                                 LOGGER.warning(
                                     "Omitting calibrated external wrench: %s", exc
                                 )
                             else:
-                                # Frame rotation does not translate a wrench's
-                                # moment origin.  Both calibrated outputs remain
-                                # referenced at the physical F/T sensor.
-                                anchor = reference_point
+                                anchor = (
+                                    "RobotiQ mounting-plane origin "
+                                    "(+18.5 mm sensor/link-8 Z)"
+                                )
                                 for name, values in (
                                     ("external_wrench_wrist", wrist_wrench),
                                     ("external_wrench_world", world_wrench),

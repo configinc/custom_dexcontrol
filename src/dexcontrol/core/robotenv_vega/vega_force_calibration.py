@@ -354,7 +354,9 @@ class VegaRobotCalibrationAdapter:
         if self.service.R_robot_to_world is not None:
             cartesian = self.service._transform_state_to_env_frame(cartesian)
         _, world_from_sensor = vega_wrench_frame_rotations(
-            cartesian, gripper_type=self.service.gripper_type
+            cartesian,
+            arm_side=self.service.arm_side,
+            gripper_type=self.service.gripper_type,
         )
         sensor = self.service._robot.arm.wrench_sensor
         wrench_raw, sensor_timestamp_ns = sensor.get_wrench_sample()

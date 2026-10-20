@@ -4,6 +4,7 @@ import threading
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 # Keep this contract test independent of the optional DualSense/hidapi stack.
 _base_arm_teleop = ModuleType("base_arm_teleop")
@@ -53,7 +54,9 @@ def test_robot_server_does_not_default_a_canonical_wrist_transform() -> None:
 
 
 def test_observation_contract_exposes_raw_and_optional_calibrated_wrenches() -> None:
-    spec = _service().GetObservationSpec(None, None)
+    service = _service()
+    spec = service.GetObservationSpec(None, None)
+    config = service.GetConfig(None, None)
 
     assert "external_wrench_wrist" in spec.fields
     assert "external_wrench_sensor_raw" in spec.fields
@@ -68,6 +71,23 @@ def test_observation_contract_exposes_raw_and_optional_calibrated_wrenches() -> 
     assert spec.fields["external_wrench_world"].required is False
     assert spec.metadata["force_signal_provider_kind"] == "wrist_force_torque"
     assert spec.metadata["force_signal_provider_schema_version"] == "2"
+    assert spec.metadata["cartesian_position_reference_frame"] == "L_ee"
+    assert spec.metadata["external_wrench_sensor_frame_id"] == "L_arm_l8"
+    assert (
+        spec.metadata["external_wrench_output_reference_point_id"]
+        == "robotiq_mount_origin"
+    )
+    assert (
+        spec.metadata["external_wrench_sensor_to_output_reference_translation_m"]
+        == "0,0,0.0185"
+    )
+    for key in (
+        "cartesian_position_reference_frame",
+        "external_wrench_sensor_frame_id",
+        "external_wrench_output_reference_point_id",
+        "external_wrench_sensor_to_output_reference_translation_m",
+    ):
+        assert config.metadata[key] == spec.metadata[key]
 
 
 def test_observation_spec_transport_access_is_tracked_until_complete() -> None:
@@ -187,15 +207,19 @@ def test_observation_keeps_configured_rotation_out_of_canonical_fields() -> None
     world_from_sensor = np.asarray(
         observation["external_wrench_world_from_sensor_rotation"].float_array.values
     ).reshape(3, 3)
-    expected = np.array(
-        [
-            [np.cos(np.deg2rad(165.0)), np.sin(np.deg2rad(165.0)), 0.0],
-            [-np.sin(np.deg2rad(165.0)), np.cos(np.deg2rad(165.0)), 0.0],
-            [0.0, 0.0, 1.0],
-        ]
+    expected_tcp_from_sensor = Rotation.from_euler(
+        "z", 90.0, degrees=True
+    ).as_matrix()
+    expected_wrist_from_sensor = (
+        Rotation.from_euler("z", -165.0, degrees=True).as_matrix()
+        @ expected_tcp_from_sensor
     )
-    np.testing.assert_allclose(wrist_from_sensor, expected, atol=1e-12)
-    np.testing.assert_allclose(world_from_sensor, np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(
+        wrist_from_sensor, expected_wrist_from_sensor, atol=1e-12
+    )
+    np.testing.assert_allclose(
+        world_from_sensor, expected_tcp_from_sensor, atol=1e-12
+    )
 
 
 def test_observation_publishes_both_calibrated_frames_only_with_active_applier() -> None:
@@ -212,11 +236,11 @@ def test_observation_publishes_both_calibrated_frames_only_with_active_applier()
         def measured_sensor_raw_to_calibrated_wrist(self, *args, **kwargs):
             assert service._force_calibration_applier_lock.locked()
             assert kwargs["reference_point"] == "physical F/T sensor measurement origin"
-            return np.ones(6)
+            return np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
         def measured_sensor_raw_to_calibrated_world(self, *args, **kwargs):
             assert service._force_calibration_applier_lock.locked()
-            return np.full(6, 2.0)
+            return np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     service = _service()
     service._force_calibration_applier_lock = threading.Lock()
@@ -233,19 +257,23 @@ def test_observation_publishes_both_calibrated_frames_only_with_active_applier()
 
     observation, _ = service._create_observation()
 
-    np.testing.assert_array_equal(
-        observation["external_wrench_wrist"].float_array.values, np.ones(6)
+    np.testing.assert_allclose(
+        observation["external_wrench_wrist"].float_array.values,
+        np.array([10.0, 0.0, 0.0, 0.0, -0.185, 0.0]),
+        atol=1e-12,
     )
-    np.testing.assert_array_equal(
-        observation["external_wrench_world"].float_array.values, np.full(6, 2.0)
+    np.testing.assert_allclose(
+        observation["external_wrench_world"].float_array.values,
+        np.array([10.0, 0.0, 0.0, 0.0, -0.185, 0.0]),
+        atol=1e-12,
     )
     assert (
         observation["external_wrench_wrist_reference_point"].string_value
-        == "physical F/T sensor measurement origin"
+        == "RobotiQ mounting-plane origin (+18.5 mm sensor/link-8 Z)"
     )
     assert (
         observation["external_wrench_world_reference_point"].string_value
-        == "physical F/T sensor measurement origin"
+        == "RobotiQ mounting-plane origin (+18.5 mm sensor/link-8 Z)"
     )
 
     service._force_calibration_expires_at_timestamp_us = 1
