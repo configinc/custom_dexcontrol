@@ -86,6 +86,19 @@ def test_prepare_stage_can_return_directly_from_moving(
     assert status.state == "RETURNING"
 
 
+def test_failed_settling_can_return_without_hiding_original_failure(
+    tmp_path: Path, plan: BilateralCalibrationPlan, clock: Clock
+) -> None:
+    lifecycle = _lifecycle(tmp_path, plan, clock)
+    lifecycle.start("run-settling", force_recalibrate=True)
+    lifecycle.advance("run-settling", 0, "tilt-x")
+    lifecycle.set_phase("run-settling", "SETTLING")
+
+    status = lifecycle.set_phase("run-settling", "RETURNING")
+
+    assert status.state == "RETURNING"
+
+
 def test_parameter_validator_rejects_cache_and_candidate_schema(
     tmp_path: Path, plan: BilateralCalibrationPlan, clock: Clock
 ) -> None:

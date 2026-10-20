@@ -747,7 +747,7 @@ class ForceCalibrationLifecycle:
         with self._lock:
             allowed = {
                 "MOVING": {"MOVING", "SETTLING", "COLLECTING", "RETURNING"},
-                "SETTLING": {"SETTLING", "COLLECTING"},
+                "SETTLING": {"SETTLING", "COLLECTING", "RETURNING"},
                 "COLLECTING": {"COLLECTING", "RETURNING"},
                 "FITTING": {"FITTING", "RETURNING"},
                 "RETURNING": {"RETURNING"},

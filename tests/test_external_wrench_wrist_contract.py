@@ -139,6 +139,7 @@ def test_observation_keeps_configured_rotation_out_of_canonical_fields() -> None
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
+        "wrench_state": np.zeros(6),
     }
     service = _service()
     service.external_wrench_sensor_to_wrist_yaw_degrees = 90.0
@@ -154,7 +155,7 @@ def test_observation_keeps_configured_rotation_out_of_canonical_fields() -> None
     observation, timestamp_us = service._create_observation()
 
     assert timestamp_us == 123
-    assert "wrench_state" not in observation
+    assert "wrench_state" in observation
     np.testing.assert_allclose(
         observation["external_wrench_sensor_raw"].float_array.values,
         source,
@@ -196,6 +197,7 @@ def test_observation_publishes_both_calibrated_frames_only_with_active_applier()
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
+        "wrench_state": np.zeros(6),
     }
 
     class Applier:
@@ -256,6 +258,7 @@ def test_misaligned_sample_keeps_raw_but_omits_pose_dependent_wrench() -> None:
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
+        "wrench_state": np.zeros(6),
     }
     service = _service()
     service._force_calibration_applier_lock = threading.Lock()
@@ -281,6 +284,47 @@ def test_misaligned_sample_keeps_raw_but_omits_pose_dependent_wrench() -> None:
     assert "external_wrench_wrist" not in observation
 
 
+def test_non_robotiq_observation_keeps_raw_without_frame_warning(caplog) -> None:
+    state = {
+        "joint_positions": np.zeros(7),
+        "joint_velocities": np.zeros(7),
+        "joint_torques_computed": np.zeros(7),
+        "gripper_position": 0.0,
+        "cartesian_position": np.zeros(6),
+        "wrench_state": np.zeros(6),
+    }
+    service = _service()
+    service.gripper_type = "wuji"
+    service._robot = SimpleNamespace(
+        get_robot_state=lambda: (state, {"robot_timestamp_us": 1_000_000}),
+        arm=SimpleNamespace(
+            wrench_sensor=SimpleNamespace(
+                get_wrench_sample=lambda: (np.arange(6.0), 1_000_000_000)
+            )
+        ),
+    )
+
+    observation, _ = service._create_observation()
+
+    assert "external_wrench_sensor_raw" in observation
+    assert "external_wrench_world_from_sensor_rotation" not in observation
+    assert "external_wrench_world" not in observation
+    assert "unsupported wrench frame rotations" not in caplog.text
+
+
+def test_non_robotiq_does_not_advertise_force_calibration_capability() -> None:
+    service = _service()
+    service.gripper_type = "wuji"
+
+    spec = service.GetObservationSpec(None, None)
+    config = service.GetConfig(None, None)
+
+    assert "force_signal_provider_kind" not in spec.metadata
+    assert "force_calibration_owner" not in spec.metadata
+    assert "force_signal_provider_kind" not in config.metadata
+    assert "force_calibration_owner" not in config.metadata
+
+
 def test_stalled_sample_pair_stops_canonical_publication(monkeypatch) -> None:
     state = {
         "joint_positions": np.zeros(7),
@@ -288,6 +332,7 @@ def test_stalled_sample_pair_stops_canonical_publication(monkeypatch) -> None:
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
+        "wrench_state": np.zeros(6),
     }
 
     class Applier:
@@ -353,6 +398,7 @@ def test_unconfigured_yaw_preserves_raw_sensor_and_omits_wrist_wrench() -> None:
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
+        "wrench_state": np.zeros(6),
     }
     service = _service()
     service._robot = SimpleNamespace(
@@ -385,6 +431,7 @@ def test_malformed_source_wrench_omits_optional_wrist_wrench() -> None:
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
+        "wrench_state": np.zeros(6),
     }
     service = _service()
     service.external_wrench_sensor_to_wrist_yaw_degrees = 0.0
@@ -412,6 +459,7 @@ def test_silent_sensor_omits_wrench_without_breaking_observation() -> None:
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
+        "wrench_state": np.zeros(6),
     }
     service = _service()
     service.external_wrench_sensor_to_wrist_yaw_degrees = 0.0
@@ -441,6 +489,7 @@ def test_sensor_payload_missing_wrench_omits_only_optional_signal() -> None:
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
+        "wrench_state": np.zeros(6),
     }
     service = _service()
     service.external_wrench_sensor_to_wrist_yaw_degrees = 0.0
@@ -468,6 +517,7 @@ def test_unexpected_sensor_failure_omits_only_optional_signal() -> None:
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
+        "wrench_state": np.zeros(6),
     }
     service = _service()
     service.external_wrench_sensor_to_wrist_yaw_degrees = 0.0
@@ -497,6 +547,7 @@ def test_unavailable_sensor_warning_is_rate_limited(caplog) -> None:
         "joint_torques_computed": np.zeros(7),
         "gripper_position": 0.0,
         "cartesian_position": np.zeros(6),
+        "wrench_state": np.zeros(6),
     }
     service = _service()
     service.external_wrench_sensor_to_wrist_yaw_degrees = 0.0

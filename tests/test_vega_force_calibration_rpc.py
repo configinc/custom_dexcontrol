@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from types import ModuleType
 
 import grpc
@@ -199,11 +200,13 @@ def test_calibration_claim_isolated_from_normal_command_implementation() -> None
     service._cmd_lock = threading.Lock()
     service._force_calibration_admission_lock = threading.Lock()
     service._force_calibration_owns_robot = threading.Event()
-    service._force_calibration_restart_control_loop = False
+    service._cancel_move = threading.Event()
+    service._cancel_move.set()
     service._control_loop_thread = None
 
     assert service._claim_robot_for_force_calibration() is True
     assert service._force_calibration_owns_robot.is_set()
+    assert not service._cancel_move.is_set()
     assert service._claim_robot_for_force_calibration() is False
 
     service._release_robot_from_force_calibration()
@@ -226,3 +229,45 @@ def test_step_and_reset_fail_busy_only_while_calibration_owns_robot() -> None:
     reset = service.Reset(robotenv_pb2.ResetRequest(), reset_context)
     assert reset.status == "BUSY"
     assert reset_context.code == grpc.StatusCode.FAILED_PRECONDITION
+
+    service._create_observation = lambda: ({}, 123)
+    current_context = Context()
+    current = service.Reset(
+        robotenv_pb2.ResetRequest(mode="current"), current_context
+    )
+    assert current.status == "SUCCESS"
+    assert current.timestamp_us == 123
+    assert current_context.code is None
+
+
+def test_reset_losing_claim_race_does_not_cancel_calibration_motion() -> None:
+    service = _service()
+    service.arm_side = "left"
+    service._cmd_lock = threading.Lock()
+    service._cmd_lock.acquire()
+    service._force_calibration_owns_robot = threading.Event()
+    service._cancel_move = threading.Event()
+    service._control_loop_thread = None
+    context = Context()
+    response = []
+
+    worker = threading.Thread(
+        target=lambda: response.append(
+            service.Reset(robotenv_pb2.ResetRequest(mode="home"), context)
+        ),
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + 1.0
+    while not service._cancel_move.is_set() and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert service._cancel_move.is_set()
+
+    service._force_calibration_owns_robot.set()
+    service._cmd_lock.release()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert response[0].status == "BUSY"
+    assert context.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert not service._cancel_move.is_set()

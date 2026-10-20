@@ -239,10 +239,12 @@ class VegaRobotCalibrationAdapter:
             else np.asarray(service_reset_joints, dtype=np.float64).copy()
         )
         self._gripper_position = 0.0
+        self._neutral_cartesian: np.ndarray | None = None
 
     def begin_run(self) -> None:
         self._start_joints = None
         self._gripper_position = 0.0
+        self._neutral_cartesian = None
 
     def configure_fit_inputs(self, inputs: VegaForceCalibrationFitInputs) -> None:
         self.gripper_mass_kg = inputs.gripper_mass_kg
@@ -297,12 +299,25 @@ class VegaRobotCalibrationAdapter:
         action[:3] *= _TELEOP_POS_ACTION_GAIN
         action[3:6] *= _TELEOP_ROT_ACTION_GAIN
         action = self.service._cartesian_velocity_to_delta(action)
-        self.service._robot.update_command(
-            action,
-            action_space="cartesian_delta",
-            gripper_action_space="position",
-            blocking=False,
-        )
+        if (
+            self.service._robot.interpolation_enabled
+            and self.service._control_loop_hz > 0
+        ):
+            # Legacy calibration entered through Step, so interpolation-enabled
+            # deployments buffered the converted delta at input rate and let
+            # the unchanged control loop dispatch it at control-loop rate.
+            self.service._robot.add_command_point(
+                action,
+                action_space="cartesian_delta",
+                gripper_action_space="position",
+            )
+        else:
+            self.service._robot.update_command(
+                action,
+                action_space="cartesian_delta",
+                gripper_action_space="position",
+                blocking=False,
+            )
 
     def _command_cartesian_target(self, target: np.ndarray) -> None:
         actual = self._current_cartesian()
@@ -397,14 +412,33 @@ class VegaRobotCalibrationAdapter:
         if error > RETURN_MAX_JOINT_ERROR_RAD:
             raise RuntimeError(f"Vega safe return joint error is {error:.4f} rad")
 
+    def _validated_reset_target(self, target: np.ndarray) -> np.ndarray:
+        validated = np.asarray(target, dtype=np.float64).copy()
+        limits = getattr(self.service._robot.arm, "joint_pos_limit", None)
+        if limits is not None:
+            limits = np.asarray(limits, dtype=np.float64)
+            low = limits[:, 0]
+            high = limits[:, 1]
+            violates = np.logical_or(validated < low, validated > high)
+            if np.any(violates):
+                validated = np.clip(validated, low, high)
+                LOGGER.warning(
+                    "Calibration reset target clipped to joint limits "
+                    "(violated indices: %s)",
+                    np.where(violates)[0].tolist(),
+                )
+        validate = getattr(self.service._robot, "validate_joint_limits", None)
+        if callable(validate):
+            validate(validated)
+        return validated
+
     def _prepare(self, payload: Mapping[str, Any], cancelled: threading.Event) -> None:
         joints = np.asarray(payload.get("start_joints"), dtype=np.float64)
         if joints.shape != (7,) or not np.isfinite(joints).all():
             raise ValueError("prepare stage requires seven finite start_joints")
+        joints = self._validated_reset_target(joints)
         self._start_joints = joints.copy()
-        self.service._execute_reset_sequence(
-            joints, cancelled=cancelled, interruptible_gripper=True
-        )
+        self._execute_reset(joints, cancelled)
         self._check_cancelled(cancelled)
         self._verify_joint_return(joints)
         state, _ = self.service._robot.get_robot_state()
@@ -414,8 +448,9 @@ class VegaRobotCalibrationAdapter:
         self._gripper_position = float(gripper[0])
         # Preserve the legacy sequence's 15-second active neutral hold after
         # the reset and before the first calibration pose.
+        self._neutral_cartesian = self._current_cartesian()
         self._hold_cartesian_target(
-            self._current_cartesian(), START_HOLD_SECONDS, cancelled
+            self._neutral_cartesian, START_HOLD_SECONDS, cancelled
         )
 
     def _pose(
@@ -425,7 +460,7 @@ class VegaRobotCalibrationAdapter:
         cancelled: threading.Event,
         set_phase: Callable[[str, str], None],
     ) -> WristFtCalibrationHold:
-        if self._start_joints is None:
+        if self._start_joints is None or self._neutral_cartesian is None:
             raise RuntimeError("prepare stage must complete before pose collection")
         degrees = np.asarray(payload.get("rpy_degrees"), dtype=np.float64)
         if degrees.shape != (3,) or not np.isfinite(degrees).all():
@@ -433,7 +468,7 @@ class VegaRobotCalibrationAdapter:
         forward_steps, reverse_steps = _minimum_jerk_rotation_steps(
             np.radians(degrees), self.service.control_hz
         )
-        start_cartesian = self._current_cartesian()
+        start_cartesian = self._neutral_cartesian.copy()
         set_phase("MOVING", f"moving to {stage_id}")
         commanded = self._move_profile(forward_steps, start_cartesian, cancelled)
         samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float]] = []
@@ -495,17 +530,33 @@ class VegaRobotCalibrationAdapter:
                 return self._pose(stage_id, payload, cancelled, set_phase)
             raise ValueError(f"unsupported Vega calibration stage kind: {kind!r}")
 
+    def _execute_reset(
+        self, target: np.ndarray, cancelled: threading.Event
+    ) -> None:
+        was_running = bool(
+            self.service._control_loop_thread is not None
+            and self.service._control_loop_thread.is_alive()
+        )
+        if was_running:
+            self.service._stop_control_loop()
+        try:
+            self.service._execute_reset_sequence(
+                target,
+                cancelled=cancelled,
+                interruptible_gripper=True,
+            )
+        finally:
+            if was_running:
+                self.service._start_control_loop()
+
     def safe_return(self, cancelled: threading.Event | None = None) -> None:
         if self._start_joints is None:
             return
         safe_cancel = threading.Event() if cancelled is None else cancelled
         with self.service._cmd_lock:
-            self.service._execute_reset_sequence(
-                self._start_joints,
-                cancelled=safe_cancel,
-                interruptible_gripper=True,
-            )
-            self._verify_joint_return(self._start_joints)
+            target = self._validated_reset_target(self._start_joints)
+            self._execute_reset(target, safe_cancel)
+            self._verify_joint_return(target)
 
     def normal_return(self, cancelled: threading.Event | None = None) -> None:
         """Return to the configured inference/reset pose after a successful fit."""
@@ -513,13 +564,9 @@ class VegaRobotCalibrationAdapter:
         configured_target = self._desired_normal_reset_joint_positions_rad
         if configured_target is None:
             configured_target = np.asarray(self.service.reset_joints, dtype=np.float64)
-        target = configured_target.copy()
+        target = self._validated_reset_target(configured_target)
         with self.service._cmd_lock:
-            self.service._execute_reset_sequence(
-                target,
-                cancelled=safe_cancel,
-                interruptible_gripper=True,
-            )
+            self._execute_reset(target, safe_cancel)
             self._check_cancelled(safe_cancel)
             self._verify_joint_return(target)
 
@@ -746,6 +793,34 @@ class VegaForceCalibrationManager:
             configure(desired)
         self._desired_normal_reset_joint_positions_rad = desired
 
+    def _cached_result_matches_fit_inputs(
+        self, inputs: VegaForceCalibrationFitInputs | None
+    ) -> bool:
+        if inputs is None:
+            return True
+        result = self.lifecycle.get_result("")
+        if not result.get("available"):
+            return True
+        parameters = result.get("parameters", {})
+        try:
+            cached_mass = float(parameters["gripper_mass_kg"])
+            cached_com = np.asarray(
+                parameters["gripper_com_sensor_m"], dtype=np.float64
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        return bool(
+            cached_com.shape == (3,)
+            and np.isfinite(cached_com).all()
+            and np.isclose(cached_mass, inputs.gripper_mass_kg, atol=1e-12, rtol=0.0)
+            and np.allclose(
+                cached_com,
+                np.asarray(inputs.gripper_com_sensor_m, dtype=np.float64),
+                atol=1e-12,
+                rtol=0.0,
+            )
+        )
+
     def start(
         self,
         run_id: str,
@@ -765,6 +840,14 @@ class VegaForceCalibrationManager:
                 ):
                     raise LifecycleError(
                         "FAILED_PRECONDITION", "conflicting Start fit inputs"
+                    )
+                if (
+                    current.state == "SUCCEEDED"
+                    and not self._cached_result_matches_fit_inputs(fit_inputs)
+                ):
+                    raise LifecycleError(
+                        "FAILED_PRECONDITION",
+                        "conflicting Start fit inputs for committed calibration",
                     )
                 if (
                     desired_normal_reset_joint_positions_rad is not None
@@ -838,6 +921,15 @@ class VegaForceCalibrationManager:
                     desired_normal_reset_joint_positions_rad
                 )
                 self.adapter.begin_run()
+                cache_input_mismatch = not self._cached_result_matches_fit_inputs(
+                    fit_inputs
+                )
+                if cache_input_mismatch:
+                    self.lifecycle.invalidate_active_result()
+                    self.adapter.install_prepared(
+                        None, expires_at_timestamp_us=1
+                    )
+                    self._runtime_install_pending_run_id = None
                 status = self.lifecycle.start(
                     run_id, force_recalibrate=force_recalibrate
                 )
@@ -1178,7 +1270,14 @@ class VegaForceCalibrationManager:
         with self._lock:
             self._cancel_deadline_locked()
             status = self.lifecycle.status()
-            if status.state in ACTIVE_CALIBRATION_STATES:
+            # READY_TO_APPLY is already motionless and is the durable half of
+            # the coordinator's bilateral COMMIT protocol.  Preserve it across
+            # a graceful restart just as we do across a crash, so Commit can be
+            # retried after the process returns.
+            if (
+                status.state in ACTIVE_CALIBRATION_STATES
+                and status.state != "READY_TO_APPLY"
+            ):
                 self.request_cancel(status.run_id)
             worker = self._worker
 

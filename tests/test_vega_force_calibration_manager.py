@@ -18,6 +18,7 @@ from dexcontrol.core.robotenv_vega.force_calibration_lifecycle import (
     ForceCalibrationLifecycle,
     LifecycleError,
 )
+from dexcontrol.core.robotenv_vega.server import VegaRobotEnvService
 from dexcontrol.core.robotenv_vega.vega_force_calibration import (
     CalibrationCancelled,
     DesiredNormalResetJointPositionsRad,
@@ -69,10 +70,20 @@ class FakeParameters:
         }
     )
 
+    def __init__(
+        self,
+        gripper_mass_kg: float = 1.2,
+        gripper_com_sensor_m: tuple[float, float, float] = (0.0, 0.0, 0.072),
+    ) -> None:
+        self.gripper_mass_kg = gripper_mass_kg
+        self.gripper_com_sensor_m = gripper_com_sensor_m
+
     def as_parameters(self):
         return {
             "schema_version": 5,
             "fake": True,
+            "gripper_mass_kg": self.gripper_mass_kg,
+            "gripper_com_sensor_m": list(self.gripper_com_sensor_m),
             "quality": {
                 "passed": True,
                 "held_out_validation": {"passed": True},
@@ -128,7 +139,12 @@ class FakeAdapter:
 
     def fit(self, holds):
         assert len(holds) == 2
-        return FakeParameters()
+        if self.fit_inputs is None:
+            return FakeParameters()
+        return FakeParameters(
+            self.fit_inputs.gripper_mass_kg,
+            self.fit_inputs.gripper_com_sensor_m,
+        )
 
     def prepare_install(self, parameters):
         return parameters
@@ -401,6 +417,28 @@ def test_force_recalibration_removes_previous_active_result(tmp_path: Path) -> N
 
     assert manager.result("")["available"] is False
     assert adapter.uninstalls == previous_uninstalls + 1
+    manager.request_cancel("run-b")
+    _wait_state(manager, "CANCELLED")
+
+
+def test_changed_fit_inputs_do_not_reuse_current_cache(tmp_path: Path) -> None:
+    manager, adapter, _claim = _manager(tmp_path)
+    first = VegaForceCalibrationFitInputs(1.2, (0.0, 0.0, 0.072))
+    second = VegaForceCalibrationFitInputs(1.4, (0.01, 0.0, 0.08))
+    manager.start("run-a", True, first)
+    manager.advance("run-a", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+    manager.advance("run-a", 1, "stage-1")
+    ready = _wait_state(manager, "READY_TO_APPLY")
+    manager.commit("run-a", ready.plan_sha256)
+
+    status = manager.start("run-b", False, second)
+    retry = manager.start("run-b", False, second)
+
+    assert status.state == "READY_FOR_STAGE"
+    assert retry == status
+    assert manager.result("")["available"] is False
+    assert adapter.fit_inputs == second
     manager.request_cancel("run-b")
     _wait_state(manager, "CANCELLED")
 
@@ -1237,8 +1275,10 @@ def test_early_deadline_callback_rearms_remaining_timeout(tmp_path: Path) -> Non
 def test_begin_run_clears_previous_physical_safe_return_target() -> None:
     adapter = _physical_adapter(_FakeService())
     adapter._start_joints = np.ones(7)
+    adapter._neutral_cartesian = np.ones(6)
     adapter.begin_run()
     assert adapter._start_joints is None
+    assert adapter._neutral_cartesian is None
 
 
 def test_rotation_profile_uses_euler_deltas_and_returns_exactly() -> None:
@@ -1266,15 +1306,21 @@ class _FakeArm:
     def __init__(self, joints=None, sensor_timestamp_ns: int = 1_000_000_000) -> None:
         self._joints = np.zeros(7) if joints is None else np.asarray(joints, dtype=float)
         self.wrench_sensor = _FakeSensor(sensor_timestamp_ns)
+        self.joint_pos_limit = None
 
     def get_joint_pos(self):
         return self._joints.copy()
+
+    def _send_position_command(self, joints):
+        self._joints = np.asarray(joints, dtype=float).copy()
 
 
 class _FakeRobot:
     def __init__(self, joints=None, sensor_timestamp_ns: int = 1_000_000_000) -> None:
         self.arm = _FakeArm(joints, sensor_timestamp_ns)
         self.last_action = None
+        self.buffered_action = None
+        self.interpolation_enabled = False
 
     def get_robot_state(self):
         return (
@@ -1290,6 +1336,30 @@ class _FakeRobot:
         self.last_action = np.asarray(action, dtype=float)
         return None
 
+    def add_command_point(self, action, **_kwargs):
+        self.buffered_action = np.asarray(action, dtype=float)
+        return None
+
+    def update_gripper(self, *_args, **_kwargs):
+        return None
+
+    def get_cached_gripper_position(self):
+        return 0.0
+
+    def reset_filter_state(self):
+        return None
+
+    def sync_motion_manager_with_arm(self, _joints):
+        return None
+
+    def validate_joint_limits(self, target):
+        limits = self.arm.joint_pos_limit
+        if limits is None:
+            return None
+        target = np.asarray(target, dtype=float)
+        assert np.all(target >= limits[:, 0])
+        assert np.all(target <= limits[:, 1])
+
 
 class _FakeService:
     gripper_type = "robotiq"
@@ -1303,6 +1373,8 @@ class _FakeService:
     def __init__(self, joints=None, sensor_timestamp_ns: int = 1_000_000_000) -> None:
         self._robot = _FakeRobot(joints, sensor_timestamp_ns)
         self._cmd_lock = threading.Lock()
+        self._control_loop_hz = 0
+        self._control_loop_thread = None
         self.reset_calls = 0
         self.reset_targets = []
 
@@ -1327,6 +1399,54 @@ def _physical_adapter(service: _FakeService) -> VegaRobotCalibrationAdapter:
     return VegaRobotCalibrationAdapter(service, 1.2, np.array([0.0, 0.0, 0.072]))
 
 
+def test_real_service_claim_and_real_adapter_prepare_do_not_deadlock() -> None:
+    service = VegaRobotEnvService.__new__(VegaRobotEnvService)
+    service.arm_side = "left"
+    service.gripper_type = "robotiq"
+    service.frame_type = "world"
+    service.control_hz = 20.0
+    service.R_robot_to_world = None
+    service.R_world_to_robot = None
+    service.reset_joints = np.full(7, 0.25)
+    service.reset_middle_joints = np.full(7, 0.1)
+    service._robot = _FakeRobot()
+    service._cmd_lock = threading.Lock()
+    service._cancel_move = threading.Event()
+    service._force_calibration_admission_lock = threading.Lock()
+    service._force_calibration_owns_robot = threading.Event()
+    service._control_loop_hz = 0
+    service._control_loop_thread = None
+
+    adapter = _physical_adapter(service)
+    adapter._hold_cartesian_target = lambda *_args, **_kwargs: None
+    phases = []
+    error = []
+
+    assert service._claim_robot_for_force_calibration() is True
+
+    def run_prepare():
+        try:
+            adapter.execute_stage(
+                "prepare",
+                {"kind": "prepare", "start_joints": [0.2] * 7},
+                threading.Event(),
+                lambda state, _message: phases.append(state),
+            )
+        except BaseException as exc:  # surfaced in the test thread below
+            error.append(exc)
+
+    worker = threading.Thread(target=run_prepare, daemon=True)
+    worker.start()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive(), "real claim deadlocked the real calibration adapter"
+    assert error == []
+    assert phases == ["MOVING", "RETURNING"]
+    np.testing.assert_allclose(service._robot.arm.get_joint_pos(), np.full(7, 0.2))
+
+    service._release_robot_from_force_calibration()
+    assert not service._force_calibration_owns_robot.is_set()
+
+
 def test_rotation_delta_uses_legacy_step_frame_transform() -> None:
     service = _FakeService()
     service.R_world_to_robot = Rotation.from_euler(
@@ -1340,6 +1460,19 @@ def test_rotation_delta_uses_legacy_step_frame_transform() -> None:
     np.testing.assert_allclose(
         service._robot.last_action[3:6], expected_delta, atol=1e-12
     )
+
+
+def test_interpolated_calibration_uses_legacy_step_buffering_path() -> None:
+    service = _FakeService()
+    service._robot.interpolation_enabled = True
+    service._control_loop_hz = 200
+    adapter = _physical_adapter(service)
+
+    adapter._command_delta(np.radians(np.array([1.0, 2.0, 3.0])))
+
+    assert service._robot.last_action is None
+    assert service._robot.buffered_action is not None
+    assert service._robot.buffered_action.shape == (7,)
 
 
 def test_motion_commands_accumulated_target_error_not_each_tiny_increment() -> None:
@@ -1387,6 +1520,7 @@ def test_pose_preserves_legacy_one_second_neutral_return_hold() -> None:
     service = _FakeService()
     adapter = _physical_adapter(service)
     adapter._start_joints = np.zeros(7)
+    adapter._neutral_cartesian = np.zeros(6)
     adapter._sleep_tick = lambda _started: None
     sample_index = 0
 
@@ -1433,10 +1567,43 @@ def test_pose_preserves_legacy_one_second_neutral_return_hold() -> None:
     assert neutral_commands == round(service.control_hz)
 
 
+def test_all_poses_reuse_the_post_prepare_neutral_target() -> None:
+    service = _FakeService()
+    adapter = _physical_adapter(service)
+    adapter._start_joints = np.zeros(7)
+    adapter._neutral_cartesian = np.arange(6, dtype=float)
+    adapter._sleep_tick = lambda _started: None
+    starts = []
+
+    def fake_move_profile(_steps, commanded, _cancelled):
+        starts.append(np.asarray(commanded, dtype=float).copy())
+        return np.asarray(commanded, dtype=float).copy()
+
+    sample_index = 0
+
+    def sample():
+        nonlocal sample_index
+        sample_index += 1
+        return np.zeros(6), np.eye(3), np.zeros(7), sample_index / service.control_hz
+
+    adapter._move_profile = fake_move_profile
+    adapter._sample = sample
+    adapter._current_cartesian = lambda: np.full(6, 99.0)
+    adapter.execute_stage(
+        "pose-0",
+        {"kind": "pose", "rpy_degrees": [1.0, 0.0, 0.0]},
+        threading.Event(),
+        lambda _state, _message: None,
+    )
+
+    np.testing.assert_array_equal(starts[0], np.arange(6, dtype=float))
+
+
 def test_successful_fit_preserves_legacy_normal_joint_reset() -> None:
     service = _FakeService()
     adapter = _physical_adapter(service)
     adapter._start_joints = np.zeros(7)
+    adapter._neutral_cartesian = np.zeros(6)
     adapter._sleep_tick = lambda _started: None
     sample_index = 0
 
@@ -1473,6 +1640,19 @@ def test_successful_fit_preserves_legacy_normal_joint_reset() -> None:
     assert not np.allclose(service.reset_targets[0], service.reset_joints)
 
 
+def test_calibration_reset_preserves_legacy_joint_limit_clipping() -> None:
+    service = _FakeService()
+    service._robot.arm.joint_pos_limit = np.tile(np.array([-1.0, 1.0]), (7, 1))
+    adapter = _physical_adapter(service)
+    adapter.configure_desired_normal_reset_joint_positions_rad(
+        DesiredNormalResetJointPositionsRad((2.0,) * 7)
+    )
+
+    adapter.normal_return(threading.Event())
+
+    np.testing.assert_array_equal(service.reset_targets[-1], np.ones(7))
+
+
 def test_sample_uses_sensor_timestamp_and_rejects_cross_stream_skew() -> None:
     adapter = _physical_adapter(_FakeService(sensor_timestamp_ns=1_000_000_000))
     assert adapter._sample()[3] == pytest.approx(1.0)
@@ -1496,6 +1676,7 @@ def test_sample_uses_sensor_timestamp_and_rejects_cross_stream_skew() -> None:
 def test_pose_collection_preserves_gt_control_tick_weighting() -> None:
     adapter = _physical_adapter(_FakeService())
     adapter._start_joints = np.zeros(7)
+    adapter._neutral_cartesian = np.zeros(6)
 
     def skip_sleep(_started):
         return None
@@ -1571,6 +1752,7 @@ def test_real_adapter_prepare_completes_against_lifecycle(tmp_path: Path) -> Non
 def test_real_adapter_cancel_during_pose_preserves_cancel_signal() -> None:
     adapter = _physical_adapter(_FakeService())
     adapter._start_joints = np.zeros(7)
+    adapter._neutral_cartesian = np.zeros(6)
     cancelled = threading.Event()
     phases = []
 
@@ -1634,6 +1816,32 @@ def test_shutdown_cancels_active_stage_waits_for_safe_return_and_releases_robot(
     assert manager.status().state == "CANCELLED"
     assert adapter.safe_returns == 1
     assert claim.owned is False
+
+
+def test_shutdown_preserves_ready_candidate_for_commit_after_restart(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    manager, adapter, claim = _manager(tmp_path)
+    manager.start("run-1", True)
+    manager.advance("run-1", 0, "stage-0")
+    _wait_state(manager, "READY_FOR_STAGE")
+    manager.advance("run-1", 1, "stage-1")
+    ready = _wait_state(manager, "READY_TO_APPLY")
+
+    manager.shutdown()
+
+    assert manager.status().state == "READY_TO_APPLY"
+    assert adapter.safe_returns == 0
+    assert claim.owned is False
+
+    monkeypatch.setattr(
+        manager_module, "wrist_ft_calibration_from_snapshot", lambda value: value
+    )
+    restored, _, restored_claim = _manager(tmp_path)
+    assert restored.status().state == "READY_TO_APPLY"
+    assert restored_claim.owned is True
+    assert restored.commit("run-1", ready.plan_sha256).state == "SUCCEEDED"
+    assert restored_claim.owned is False
 
 
 def test_packaged_plan_has_shared_stage_ids_and_mirrored_arm_payloads() -> None:
