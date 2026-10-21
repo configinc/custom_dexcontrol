@@ -856,21 +856,22 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
     def Reset(self, request, context):
         mode = request.mode or "home"
+        if mode == "current":
+            try:
+                observation, timestamp_us = self._create_observation()
+                return robotenv_pb2.ResetResponse(
+                    observation=observation,
+                    status="SUCCESS",
+                    message="Reset to current",
+                    timestamp_us=timestamp_us,
+                )
+            except Exception as exc:
+                LOGGER.exception("Reset failed (mode=current): %s", exc)
+                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_details(f"Reset failed: {exc}")
+                return robotenv_pb2.ResetResponse()
+
         if self._force_calibration_owns_robot.is_set():
-            if mode == "current":
-                try:
-                    observation, timestamp_us = self._create_observation()
-                    return robotenv_pb2.ResetResponse(
-                        observation=observation,
-                        status="SUCCESS",
-                        message="Reset to current",
-                        timestamp_us=timestamp_us,
-                    )
-                except Exception as exc:
-                    LOGGER.exception("Reset failed (mode=current): %s", exc)
-                    context.set_code(grpc.StatusCode.INTERNAL)
-                    context.set_details(f"Reset failed: {exc}")
-                    return robotenv_pb2.ResetResponse()
             context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
             context.set_details("force calibration owns robot commands")
             return robotenv_pb2.ResetResponse(
@@ -912,8 +913,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 elif mode == "random":
                     target_joints = self._sample_random_target()
                     self._execute_reset_sequence(target_joints)
-                elif mode == "current":
-                    pass
                 else:
                     context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                     context.set_details(f"Unknown reset mode: {mode}")

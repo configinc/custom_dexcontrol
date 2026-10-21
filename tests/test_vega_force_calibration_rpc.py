@@ -240,6 +240,29 @@ def test_step_and_reset_fail_busy_only_while_calibration_owns_robot() -> None:
     assert current_context.code is None
 
 
+def test_reset_current_is_read_only_outside_calibration() -> None:
+    service = _service()
+    service._force_calibration_owns_robot = threading.Event()
+    service._cancel_move = threading.Event()
+    service._control_loop_thread = type("RunningThread", (), {"is_alive": lambda self: True})()
+    service._stop_control_loop = lambda: (_ for _ in ()).throw(
+        AssertionError("current observation must not stop the control loop")
+    )
+    service._start_control_loop = lambda: (_ for _ in ()).throw(
+        AssertionError("current observation must not restart the control loop")
+    )
+    service._cmd_lock = None
+    service._create_observation = lambda: ({}, 456)
+
+    context = Context()
+    response = service.Reset(robotenv_pb2.ResetRequest(mode="current"), context)
+
+    assert response.status == "SUCCESS"
+    assert response.timestamp_us == 456
+    assert context.code is None
+    assert not service._cancel_move.is_set()
+
+
 def test_reset_losing_claim_race_does_not_cancel_calibration_motion() -> None:
     service = _service()
     service.arm_side = "left"
