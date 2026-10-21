@@ -52,6 +52,8 @@ def test_observation_contract_exposes_raw_and_optional_calibrated_wrenches() -> 
     assert "external_wrench_wrist" in spec.fields
     assert "external_wrench_sensor_raw" in spec.fields
     assert "external_wrench_world" in spec.fields
+    assert list(spec.fields["torso_joint_positions"].shape) == [3]
+    assert list(spec.fields["head_joint_positions"].shape) == [3]
     # The server-owned fields are additive: the legacy field remains available.
     assert "wrench_state" in spec.fields
     assert list(spec.fields["external_wrench_sensor_raw"].shape) == [6]
@@ -80,6 +82,41 @@ def test_observation_contract_exposes_raw_and_optional_calibrated_wrenches() -> 
         "external_wrench_sensor_to_output_reference_translation_m",
     ):
         assert config.metadata[key] == spec.metadata[key]
+
+
+def test_observation_exposes_measured_shared_torso_and_head_state() -> None:
+    robot = VegaRobot.__new__(VegaRobot)
+    robot.arm = SimpleNamespace(
+        get_joint_pos=lambda: np.zeros(7),
+        get_joint_vel=lambda: np.zeros(7),
+        get_joint_torque=lambda: np.zeros(7),
+        get_timestamp_ns=lambda: 123_000,
+        wrench_sensor=None,
+    )
+    robot.robot = SimpleNamespace(
+        torso=SimpleNamespace(get_joint_pos=lambda: [0.1, 0.2, 0.3]),
+        head=SimpleNamespace(get_joint_pos=lambda: [-0.1, -0.2, -0.3]),
+    )
+    robot.hand = None
+    robot._prev_controller_latency_ms = 0.0
+    robot._prev_command_successful = True
+    robot._prev_gripper_command_successful = True
+    robot._get_cartesian_pose = lambda *, joint_positions: np.zeros(6)
+
+    service = _service()
+    service._robot = robot
+    observation, _ = service._create_observation()
+
+    assert list(observation["torso_joint_positions"].float_array.values) == [
+        0.1,
+        0.2,
+        0.3,
+    ]
+    assert list(observation["head_joint_positions"].float_array.values) == [
+        -0.1,
+        -0.2,
+        -0.3,
+    ]
 
 
 def test_sensor_boundary_preserves_source_wrench_order_and_sign(monkeypatch) -> None:

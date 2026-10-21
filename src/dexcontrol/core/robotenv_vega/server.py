@@ -570,6 +570,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 description="Physical F/T sensor measurement origin",
             )
         )
+        spec.fields["torso_joint_positions"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64", shape=[3], required=False,
+                description="Measured torso_j1..torso_j3 positions in radians",
+            )
+        )
+        spec.fields["head_joint_positions"].CopyFrom(
+            robotenv_pb2.FieldSpec(
+                dtype="float64", shape=[3], required=False,
+                description="Measured head_j1..head_j3 positions in radians",
+            )
+        )
         spec.fields["external_wrench_sensor_raw_timestamp_ns"].CopyFrom(
             robotenv_pb2.FieldSpec(
                 dtype="int64", shape=[], required=False,
@@ -1249,6 +1261,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     values=[float(v) for v in state_dict["hand_tactile"]]
                 )
             )
+        for field_name in ("torso_joint_positions", "head_joint_positions"):
+            if field_name in state_dict:
+                observation[field_name] = robotenv_pb2.Value(
+                    float_array=robotenv_pb2.FloatArray(
+                        values=np.asarray(
+                            state_dict[field_name], dtype=np.float64
+                        ).tolist()
+                    )
+                )
         self._append_external_wrench_observation(
             observation,
             cartesian_position=cartesian_position,
