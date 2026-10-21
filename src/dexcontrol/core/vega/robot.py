@@ -127,7 +127,7 @@ class VegaRobot:
         gripper_type: str = "default",
         ik_solver_type: str = "pink",
         use_velocity_feedforward: bool = False,
-        robotiq_comport: str = "/dev/ttyUSB0",
+        robotiq_comport: str | None = None,
         wuji_sn: str | None = None,
         wuji_effort_limit: float | None = None,
         ema_alpha: float = 0.0,
@@ -196,10 +196,12 @@ class VegaRobot:
 
         if gripper_type == "robotiq":
             from dexcontrol.core.robotiq_gripper import RobotiqGripper  # lazy import
-            self.hand = RobotiqGripper(comport=self._robotiq_comport)
+            # No comport -> gripper sits on this arm's wrist RS485 pass-through.
+            self.hand = RobotiqGripper(comport=self._robotiq_comport, side=arm_side)
         elif gripper_type == "sr_gripper":
             from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
-            self.hand = SrGripperAdapter(comport=self._robotiq_comport)
+            sr_kwargs = {"comport": self._robotiq_comport} if self._robotiq_comport else {}
+            self.hand = SrGripperAdapter(**sr_kwargs)
         elif gripper_type in ("wuji_hand_v1", "wuji_hand_v2"):
             from dexcontrol.core.wuji_hand import WujiHandAdapter  # lazy import
             if wuji_effort_limit is None:

@@ -7,7 +7,7 @@
     dexmate_user: "dexmate"
     dexmate_pass: "hello-dex"
     # Gripper selection:
-    #   "robotiq"    -> 2-finger over ttyUSB
+    #   "robotiq"    -> 2-finger over wrist RS485 pass-through (no port)
     #   "sr_gripper" -> 2-finger over EtherCAT
     #   "wuji_hand_v1" / "wuji_hand_v2" -> Wuji 5-finger hand (USB gen 1 /
     #                   Ethernet gen 2; the wuji-sdk driver auto-detects the
@@ -116,32 +116,21 @@
         msg: "Cannot reach {{ dexmate_ip }} — dexmate machine is offline or not connected"
       when: dexmate_ping.rc != 0
 
-    # ── Detect Robotiq ttyUSB devices ────────────────────────────────────────
-    - name: Check /dev/ttyUSB* devices on dexmate (Robotiq)
-      shell: |
-        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} 'ls /dev/ttyUSB*'
-      args:
-        executable: /bin/bash
-      register: ttyusb_list
-      become: false
-      when: gripper_type == "robotiq"
-
-    - name: Fail if fewer than 2 ttyUSB devices found (Robotiq)
-      fail:
-        msg: "Expected 2 /dev/ttyUSB* devices, found: {{ ttyusb_list.stdout_lines }}"
-      when: gripper_type == "robotiq" and ttyusb_list.stdout_lines | length < 2
-
-    - name: Resolve left/right Robotiq comports
+    # ── Robotiq: wrist RS485 pass-through ──────────────────────────────────
+    # Robotiq grippers are plugged into each arm's wrist RS485 connector and
+    # reached through the robot SoC, so there is no local port to detect:
+    # server.py binds the gripper to --arm-side when --robotiq-comport is omitted.
+    - name: Use arm-side EE pass-through for Robotiq
       set_fact:
-        left_gripper_port: "{{ ttyusb_list.stdout_lines | sort | first }}"
-        right_gripper_port: "{{ ttyusb_list.stdout_lines | sort | last }}"
+        left_gripper_port: ""
+        right_gripper_port: ""
       when: gripper_type == "robotiq"
 
     # ── Detect SR EtherCAT ifaces ───────────────────────────────────────────
     # Probe every non-skipped NIC on dexmate, pick the ones whose first slave
     # is an SR DCU (vendor=0x534543, product=0x1002), then sort the names.
     # First name -> left arm, last -> right arm. Same convention as the
-    # Robotiq /dev/ttyUSB* sort above so left/right assignment is stable.
+    # previous Robotiq /dev/ttyUSB* sort so left/right assignment is stable.
     - name: Probe EtherCAT NICs on dexmate for SR DCU
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
@@ -421,16 +410,14 @@
 
     # ── Start robot gRPC servers ─────────────────────────────────────────────
     # The gripper-port flag differs between gripper types:
-    #   robotiq      -> --robotiq-comport <ttyUSB>
+    #   robotiq      -> (none; uses --arm-side EE RS485 pass-through)
     #   sr_gripper   -> --gripper-iface   <EtherCAT iface>
     #   wuji_hand_v1/v2, vega_hand -> (no port flag; the driver selects by
     #                   handedness/SN)
     - name: Resolve gripper-port CLI flag
       set_fact:
         gripper_port_flag: >-
-          {{ '' if gripper_type in ['vega_hand', 'wuji_hand_v1', 'wuji_hand_v2']
-             else '--gripper-iface' if gripper_type == 'sr_gripper'
-             else '--robotiq-comport' }}
+          {{ '--gripper-iface' if gripper_type == 'sr_gripper' else '' }}
 
     # Only wuji hands take an SN; robotiq/sr/vega_hand get an empty string so
     # the command line is unchanged for them.

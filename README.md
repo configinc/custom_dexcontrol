@@ -18,8 +18,11 @@ pip install dexcontrol[example]
 
 ### Robotiq 2F-85 Gripper (optional)
 
-If you want to use a Robotiq 2F-85 gripper connected via USB-RS485, clone this
-repo with submodules and install the gripper package:
+If you want to use a Robotiq 2F-85 gripper, clone this repo with submodules and
+install the gripper package. The gripper is expected on the arm's wrist RS485
+connector (pin 1 A/+, pin 2 B/-, pin 3 24V, pin 4 GND) and is reached through
+the robot's EE RS485 pass-through; a USB-RS485 adapter is still supported via
+`--robotiq-comport`.
 
 ```shell
 # Clone with submodule
@@ -32,14 +35,23 @@ git submodule update --init --recursive
 pip install -e robotiq_2f_85_controller/
 ```
 
-Then start the RobotEnv server with `--gripper-type robotiq`:
+Then start the RobotEnv server with `--gripper-type robotiq`. The gripper on
+the `--arm-side` arm's wrist connector is used automatically:
 
 ```shell
+python src/dexcontrol/core/robotenv_vega/server.py \
+    --arm-side left \
+    --gripper-type robotiq
+
+# Legacy USB-RS485 adapter instead of the wrist connector
 python src/dexcontrol/core/robotenv_vega/server.py \
     --arm-side left \
     --gripper-type robotiq \
     --robotiq-comport /dev/ttyUSB0
 ```
+
+The wrist RS485 baud rate must match the gripper (115200); check it with
+`python examples/advanced_examples/config_ee_baud_rate.py get`.
 
 Or instantiate `VegaRobot` directly:
 
@@ -48,8 +60,7 @@ from dexcontrol.core.vega.robot import VegaRobot
 
 robot = VegaRobot(
     arm_side="left",
-    gripper_type="robotiq",
-    robotiq_comport="/dev/ttyUSB0",
+    gripper_type="robotiq",  # wrist RS485 of arm_side; pass robotiq_comport for USB-RS485
 )
 ```
 
@@ -86,7 +97,6 @@ python src/dexcontrol/core/robotenv_vega/server.py \
     --arm-side left \
     --grpc-port 50061 \
     --gripper-type robotiq \
-    --robotiq-comport /dev/ttyUSB0 \
     --use-velocity-feedforward \
     --interpolation-method cubic \
     --interpolation-history 3 \
@@ -102,7 +112,6 @@ python src/dexcontrol/core/robotenv_vega/server.py \
     --arm-side right \
     --grpc-port 50063 \
     --gripper-type robotiq \
-    --robotiq-comport /dev/ttyUSB1 \
     --use-velocity-feedforward \
     --interpolation-method cubic \
     --interpolation-history 3 \
