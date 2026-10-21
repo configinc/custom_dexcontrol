@@ -1717,6 +1717,34 @@ def test_pose_collection_preserves_gt_control_tick_weighting() -> None:
     assert phases == ["MOVING", "SETTLING", "COLLECTING", "RETURNING"]
 
 
+def test_pose_collection_allows_three_extra_seconds_to_settle() -> None:
+    adapter = _physical_adapter(_FakeService())
+    adapter._start_joints = np.zeros(7)
+    adapter._neutral_cartesian = np.zeros(6)
+    adapter._sleep_tick = lambda _started: None
+    sample_index = 0
+
+    def sample_that_settles_after_the_legacy_deadline():
+        nonlocal sample_index
+        timestamp = 1.0 + 0.05 * sample_index
+        motion_seconds = min(0.05 * sample_index, 6.25)
+        sample_index += 1
+        joints = np.full(7, np.radians(3.0) * motion_seconds, dtype=np.float64)
+        return np.zeros(6), np.eye(3), joints, timestamp
+
+    adapter._sample = sample_that_settles_after_the_legacy_deadline
+    hold = adapter.execute_stage(
+        "pose-0",
+        {"kind": "pose", "rpy_degrees": [0.0, 0.0, 0.0]},
+        threading.Event(),
+        lambda _state, _message: None,
+    )
+
+    assert hold is not None
+    assert 7.0 * adapter.service.control_hz < sample_index
+    assert sample_index <= manager_module.POSE_HOLD_SECONDS * adapter.service.control_hz
+
+
 def test_safe_return_verification_rejects_unreached_joint_target() -> None:
     adapter = _physical_adapter(_FakeService(joints=np.ones(7)))
     with pytest.raises(RuntimeError, match="safe return joint error"):

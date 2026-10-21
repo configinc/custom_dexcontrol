@@ -31,7 +31,7 @@ from .wrench_contract import vega_wrench_frame_rotations
 LOGGER = logging.getLogger("robotenv_vega.force_calibration")
 
 MAX_ROTATION_SPEED_DPS = 15.0
-POSE_HOLD_SECONDS = 7.0
+POSE_HOLD_SECONDS = 10.0
 MINIMUM_POSE_HOLD_SECONDS = 3.0
 START_HOLD_SECONDS = 15.0
 NEUTRAL_RETURN_HOLD_SECONDS = 1.0
