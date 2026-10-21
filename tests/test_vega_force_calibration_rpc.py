@@ -263,6 +263,34 @@ def test_reset_current_is_read_only_outside_calibration() -> None:
     assert not service._cancel_move.is_set()
 
 
+def test_reset_skip_intermediate_pose_is_forwarded_only_when_requested() -> None:
+    service = _service()
+    service.arm_side = "left"
+    service.reset_joints = [0.0] * 7
+    service._force_calibration_owns_robot = threading.Event()
+    service._cancel_move = threading.Event()
+    service._control_loop_thread = None
+    service._cmd_lock = threading.Lock()
+    calls = []
+    service._execute_reset_sequence = lambda target, **kwargs: calls.append(
+        bool(kwargs.get("skip_intermediate_pose", False))
+    )
+    service._create_observation = lambda: ({"ok": robotenv_pb2.Value(int_value=1)}, 123)
+
+    direct = service.Reset(
+        robotenv_pb2.ResetRequest(
+            mode="home",
+            params={"skip_intermediate_pose": robotenv_pb2.Value(int_value=1)},
+        ),
+        Context(),
+    )
+    default = service.Reset(robotenv_pb2.ResetRequest(mode="home"), Context())
+
+    assert direct.status == "SUCCESS"
+    assert default.status == "SUCCESS"
+    assert calls == [True, False]
+
+
 def test_reset_losing_claim_race_does_not_cancel_calibration_motion() -> None:
     service = _service()
     service.arm_side = "left"

@@ -878,6 +878,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 status="BUSY", message="force calibration owns robot commands"
             )
         LOGGER.info("Reset requested: mode=%s arm=%s", mode, self.arm_side)
+        skip_intermediate_pose = bool(
+            request.params["skip_intermediate_pose"].int_value
+            if "skip_intermediate_pose" in request.params
+            else False
+        )
 
         # Cancel any in-progress _move_incremental from a previous Reset.
         self._cancel_move.set()
@@ -906,13 +911,22 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             try:
                 if mode == "home":
                     target_joints = self.reset_joints
-                    self._execute_reset_sequence(target_joints)
+                    self._execute_reset_sequence(
+                        target_joints,
+                        skip_intermediate_pose=skip_intermediate_pose,
+                    )
                 elif mode == "target":
                     target_joints = self._extract_target_joints(request)
-                    self._execute_reset_sequence(target_joints)
+                    self._execute_reset_sequence(
+                        target_joints,
+                        skip_intermediate_pose=skip_intermediate_pose,
+                    )
                 elif mode == "random":
                     target_joints = self._sample_random_target()
-                    self._execute_reset_sequence(target_joints)
+                    self._execute_reset_sequence(
+                        target_joints,
+                        skip_intermediate_pose=skip_intermediate_pose,
+                    )
                 else:
                     context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                     context.set_details(f"Unknown reset mode: {mode}")
@@ -1429,6 +1443,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         *,
         cancelled: threading.Event | None = None,
         interruptible_gripper: bool = False,
+        skip_intermediate_pose: bool = False,
     ) -> None:
         t0 = time.time()
         if cancelled is not None and cancelled.is_set():
@@ -1452,13 +1467,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         LOGGER.info("Reset[%s]: gripper done (%.2fs), starting reset motion", self.arm_side, time.time() - t0)
         self._robot.reset_filter_state()
 
-        # Move to middle waypoint to avoid collisions.
-        middle_f64 = np.asarray(self.reset_middle_joints, dtype=np.float64)
-        LOGGER.info("Reset[%s]: moving to middle waypoint", self.arm_side)
-        self._move_incremental(middle_f64, cancelled=cancelled)
-        if cancelled is not None and cancelled.is_set():
-            return
-        LOGGER.info("Reset[%s]: middle waypoint reached (%.2fs)", self.arm_side, time.time() - t0)
+        if not skip_intermediate_pose:
+            # Default reset path retains the collision-avoidance waypoint.
+            middle_f64 = np.asarray(self.reset_middle_joints, dtype=np.float64)
+            LOGGER.info("Reset[%s]: moving to middle waypoint", self.arm_side)
+            self._move_incremental(middle_f64, cancelled=cancelled)
+            if cancelled is not None and cancelled.is_set():
+                return
+            LOGGER.info("Reset[%s]: middle waypoint reached (%.2fs)", self.arm_side, time.time() - t0)
+        else:
+            LOGGER.info("Reset[%s]: skipping middle waypoint", self.arm_side)
 
         # Then move to the final target (home/init position).
         target_f64 = np.asarray(target_joints, dtype=np.float64)
