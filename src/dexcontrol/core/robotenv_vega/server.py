@@ -99,7 +99,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         use_velocity_feedforward: bool = False,
         base_frame_rotation: Optional[list[float]] = None,
         ik_solver_type: str = "pink",
-        robotiq_comport: str = "/dev/ttyUSB0",
+        robotiq_comport: Optional[str] = None,
         wuji_sn: Optional[str] = None,
         wuji_effort_limit: Optional[float] = None,
         ema_alpha: float = 0.0,
@@ -1611,7 +1611,7 @@ def serve(
     use_velocity_feedforward: bool = False,
     base_frame_rotation: Optional[list[float]] = None,
     ik_solver_type: str = "pink",
-    robotiq_comport: str = "/dev/ttyUSB0",
+    robotiq_comport: Optional[str] = None,
     wuji_sn: Optional[str] = None,
     wuji_effort_limit: Optional[float] = None,
     ema_alpha: float = 0.0,
@@ -1789,8 +1789,10 @@ def main() -> None:
     parser.add_argument(
         "--robotiq-comport",
         type=str,
-        default="/dev/ttyUSB0",
-        help="Serial port for Robotiq gripper when --gripper-type=robotiq (default: /dev/ttyUSB0). "
+        default=None,
+        help="Serial port (e.g. /dev/ttyUSB0) for a Robotiq gripper on a USB-RS485 adapter. "
+             "When omitted with --gripper-type=robotiq, the gripper is driven through the "
+             "--arm-side arm's wrist RS485 pass-through. "
              "For SR gripper, prefer --gripper-iface; this flag is still accepted as a fallback.",
     )
     parser.add_argument(
