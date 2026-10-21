@@ -32,6 +32,7 @@ LOGGER = logging.getLogger("robotenv_vega.force_calibration")
 
 MAX_ROTATION_SPEED_DPS = 15.0
 POSE_HOLD_SECONDS = 7.0
+MINIMUM_POSE_HOLD_SECONDS = 3.0
 START_HOLD_SECONDS = 15.0
 NEUTRAL_RETURN_HOLD_SECONDS = 1.0
 FIT_TAIL_SECONDS = 2.0
@@ -475,6 +476,9 @@ class VegaRobotCalibrationAdapter:
         try:
             set_phase("SETTLING", f"settling at {stage_id}")
             count = max(1, round(POSE_HOLD_SECONDS * self.service.control_hz))
+            minimum_count = max(
+                1, round(MINIMUM_POSE_HOLD_SECONDS * self.service.control_hz)
+            )
             settled = None
             for index in range(count):
                 self._check_cancelled(cancelled)
@@ -487,6 +491,9 @@ class VegaRobotCalibrationAdapter:
                     if "did not contain two continuous settled seconds" not in str(exc):
                         raise
                 else:
+                    if index + 1 < minimum_count:
+                        self._sleep_tick(started)
+                        continue
                     set_phase("COLLECTING", f"collecting {stage_id}")
                     # The legacy loop completed the current control tick before
                     # starting the reverse profile, even on early settlement.

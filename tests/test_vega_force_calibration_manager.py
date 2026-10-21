@@ -1707,6 +1707,9 @@ def test_pose_collection_preserves_gt_control_tick_weighting() -> None:
     )
 
     assert hold is not None
+    assert sample_index >= round(
+        manager_module.MINIMUM_POSE_HOLD_SECONDS * adapter.service.control_hz
+    )
     assert hold.measured_sensor_wrench_samples.shape[0] >= 40
     assert np.unique(hold.measured_sensor_wrench_samples[:, 0]).size < len(
         hold.measured_sensor_wrench_samples
