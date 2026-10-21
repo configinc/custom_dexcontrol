@@ -16,10 +16,17 @@ VEGA_COMPANY_WRIST_ORIGIN_FROM_SENSOR_M = np.array(
 )
 
 # Dexmate's Vega URDF defines the physical F/T measurement axes on arm link 8.
-# Cartesian control/recording remains on L_ee/R_ee, whose fixed joint is yawed
-# relative to link 8 by -90 degrees on the left arm and +90 degrees on the
-# right arm.  These are sensor-to-TCP mounting transforms, not the independent
-# TCP-to-company-wrist convention above.
+# Cartesian control/recording currently remains on L_ee/R_ee, whose fixed joint
+# is yawed relative to link 8 by -90 degrees on the left arm and +90 degrees on
+# the right arm.  These are sensor-to-TCP mounting transforms, not the
+# independent TCP-to-company-wrist convention above.
+#
+# TODO(2026-11): This is an intentional compatibility hold, not the final Vega
+# frame contract.  IK, stored Cartesian poses/deltas, and every related value
+# should ultimately use L_arm_l8/R_arm_l8 consistently.  Changing that contract
+# also requires a coordinated migration of data building and wrist-policy
+# training, so retain the existing L_ee/R_ee behavior until that migration is
+# explicitly implemented and validated.
 VEGA_LINK8_FROM_TCP_YAW_DEGREES = {
     "left": -90.0,
     "right": 90.0,
