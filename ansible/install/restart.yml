@@ -116,14 +116,45 @@
         msg: "Cannot reach {{ dexmate_ip }} — dexmate machine is offline or not connected"
       when: dexmate_ping.rc != 0
 
-    # ── Robotiq: wrist RS485 pass-through ──────────────────────────────────
-    # Robotiq grippers are plugged into each arm's wrist RS485 connector and
-    # reached through the robot SoC, so there is no local port to detect:
-    # server.py binds the gripper to --arm-side when --robotiq-comport is omitted.
-    - name: Use arm-side EE pass-through for Robotiq
+    # ── Robotiq transport auto-detection ────────────────────────────────────
+    # Older units use two USB-RS485 adapters; newer units connect each gripper
+    # directly to the corresponding Vega wrist. Preserve both layouts:
+    #   2 ttyUSB devices -> left=first, right=last (legacy USB convention)
+    #   0 ttyUSB devices -> arm-side EE RS485 pass-through
+    # Any other count is ambiguous, so fail instead of binding the wrong arm.
+    - name: Detect Robotiq USB-RS485 adapters on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'find /dev -maxdepth 1 -type c -name "ttyUSB*" -print | sort'
+      args:
+        executable: /bin/bash
+      register: robotiq_ttyusb_list
+      become: false
+      changed_when: false
+      when: gripper_type == "robotiq"
+
+    - name: Fail when Robotiq USB transport is ambiguous
+      fail:
+        msg: >-
+          Found {{ robotiq_ttyusb_list.stdout_lines | length }} Robotiq USB candidates:
+          {{ robotiq_ttyusb_list.stdout_lines }}. Expected exactly 0 devices for
+          Vega wrist RS485 pass-through or exactly 2 devices for legacy USB-RS485
+          (left=first, right=last). Fix the hardware connection before retrying.
+      when:
+        - gripper_type == "robotiq"
+        - robotiq_ttyusb_list.stdout_lines | length not in [0, 2]
+
+    - name: Resolve Robotiq USB or wrist pass-through transport
       set_fact:
-        left_gripper_port: ""
-        right_gripper_port: ""
+        left_gripper_port: >-
+          {{ (robotiq_ttyusb_list.stdout_lines | first)
+             if (robotiq_ttyusb_list.stdout_lines | length == 2) else '' }}
+        right_gripper_port: >-
+          {{ (robotiq_ttyusb_list.stdout_lines | last)
+             if (robotiq_ttyusb_list.stdout_lines | length == 2) else '' }}
+        robotiq_transport: >-
+          {{ 'usb_rs485' if (robotiq_ttyusb_list.stdout_lines | length == 2)
+             else 'wrist_rs485_pass_through' }}
       when: gripper_type == "robotiq"
 
     # ── Detect SR EtherCAT ifaces ───────────────────────────────────────────
@@ -370,7 +401,10 @@
 
     - name: Display gripper port assignments
       debug:
-        msg: "[{{ gripper_type }}] Left: {{ left_gripper_port }} / Right: {{ right_gripper_port }}"
+        msg: >-
+          [{{ gripper_type }}{% if gripper_type == 'robotiq' %}, {{ robotiq_transport }}{% endif %}]
+          Left: {{ left_gripper_port | default('arm-side pass-through', true) }} /
+          Right: {{ right_gripper_port | default('arm-side pass-through', true) }}
 
     # ── Kill existing sessions ───────────────────────────────────────────────
     - name: Kill existing robot-server tmux session on dexmate
@@ -410,14 +444,18 @@
 
     # ── Start robot gRPC servers ─────────────────────────────────────────────
     # The gripper-port flag differs between gripper types:
-    #   robotiq      -> (none; uses --arm-side EE RS485 pass-through)
+    #   robotiq USB  -> --robotiq-comport <ttyUSB>
+    #   robotiq wrist -> (none; uses --arm-side EE RS485 pass-through)
     #   sr_gripper   -> --gripper-iface   <EtherCAT iface>
     #   wuji_hand_v1/v2, vega_hand -> (no port flag; the driver selects by
     #                   handedness/SN)
     - name: Resolve gripper-port CLI flag
       set_fact:
         gripper_port_flag: >-
-          {{ '--gripper-iface' if gripper_type == 'sr_gripper' else '' }}
+          {{ '--gripper-iface' if gripper_type == 'sr_gripper'
+             else '--robotiq-comport'
+             if (gripper_type == 'robotiq' and left_gripper_port | length > 0)
+             else '' }}
 
     # Only wuji hands take an SN; robotiq/sr/vega_hand get an empty string so
     # the command line is unchanged for them.
