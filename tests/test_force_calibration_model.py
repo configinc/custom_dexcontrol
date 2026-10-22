@@ -170,8 +170,8 @@ def test_fit_consumes_robot_server_world_from_sensor_rotation_directly():
     assert parameters.as_parameters()["frame_rotations_owner"] == "robot_server"
 
 
-def _holds_with_force_decoupling(cross_axis_term):
-    decoupling = np.eye(3)
+def _holds_with_force_decoupling(cross_axis_term, diagonal=(1.0, 1.0, 1.0)):
+    decoupling = np.diag(diagonal)
     decoupling[0, 1] = cross_axis_term
     holds = []
     for index, world_from_sensor in enumerate(_orientations()):
@@ -212,6 +212,32 @@ def test_fit_rejects_force_cross_axis_term_above_point_two():
     with pytest.raises(WristFtCalibrationQualityError, match="cross-axis term exceeds 0.2"):
         fit_wrist_ft_calibration(
             _holds_with_force_decoupling(0.21),
+            arm_name="right",
+            sensor_frame_id="right_ft_sensor",
+            reference_point=REFERENCE_POINT,
+            world_frame_id="world",
+            gravity_world_unit=GRAVITY_WORLD,
+            gripper_mass_kg=MASS_KG,
+            gripper_com_sensor_m=COM_SENSOR_M,
+        )
+
+
+def test_fit_accepts_fleet_gain_and_rejects_outside_twenty_percent():
+    parameters = fit_wrist_ft_calibration(
+        _holds_with_force_decoupling(0.0, diagonal=(1.0, 1.16, 1.0)),
+        arm_name="right",
+        sensor_frame_id="right_ft_sensor",
+        reference_point=REFERENCE_POINT,
+        world_frame_id="world",
+        gravity_world_unit=GRAVITY_WORLD,
+        gripper_mass_kg=MASS_KG,
+        gripper_com_sensor_m=COM_SENSOR_M,
+    )
+    assert parameters.quality["force_decoupling_diagonal"][1] == pytest.approx(1.16)
+
+    with pytest.raises(WristFtCalibrationQualityError, match="outside \\[0.80, 1.20\\]"):
+        fit_wrist_ft_calibration(
+            _holds_with_force_decoupling(0.0, diagonal=(1.0, 1.21, 1.0)),
             arm_name="right",
             sensor_frame_id="right_ft_sensor",
             reference_point=REFERENCE_POINT,

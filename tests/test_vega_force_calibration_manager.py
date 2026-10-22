@@ -1745,6 +1745,23 @@ def test_pose_collection_allows_three_extra_seconds_to_settle() -> None:
     assert sample_index <= manager_module.POSE_HOLD_SECONDS * adapter.service.control_hz
 
 
+def test_settled_tail_accepts_fleet_jitter_but_rejects_larger_motion() -> None:
+    def samples_at(speed_degrees_per_second: float):
+        return [
+            (
+                np.zeros(6),
+                np.eye(3),
+                np.full(7, np.radians(speed_degrees_per_second) * index * 0.05),
+                1.0 + index * 0.05,
+            )
+            for index in range(60)
+        ]
+
+    assert manager_module._settled_tail(samples_at(2.9))
+    with pytest.raises(RuntimeError, match="two continuous settled seconds"):
+        manager_module._settled_tail(samples_at(3.1))
+
+
 def test_safe_return_verification_rejects_unreached_joint_target() -> None:
     adapter = _physical_adapter(_FakeService(joints=np.ones(7)))
     with pytest.raises(RuntimeError, match="safe return joint error"):

@@ -22,7 +22,7 @@ GRAVITY_M_S2 = 9.81
 MIN_HOLDS = MIN_CLEAN_HOLDS
 MIN_POSE_SPREAD = 0.3
 MAX_RMS_FORCE_N = 0.5
-K_DIAGONAL_RANGE = (0.85, 1.15)
+K_DIAGONAL_RANGE = (0.80, 1.20)
 MAX_K_OFF_DIAGONAL = 0.2
 _VALIDATED_FIT_TOKEN = object()
 
@@ -414,7 +414,7 @@ def fit_wrist_ft_calibration(
         reasons.append("force residual exceeds 0.5 N")
     diagonal = np.diag(decoupling_fit["decoupling"])
     if not np.all((diagonal >= K_DIAGONAL_RANGE[0]) & (diagonal <= K_DIAGONAL_RANGE[1])):
-        reasons.append("force decoupling diagonal is outside [0.85, 1.15]")
+        reasons.append("force decoupling diagonal is outside [0.80, 1.20]")
     if decoupling_fit["max_off_diagonal"] > MAX_K_OFF_DIAGONAL:
         reasons.append(
             f"force decoupling cross-axis term exceeds {MAX_K_OFF_DIAGONAL:g}"
