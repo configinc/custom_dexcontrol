@@ -127,7 +127,7 @@ class VegaRobot:
         gripper_type: str = "default",
         ik_solver_type: str = "pink",
         use_velocity_feedforward: bool = False,
-        robotiq_comport: str = "/dev/ttyUSB0",
+        robotiq_comport: str | None = None,
         wuji_sn: str | None = None,
         wuji_effort_limit: float | None = None,
         ema_alpha: float = 0.0,
@@ -196,10 +196,12 @@ class VegaRobot:
 
         if gripper_type == "robotiq":
             from dexcontrol.core.robotiq_gripper import RobotiqGripper  # lazy import
-            self.hand = RobotiqGripper(comport=self._robotiq_comport)
+            # No comport -> gripper sits on this arm's wrist RS485 pass-through.
+            self.hand = RobotiqGripper(comport=self._robotiq_comport, side=arm_side)
         elif gripper_type == "sr_gripper":
             from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
-            self.hand = SrGripperAdapter(comport=self._robotiq_comport)
+            sr_kwargs = {"comport": self._robotiq_comport} if self._robotiq_comport else {}
+            self.hand = SrGripperAdapter(**sr_kwargs)
         elif gripper_type in ("wuji_hand_v1", "wuji_hand_v2"):
             from dexcontrol.core.wuji_hand import WujiHandAdapter  # lazy import
             if wuji_effort_limit is None:
@@ -1129,6 +1131,15 @@ class VegaRobot:
             "prev_command_successful": bool(self._prev_command_successful),
             "prev_gripper_command_successful": bool(self._prev_gripper_command_successful),
         }
+        for field_name, component_name in (
+            ("torso_joint_positions", "torso"),
+            ("head_joint_positions", "head"),
+        ):
+            component = getattr(getattr(self, "robot", None), component_name, None)
+            if component is not None:
+                values = np.asarray(component.get_joint_pos(), dtype=np.float64)
+                if values.shape == (3,) and np.isfinite(values).all():
+                    state_dict[field_name] = values
         # Only present for hands with a tactile stream; scalar grippers never
         # add this key.
         if hand_tactile is not None:
