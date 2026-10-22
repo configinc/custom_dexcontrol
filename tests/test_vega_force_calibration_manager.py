@@ -1729,7 +1729,7 @@ def test_pose_collection_allows_three_extra_seconds_to_settle() -> None:
         timestamp = 1.0 + 0.05 * sample_index
         motion_seconds = min(0.05 * sample_index, 6.25)
         sample_index += 1
-        joints = np.full(7, np.radians(3.0) * motion_seconds, dtype=np.float64)
+        joints = np.full(7, np.radians(4.0) * motion_seconds, dtype=np.float64)
         return np.zeros(6), np.eye(3), joints, timestamp
 
     adapter._sample = sample_that_settles_after_the_legacy_deadline
@@ -1757,9 +1757,9 @@ def test_settled_tail_accepts_fleet_jitter_but_rejects_larger_motion() -> None:
             for index in range(60)
         ]
 
-    assert manager_module._settled_tail(samples_at(2.9))
+    assert manager_module._settled_tail(samples_at(3.4))
     with pytest.raises(RuntimeError, match="two continuous settled seconds"):
-        manager_module._settled_tail(samples_at(3.1))
+        manager_module._settled_tail(samples_at(3.6))
 
 
 def test_safe_return_verification_rejects_unreached_joint_target() -> None:
