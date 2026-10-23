@@ -17,6 +17,7 @@ from .server import VegaRobotEnvService, robotenv_pb2, robotenv_pb2_grpc
 from .body_control import BodyControl, ControlConflict
 from .body_hardware import VegaHardware
 from .body_grpc import BodyService
+from .force_calibration_lifecycle import ACTIVE_STATES
 from proto import vega_body_pb2_grpc
 
 LOG = logging.getLogger(__name__)
@@ -24,6 +25,32 @@ LOG = logging.getLogger(__name__)
 
 class ManagedArm(VegaRobotEnvService):
     control = None
+
+    def _start_control_loop(self):
+        # A reset/calibration finally block must not restart output after Stop.
+        with self._cmd_lock:
+            if self.control is None or self.control.mode == "arms":
+                super()._start_control_loop()
+
+    def _claim_robot_for_force_calibration(self):
+        # Calibration uses the arm command path, so it must not compete with
+        # body-mode holds. Before control is assigned, the parent constructor
+        # may restore a motionless calibration candidate for a later commit.
+        if not self._cmd_lock.acquire(blocking=False):
+            return False
+        try:
+            if self.control is not None and self.control.mode != "arms":
+                return False
+            return super()._claim_robot_for_force_calibration()
+        finally:
+            self._cmd_lock.release()
+
+    def _cancel_force_calibration_motion(self):
+        manager = self._force_calibration_manager
+        status = manager.status()
+        # Preserve the wrench branch's durable, already motionless candidate.
+        if status.state in ACTIVE_STATES and status.state != "READY_TO_APPLY":
+            manager.request_cancel(status.run_id, safe_return=False)
 
     def Step(self, request, context):
         with self._cmd_lock:
@@ -58,8 +85,10 @@ def parse_args(argv=None):
     parser.add_argument("--right-port", type=int, default=50063)
     parser.add_argument("--robot-model", default="vega_1")
     parser.add_argument("--gripper-type", choices=["default", "robotiq"], default="robotiq")
-    parser.add_argument("--left-gripper", default="/dev/ttyUSB0")
-    parser.add_argument("--right-gripper", default="/dev/ttyUSB1")
+    parser.add_argument("--left-gripper", default=None,
+                        help="Left Robotiq USB serial port; omit for arm EE RS485 pass-through")
+    parser.add_argument("--right-gripper", default=None,
+                        help="Right Robotiq USB serial port; omit for arm EE RS485 pass-through")
     parser.add_argument("--action-hz", type=int, default=20)
     # Match the deployed Vega arm launch profile; body timing is independent.
     parser.add_argument("--control-loop-hz", type=int, default=200)

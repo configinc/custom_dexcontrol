@@ -7,8 +7,7 @@
     dexmate_user: "dexmate"
     dexmate_pass: "hello-dex"
     # Gripper selection:
-    #   "robotiq"      -> 2-finger over legacy USB-RS485 adapters
-    #   "robotiq_vega" -> 2-finger over Vega arm EE RS485 pass-through
+    #   "robotiq" / "robotiq_vega" -> 2-finger over arm EE RS485 by default
     #   "sr_gripper" -> 2-finger over EtherCAT
     #   "wuji_hand_v1" / "wuji_hand_v2" -> Wuji 5-finger hand (USB gen 1 /
     #                   Ethernet gen 2; the wuji-sdk driver auto-detects the
@@ -21,10 +20,12 @@
     # flags. `-e gripper_type=...` still overrides for one-offs; resolution
     # failure is a hard error, never a silent robotiq fallback.
     gripper_type: ""
+    # Explicitly select USB-RS485 adapters with -e robotiq_transport=usb.
+    robotiq_transport: "rs485"
     # This release enables the shared arm/body server for Robotiq units.
     # Other grippers retain their existing per-arm servers. Override with
     # -e vega_body_control=false for legacy arm-only operation.
-    vega_body_control: "{{ gripper_type == 'robotiq' }}"
+    vega_body_control: "{{ gripper_type in ['robotiq', 'robotiq_vega'] }}"
     vega_body_port: 50065
     unit_config_url: "http://data-studio-layout.tailb971f6.ts.net/api/unit_config"
     # Wuji hand serial numbers are PER UNIT, so they are not stored here.
@@ -104,9 +105,15 @@
 
     - name: Validate managed body server gripper support
       assert:
-        that: gripper_type == 'robotiq'
+        that: gripper_type in ['robotiq', 'robotiq_vega']
         fail_msg: "Managed body deployment supports Robotiq. Use vega_body_control=false for other grippers."
       when: vega_body_control | bool
+
+    - name: Validate Robotiq transport
+      assert:
+        that: robotiq_transport in ['rs485', 'usb']
+        fail_msg: "Use robotiq_transport=rs485 for arm EE pass-through or robotiq_transport=usb for USB-RS485 adapters."
+      when: gripper_type in ['robotiq', 'robotiq_vega']
 
     # ── Pre-flight checks ────────────────────────────────────────────────────
     - name: Install sshpass on teleop host
@@ -129,8 +136,7 @@
         msg: "Cannot reach {{ dexmate_ip }} — dexmate machine is offline or not connected"
       when: dexmate_ping.rc != 0
 
-    # ── Legacy Robotiq USB-RS485 transport ──────────────────────────────────
-    # Preserve the established USB convention for gripper_type=robotiq.
+    # ── Explicit Robotiq USB-RS485 transport ────────────────────────────────
     - name: Check /dev/ttyUSB* devices on dexmate (legacy Robotiq USB)
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
@@ -139,25 +145,25 @@
         executable: /bin/bash
       register: ttyusb_list
       become: false
-      when: gripper_type == "robotiq"
+      when: gripper_type in ['robotiq', 'robotiq_vega'] and robotiq_transport == 'usb'
 
     - name: Fail if fewer than 2 ttyUSB devices found (legacy Robotiq USB)
       fail:
         msg: "Expected 2 /dev/ttyUSB* devices, found: {{ ttyusb_list.stdout_lines }}"
-      when: gripper_type == "robotiq" and ttyusb_list.stdout_lines | length < 2
+      when: gripper_type in ['robotiq', 'robotiq_vega'] and robotiq_transport == 'usb' and ttyusb_list.stdout_lines | length < 2
 
     - name: Resolve left/right legacy Robotiq USB comports
       set_fact:
         left_gripper_port: "{{ left_gripper_port | default(ttyusb_list.stdout_lines | sort | first) }}"
         right_gripper_port: "{{ right_gripper_port | default(ttyusb_list.stdout_lines | sort | last) }}"
-      when: gripper_type == "robotiq"
+      when: gripper_type in ['robotiq', 'robotiq_vega'] and robotiq_transport == 'usb'
 
     # No local serial port: each server selects its own arm's EE pass-through.
     - name: Use Vega arm EE RS485 pass-through for Robotiq
       set_fact:
         left_gripper_port: ""
         right_gripper_port: ""
-      when: gripper_type == "robotiq_vega"
+      when: gripper_type in ['robotiq', 'robotiq_vega'] and robotiq_transport == 'rs485'
 
     # ── Detect SR EtherCAT ifaces ───────────────────────────────────────────
     # Probe every non-skipped NIC on dexmate, pick the ones whose first slave
@@ -403,7 +409,9 @@
 
     - name: Display gripper port assignments
       debug:
-        msg: "[{{ gripper_type }}] Left: {{ left_gripper_port }} / Right: {{ right_gripper_port }}"
+        msg: >-
+          [{{ gripper_type }}{% if gripper_type in ['robotiq', 'robotiq_vega'] %}, {{ robotiq_transport }}{% endif %}]
+          Left: {{ left_gripper_port }} / Right: {{ right_gripper_port }}
 
     # ── Kill existing sessions ───────────────────────────────────────────────
     - name: Kill existing robot-server tmux session on dexmate
@@ -443,8 +451,7 @@
 
     # ── Start robot gRPC servers ─────────────────────────────────────────────
     # The gripper-port flag differs between gripper types:
-    #   robotiq      -> --robotiq-comport <ttyUSB>
-    #   robotiq_vega -> (none; uses --arm-side EE RS485 pass-through)
+    #   robotiq / robotiq_vega -> no port for rs485; --robotiq-comport for usb
     #   sr_gripper   -> --gripper-iface   <EtherCAT iface>
     #   wuji_hand_v1/v2, vega_hand -> (no port flag; the driver selects by
     #                   handedness/SN)
@@ -452,7 +459,7 @@
       set_fact:
         gripper_port_flag: >-
           {{ '--gripper-iface' if gripper_type == 'sr_gripper'
-             else '--robotiq-comport' if gripper_type == 'robotiq'
+             else '--robotiq-comport' if gripper_type in ['robotiq', 'robotiq_vega'] and robotiq_transport == 'usb'
              else '' }}
         server_gripper_type: >-
           {{ 'robotiq' if gripper_type == 'robotiq_vega' else gripper_type }}
@@ -477,8 +484,8 @@
         tmux new-session -d -s robot-server "bash -ic 'conda activate robot && cd ~/custom_dexcontrol && exec python -m dexcontrol.core.robotenv_vega.body_server \
             --host 0.0.0.0 --left-port 50061 --right-port 50063 --body-port {{ vega_body_port }} \
             --gripper-type robotiq \
-            --left-gripper {{ left_gripper_port | quote }} \
-            --right-gripper {{ right_gripper_port | quote }} \
+            {{ ('--left-gripper ' ~ (left_gripper_port | quote)) if robotiq_transport == 'usb' else '' }} \
+            {{ ('--right-gripper ' ~ (right_gripper_port | quote)) if robotiq_transport == 'usb' else '' }} \
             --action-hz 20 --control-loop-hz 200 \
             --use-velocity-feedforward \
             --interpolation-method linear --interpolation-history 3 \
@@ -498,7 +505,7 @@
             --arm-side left \
             --grpc-port 50061 \
             --gripper-type {{ server_gripper_type }} \
-            {{ gripper_port_flag }} {{ left_gripper_port }} \
+            {{ (gripper_port_flag ~ ' ' ~ (left_gripper_port | quote)) if gripper_port_flag else '' }} \
             {{ left_wuji_sn_flag }} \
             --use-velocity-feedforward \
             --interpolation-method linear \
@@ -517,7 +524,7 @@
             --arm-side right \
             --grpc-port 50063 \
             --gripper-type {{ server_gripper_type }} \
-            {{ gripper_port_flag }} {{ right_gripper_port }} \
+            {{ (gripper_port_flag ~ ' ' ~ (right_gripper_port | quote)) if gripper_port_flag else '' }} \
             {{ right_wuji_sn_flag }} \
             --use-velocity-feedforward \
             --interpolation-method linear \

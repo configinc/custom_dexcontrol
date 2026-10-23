@@ -65,11 +65,19 @@ class VegaHardware:
             self.torso.set_joint_pos_vel(self.torso_command, np.zeros(3), wait_time=0)
         except Exception as exc:
             errors.append(str(exc))
+        # Cancel both arms before waiting for either command lock. Calibration
+        # stages and reset moves release that lock after observing cancellation.
+        for service in self.services:
+            service._cancel_move.set()
+            try:
+                service._cancel_force_calibration_motion()
+            except Exception as exc:
+                errors.append(str(exc))
         for i, service in enumerate(self.services):
             robot = service._robot
             try:
-                service._stop_control_loop()
                 with service._cmd_lock:
+                    service._stop_control_loop()
                     robot.reset_filter_state()
                     q = np.asarray(robot.arm.get_joint_pos(), dtype=float)
                     self.hold_joints[i] = q

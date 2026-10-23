@@ -11,8 +11,12 @@ Use the robot's existing DexControl environment and communication configuration:
 ```bash
 python -m dexcontrol.core.robotenv_vega.body_server \
   --host 0.0.0.0 --left-port 50061 --right-port 50063 --body-port 50065 \
-  --gripper-type robotiq --left-gripper /dev/ttyUSB0 --right-gripper /dev/ttyUSB1
+  --gripper-type robotiq
 ```
+
+Robotiq defaults to each arm's wrist RS485 pass-through, following the existing
+per-arm server convention. For USB-RS485 adapters, add
+`--left-gripper /dev/ttyUSB0 --right-gripper /dev/ttyUSB1` to the command.
 
 This opens real hardware and performs the existing DexControl startup sequence:
 head initialization, gripper opening, and each arm's middle/init pose movement.
@@ -28,8 +32,8 @@ on, linear interpolation with 3 samples, velocity smoothing alpha 1.0, hardware
 correction alpha 0.5, max delta scale 3.0, max jerk 0 (disabled), rotation
 sensitivity 2.0 and velocity ratio 1.0. These are CLI options on body_server.
 The per-arm server's defaults and command calculations remain unchanged.
-The RobotEnv service includes the deployed v3.1.0-wrench-beta-3 force-calibration
-RPCs, wrench observations, and torso/head observation fields.
+This branch is based on `refactor/vega-force-calibration-clean-v2`, preserving
+its force-calibration RPCs, wrench observations, and torso/head observation fields.
 
 RCI must use both managed gRPC endpoints. Its connection code recognizes
 `body_control_required=true` and skips automatic homing. Open RCI's
@@ -56,13 +60,29 @@ checks all three ports. Normal startup still opens the grippers and moves the
 arms through their existing initialization poses. SIGTERM/SIGHUP run stop/hold
 cleanup. The tested arm profile remains 20 Hz input / 200 Hz output.
 
-Gripper type is read from the unit configuration. Serial devices retain the
-existing sorted ttyUSB mapping; for unit 04 this is left `/dev/ttyUSB0`, right
-`/dev/ttyUSB1`. Inventory/extra variables `left_gripper_port` and
-`right_gripper_port` can specify another mapping. `vega_body_port` overrides the
-body port. `vega_body_control=false` selects legacy per-arm servers. SR, Wuji and
-Vega Hand deployments keep their existing per-arm launch path; this release's
-managed Ansible deployment supports Robotiq only.
+Gripper type is read from the unit configuration. Both `robotiq` and
+`robotiq_vega` start the managed server with the same Robotiq driver, using
+`robotiq_transport=rs485` by default. This selects each arm's wrist RS485
+pass-through without probing ttyUSB devices or passing serial-port arguments.
+Use `-e robotiq_transport=usb` for USB-RS485 adapters. USB mode retains the
+existing sorted ttyUSB mapping, with `left_gripper_port` and
+`right_gripper_port` available as overrides. There is no automatic switch
+between transports.
+
+From an updated SDK checkout on the teleop PC, after syncing the code to the
+robot, restart using unit 04's USB mapping with:
+
+```bash
+ansible-playbook -i localhost, -c local ansible/install/restart.yml --ask-become-pass \
+  -e gripper_type=robotiq -e robotiq_transport=usb \
+  -e left_gripper_port=/dev/ttyUSB0 -e right_gripper_port=/dev/ttyUSB1
+```
+
+The same extra variables apply to a full `ansible/install/deploy.yml` deployment.
+`vega_body_port` overrides the body port. `vega_body_control=false` selects
+legacy per-arm servers with the same transport setting. SR, Wuji and Vega Hand
+deployments keep their existing per-arm launch path; this release's managed
+Ansible deployment supports Robotiq only.
 
 Then deploy the matching `robot-control-interface` revision. Its existing web
 process discovers the body endpoint from both arm services. No DS Layout source
@@ -105,6 +125,14 @@ at 10 Hz, only from the window that selected body mode.
 RCI mode transitions are limited to manual teleop: stop policy inference and
 calibration before changing mode. The body feature is not a new policy action
 space and is not included in existing arm training/recording vectors.
+
+Main-page calibration prepares the managed arm command path without requiring
+Oculus tracking, then returns to hold when it finishes or is cancelled. Server
+force-calibration motion is admitted only in arm mode. Stop cancels active
+calibration without a return movement and stops any reset already in progress.
+The wrench server's durable `READY_TO_APPLY` candidate is already motionless and
+remains available for a later commit. Reset/calibration completion cannot restart
+the arm output loop after a body Stop.
 
 The loop schedules against a monotonic deadline rather than adding a fixed
 sleep after each tick. Body targets integrate the actual elapsed time; a new

@@ -46,7 +46,9 @@ def make_hardware():
         arm=ArmComponent([.1]*7)
         robot=SimpleNamespace(arm=arm,_stop_gripper_worker=lambda:None,reset_filter_state=lambda:None)
         h.services.append(SimpleNamespace(_robot=robot, _cmd_lock=threading.RLock(),
-                                          _stop_control_loop=lambda:None))
+                                          _stop_control_loop=lambda:None,
+                                          _cancel_move=threading.Event(),
+                                          _cancel_force_calibration_motion=lambda:None))
     h.command_limits=np.array([.15,.15,.3,.02,.02,.05]);h.wheel_command=np.zeros(2);h.hold()
     return h
 
@@ -82,6 +84,39 @@ def test_stop_confirmation_requires_new_sensor_samples():
     assert not h.stationary()
     for c in h.components():c.stamp+=1
     assert h.stationary()
+
+
+def test_stop_cancels_both_reset_moves_before_waiting_for_arm_commands():
+    h = make_hardware()
+    entered = [threading.Event(), threading.Event()]
+    saw_bilateral_stop = []
+    for service in h.services:
+        service._cancel_move.clear()
+
+    def reset_worker(index):
+        service = h.services[index]
+        with service._cmd_lock:
+            entered[index].set()
+            # A reset can own the arm command lock until cancellation arrives.
+            stopped = all(s._cancel_move.wait(1) for s in h.services)
+            saw_bilateral_stop.append(stopped)
+            service._robot.arm.q[:] = .3 + index * .1
+
+    workers = [threading.Thread(target=reset_worker, args=(i,)) for i in range(2)]
+    for worker in workers:
+        worker.start()
+    try:
+        assert all(event.wait(1) for event in entered)
+        h.hold()
+    finally:
+        for service in h.services:
+            service._cancel_move.set()
+        for worker in workers:
+            worker.join(2)
+    assert saw_bilateral_stop == [True, True]
+    for index, service in enumerate(h.services):
+        np.testing.assert_allclose(h.hold_joints[index], .3 + index * .1)
+        np.testing.assert_array_equal(service._robot.arm.command_velocity, np.zeros(7))
 
 
 def test_release_keeps_target_when_measured_pose_lags_or_drifts():
