@@ -33,7 +33,11 @@ RPCs, wrench observations, and torso/head observation fields.
 
 RCI must use both managed gRPC endpoints. Its connection code recognizes
 `body_control_required=true` and skips automatic homing. Open RCI's
-`/vega-control` page after connecting the arms and internal Oculus controller.
+`/vega-control` page after connecting the arms and internal Oculus controller
+and starting Robot Control on the main RCI page. Only the main page starts or
+stops the control session; Vega Control switches modes within that session.
+Stopping Robot Control sends body Stop as well as stopping arm output. Mode
+and motion requests are rejected while the main control session is stopped.
 The body gRPC endpoint uses the robot IP and port advertised by both arms
 (default 50065). There is no separate endpoint override or server identity
 handshake; connect both arms to the intended robot as with existing RCI control.
