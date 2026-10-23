@@ -481,7 +481,12 @@
     - name: Start managed arm and body server on dexmate
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
-        tmux new-session -d -s robot-server "bash -ic 'conda activate robot && cd ~/custom_dexcontrol && exec python -m dexcontrol.core.robotenv_vega.body_server \
+        set -e
+        mkdir -p ~/.local/state/dexcontrol
+        tmux new-session -d -s robot-server
+        tmux set-option -t robot-server remain-on-exit on
+        tmux pipe-pane -o -t robot-server 'cat >> ~/.local/state/dexcontrol/body_server.log'
+        tmux send-keys -t robot-server "conda activate robot && cd ~/custom_dexcontrol && exec python -u -m dexcontrol.core.robotenv_vega.body_server \
             --host 0.0.0.0 --left-port 50061 --right-port 50063 --body-port {{ vega_body_port }} \
             --gripper-type robotiq \
             {{ ('--left-gripper ' ~ (left_gripper_port | quote)) if robotiq_transport == 'usb' else '' }} \
@@ -490,7 +495,7 @@
             --use-velocity-feedforward \
             --interpolation-method linear --interpolation-history 3 \
             --vel-smoothing-alpha 1.0 --hw-correction-alpha 0.5 \
-            --max-delta-scale 3.0 --max-jerk 0 --rot-sensitivity 2.0 --vel-ratio 1.0'"
+            --max-delta-scale 3.0 --max-jerk 0 --rot-sensitivity 2.0 --vel-ratio 1.0" C-m
         ENDSSH
       args:
         executable: /bin/bash

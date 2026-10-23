@@ -60,6 +60,13 @@ checks all three ports. Normal startup still opens the grippers and moves the
 arms through their existing initialization poses. SIGTERM/SIGHUP run stop/hold
 cleanup. The tested arm profile remains 20 Hz input / 200 Hz output.
 
+Managed-server startup output is retained in the `robot-server` tmux pane and
+`~/.local/state/dexcontrol/body_server.log` on the robot PC, including when
+startup exits before the gRPC ports open. The log is outside the synced checkout
+so a subsequent deployment does not delete it. Inspect it with
+`tail -n 100 ~/.local/state/dexcontrol/body_server.log` or
+`tmux capture-pane -pt robot-server -S -100` when a port readiness check fails.
+
 Gripper type is read from the unit configuration. Both `robotiq` and
 `robotiq_vega` start the managed server with the same Robotiq driver, using
 `robotiq_transport=rs485` by default. This selects each arm's wrist RS485
