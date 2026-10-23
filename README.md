@@ -18,8 +18,9 @@ pip install dexcontrol[example]
 
 ### Robotiq 2F-85 Gripper (optional)
 
-If you want to use a Robotiq 2F-85 gripper connected via USB-RS485, clone this
-repo with submodules and install the gripper package:
+Robotiq 2F-85 grippers use the Vega arm's wrist RS485 pass-through by default.
+USB-RS485 adapters are also supported. Clone this repo with submodules and
+install the gripper package:
 
 ```shell
 # Clone with submodule
@@ -37,9 +38,13 @@ Then start the RobotEnv server with `--gripper-type robotiq`:
 ```shell
 python src/dexcontrol/core/robotenv_vega/server.py \
     --arm-side left \
-    --gripper-type robotiq \
-    --robotiq-comport /dev/ttyUSB0
+    --gripper-type robotiq
 ```
+
+For a USB-RS485 adapter, add `--robotiq-comport /dev/ttyUSB0`.
+The managed arm/body server also defaults to wrist RS485. Its USB options and
+the Ansible `robotiq_transport=usb` setting are documented in
+[Vega arm / body control](docs/vega-body-control.md#deploy-from-data-studio-layout).
 
 Or instantiate `VegaRobot` directly:
 
@@ -49,9 +54,10 @@ from dexcontrol.core.vega.robot import VegaRobot
 robot = VegaRobot(
     arm_side="left",
     gripper_type="robotiq",
-    robotiq_comport="/dev/ttyUSB0",
 )
 ```
+
+Pass `robotiq_comport="/dev/ttyUSB0"` to use a USB-RS485 adapter instead.
 
 ## Trajectory Interpolation & Control Tuning
 

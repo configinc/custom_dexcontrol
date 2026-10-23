@@ -58,8 +58,10 @@ def parse_args(argv=None):
     parser.add_argument("--right-port", type=int, default=50063)
     parser.add_argument("--robot-model", default="vega_1")
     parser.add_argument("--gripper-type", choices=["default", "robotiq"], default="robotiq")
-    parser.add_argument("--left-gripper", default="/dev/ttyUSB0")
-    parser.add_argument("--right-gripper", default="/dev/ttyUSB1")
+    parser.add_argument("--left-gripper", default=None,
+                        help="Left Robotiq USB serial port; omit for arm EE RS485 pass-through")
+    parser.add_argument("--right-gripper", default=None,
+                        help="Right Robotiq USB serial port; omit for arm EE RS485 pass-through")
     parser.add_argument("--action-hz", type=int, default=20)
     # Match the deployed Vega arm launch profile; body timing is independent.
     parser.add_argument("--control-loop-hz", type=int, default=200)

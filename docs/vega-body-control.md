@@ -11,8 +11,11 @@ Use the robot's existing DexControl environment and communication configuration:
 ```bash
 python -m dexcontrol.core.robotenv_vega.body_server \
   --host 0.0.0.0 --left-port 50061 --right-port 50063 --body-port 50065 \
-  --gripper-type robotiq --left-gripper /dev/ttyUSB0 --right-gripper /dev/ttyUSB1
+  --gripper-type robotiq
 ```
+
+Robotiq defaults to each arm's wrist RS485 pass-through. For USB-RS485 adapters,
+add `--left-gripper /dev/ttyUSB0 --right-gripper /dev/ttyUSB1` to the command.
 
 This opens real hardware and performs the existing DexControl startup sequence:
 head initialization, gripper opening, and each arm's middle/init pose movement.
@@ -56,13 +59,29 @@ checks all three ports. Normal startup still opens the grippers and moves the
 arms through their existing initialization poses. SIGTERM/SIGHUP run stop/hold
 cleanup. The tested arm profile remains 20 Hz input / 200 Hz output.
 
-Gripper type is read from the unit configuration. Serial devices retain the
-existing sorted ttyUSB mapping; for unit 04 this is left `/dev/ttyUSB0`, right
-`/dev/ttyUSB1`. Inventory/extra variables `left_gripper_port` and
-`right_gripper_port` can specify another mapping. `vega_body_port` overrides the
-body port. `vega_body_control=false` selects legacy per-arm servers. SR, Wuji and
-Vega Hand deployments keep their existing per-arm launch path; this release's
-managed Ansible deployment supports Robotiq only.
+Gripper type is read from the unit configuration. Both `robotiq` and
+`robotiq_vega` use the Robotiq driver, with `robotiq_transport=rs485` selecting
+each arm's wrist RS485 pass-through by default. No ttyUSB device is required or
+probed in this mode. Use `-e robotiq_transport=usb` for USB-RS485 adapters.
+USB mode retains the existing sorted ttyUSB mapping; inventory/extra variables
+`left_gripper_port` and `right_gripper_port` can specify another mapping.
+There is no automatic switch between transports.
+
+For example, run this from the SDK checkout on a teleop PC with the code already
+synced to the robot. It restarts the server using unit 04's USB mapping:
+
+```bash
+ansible-playbook -i localhost, -c local ansible/install/restart.yml --ask-become-pass \
+  -e gripper_type=robotiq -e robotiq_transport=usb \
+  -e left_gripper_port=/dev/ttyUSB0 -e right_gripper_port=/dev/ttyUSB1
+```
+
+Use the same extra variables with `ansible/install/deploy.yml` for a full
+deployment. Omit `robotiq_transport` and the serial-port variables to use wrist
+RS485. `vega_body_port` overrides the body port. `vega_body_control=false`
+selects legacy per-arm servers and uses the same transport setting. SR, Wuji
+and Vega Hand deployments keep their existing per-arm launch path; this
+release's managed Ansible deployment supports Robotiq only.
 
 Then deploy the matching `robot-control-interface` revision. Its existing web
 process discovers the body endpoint from both arm services. No DS Layout source
