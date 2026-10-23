@@ -25,6 +25,7 @@ from dexcomm.codecs import JointCmdCodec, JointStateCodec
 from jaxtyping import Float
 
 from dexcontrol.core.component import RobotJointComponent
+from dexcontrol.core.chassis_kinematics import bounded_wheel_control
 from dexcontrol.core.subscription_policy import (
     SubscriptionPolicy,
     SubscriptionPolicyMixin,
@@ -204,6 +205,16 @@ class Chassis(SubscriptionPolicyMixin):
         self._max_steering_angle = robot_info.get_component_parameter(
             "chassis", "max_steering_angle"
         )
+        # Respect both the operational configuration and the model's hard limits.
+        limits = np.asarray(robot_info.get_joint_pos_limits(config.steer_joints), dtype=float)
+        self.steering_limits = np.column_stack((
+            np.maximum(limits[:, 0], -self._max_steering_angle),
+            np.minimum(limits[:, 1], self._max_steering_angle),
+        ))
+        if (self.steering_limits.shape != (2, 2)
+                or not np.all(np.isfinite(self.steering_limits))
+                or np.any(self.steering_limits[:, 0] >= self.steering_limits[:, 1])):
+            raise ValueError("Invalid chassis steering limits")
         self._half_wheels_dist = self._wheels_dist / 2
 
         # Pre-compute geometry constants for efficiency
@@ -368,10 +379,10 @@ class Chassis(SubscriptionPolicyMixin):
 
         # Compute steering angles and wheel speeds
         left_steering_angle, left_wheel_speed = self._compute_wheel_control(
-            left_wheel_velocity, current_steering[0]
+            left_wheel_velocity, current_steering[0], self.steering_limits[0]
         )
         right_steering_angle, right_wheel_speed = self._compute_wheel_control(
-            right_wheel_velocity, current_steering[1]
+            right_wheel_velocity, current_steering[1], self.steering_limits[1]
         )
 
         target_steering = np.array([left_steering_angle, right_steering_angle])
@@ -580,6 +591,11 @@ class Chassis(SubscriptionPolicyMixin):
         """
         wait_kwargs = wait_kwargs or {}
 
+        steering_angle = np.broadcast_to(np.asarray(steering_angle, dtype=float), (2,)).copy()
+        wheel_velocity = np.broadcast_to(np.asarray(wheel_velocity, dtype=float), (2,)).copy()
+        if not np.all(np.isfinite([steering_angle, wheel_velocity])) or not np.isfinite(wait_time) or wait_time < 0:
+            raise ValueError("Motion commands must be finite; wait_time must be nonnegative")
+        steering_angle = np.clip(steering_angle, self.steering_limits[:, 0], self.steering_limits[:, 1])
         # Ensure wheel velocities are within limits
         wheel_velocity = np.clip(wheel_velocity, -self.max_lin_vel, self.max_lin_vel)
 
@@ -650,7 +666,7 @@ class Chassis(SubscriptionPolicyMixin):
         rate_limiter = RateLimiter(control_hz)
 
         now_sec = time.monotonic()
-        duration_sec = max(wait_time - 1.0, 0.0)
+        duration_sec = wait_time
         end_time_sec = now_sec + duration_sec
 
         while True:
@@ -674,19 +690,11 @@ class Chassis(SubscriptionPolicyMixin):
             steering_angle: Target steering angles.
             wheel_velocity: Target wheel velocities.
         """
-        if isinstance(steering_angle, float):
-            steering_angle = np.array([steering_angle, steering_angle])
-            self.chassis_steer._send_position_command(steering_angle)
-        elif isinstance(steering_angle, np.ndarray):
-            self.chassis_steer._send_position_command(steering_angle)
-
-        if isinstance(wheel_velocity, float):
-            wheel_velocity = np.array([wheel_velocity, wheel_velocity])
-        elif isinstance(wheel_velocity, np.ndarray):
-            self.chassis_drive._send_velocity_command(wheel_velocity)
+        self.chassis_steer._send_position_command(steering_angle)
+        self.chassis_drive._send_velocity_command(wheel_velocity)
 
     def _compute_wheel_control(
-        self, wheel_velocity: np.ndarray, current_angle: float
+        self, wheel_velocity: np.ndarray, current_angle: float, limits=None
     ) -> tuple[float, float]:
         """Compute steering angle and wheel speed for a given wheel velocity vector.
 
@@ -696,39 +704,12 @@ class Chassis(SubscriptionPolicyMixin):
 
         Returns:
             Tuple of (steering_angle, wheel_speed) where:
-            - steering_angle is in radians, constrained to [-170°, 170°]
+            - steering_angle is in radians, constrained to the configured limits
             - wheel_speed is the magnitude of velocity (can be negative)
         """
-        # Compute speed and direction
-        wheel_speed = float(np.linalg.norm(wheel_velocity))
-
-        # Handle zero velocity case
-        if wheel_speed < self._min_velocity_threshold:
-            return 0.0, 0.0
-
-        # Compute base steering angle
-        base_angle = float(-np.arctan2(wheel_velocity[1], wheel_velocity[0]))
-
-        # Consider both possible solutions
-        sol1 = (base_angle, wheel_speed)
-        sol2 = (
-            base_angle + np.pi if base_angle < 0 else base_angle - np.pi,
-            -wheel_speed,
-        )
-
-        # Choose solution with angle closer to current angle
-        angle1_diff = abs(sol1[0] - current_angle)
-        angle2_diff = abs(sol2[0] - current_angle)
-
-        # Select the better solution
-        steering_angle, wheel_speed = sol1 if angle1_diff < angle2_diff else sol2
-
-        # Ensure steering angle is within bounds
-        steering_angle = float(
-            np.clip(steering_angle, -self._max_steering_angle, self._max_steering_angle)
-        )
-
-        return steering_angle, wheel_speed
+        if limits is None:
+            limits = (-self._max_steering_angle, self._max_steering_angle)
+        return bounded_wheel_control(wheel_velocity, current_angle, limits)
 
     def is_active(self) -> bool:
         """Check if the chassis is active.

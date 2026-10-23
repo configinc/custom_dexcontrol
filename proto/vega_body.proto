@@ -1,0 +1,63 @@
+syntax = "proto3";
+package vega.body.v1;
+
+service BodyControl {
+  rpc GetState (Empty) returns (BodyState);
+  // BODY selects body control; ARMS stops and prepares ARM_READY for reanchoring.
+  rpc SelectMode (SelectModeRequest) returns (BodyState);
+  rpc EnableArms (Empty) returns (BodyState);
+  rpc Command (BodyCommand) returns (BodyState);
+  rpc Stop (Empty) returns (BodyState);
+}
+
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  HOLD = 1;
+  TRANSITION = 2;
+  BODY = 3;
+  ARM_READY = 4;
+  ARMS = 5;
+}
+message Empty {}
+message SelectModeRequest {
+  Mode mode = 1;
+}
+// Body-frame m/s and rad/s. Shoulder pitch is about base +Y, positive forward.
+message Velocity {
+  double base_vx = 1;
+  double base_vy = 2;
+  double base_wz = 3;
+  double shoulder_vx = 4;
+  double shoulder_vz = 5;
+  double pitch_rate = 6;
+}
+message BodyCommand {
+  // Only base_vx/base_vy/base_wz are accepted here. Torso velocity is rejected.
+  Velocity velocity = 1;
+  // Absolute arm_center X/Z/pitch in the base frame (m, m, rad).
+  // Absent means keep the accepted torso target, including while braking base.
+  ShoulderPose shoulder_target = 2;
+}
+message JointRange { double lower = 1; double upper = 2; }
+message ShoulderPose { double x = 1; double z = 2; double pitch = 3; }
+message Limits {
+  repeated JointRange steering = 1;
+  repeated JointRange torso = 2;
+  Velocity command_velocity = 3;
+  repeated double torso_joint_velocity = 4;
+  string shoulder_frame = 5;
+  string reference_frame = 6;
+  double watchdog_seconds = 7;
+}
+message BodyState {
+  Mode mode = 1;
+  string error = 2;
+  Limits limits = 3;
+  repeated double torso = 4;
+  ShoulderPose shoulder = 5;
+  repeated double steering = 6;
+  repeated double wheel_velocity = 7;
+  // Accepted final targets; independent of intermediate commands and feedback.
+  repeated double torso_target = 8;
+  ShoulderPose shoulder_target = 9;
+}

@@ -20,6 +20,11 @@
     # flags. `-e gripper_type=...` still overrides for one-offs; resolution
     # failure is a hard error, never a silent robotiq fallback.
     gripper_type: ""
+    # This release enables the shared arm/body server for Robotiq units.
+    # Other grippers retain their existing per-arm servers. Override with
+    # -e vega_body_control=false for legacy arm-only operation.
+    vega_body_control: "{{ gripper_type == 'robotiq' }}"
+    vega_body_port: 50065
     unit_config_url: "http://data-studio-layout.tailb971f6.ts.net/api/unit_config"
     # Wuji hand serial numbers are PER UNIT, so they are not stored here.
     # Each robot host keeps its own map at ~/.wuji/hands.json, written once by
@@ -95,6 +100,12 @@
       debug:
         msg: "gripper_type = {{ gripper_type }} ({{ gripper_type_source | default('explicit -e override') }})"
 
+    - name: Validate managed body server gripper support
+      assert:
+        that: gripper_type == 'robotiq'
+        fail_msg: "Managed body deployment supports Robotiq. Use vega_body_control=false for other grippers."
+      when: vega_body_control | bool
+
     # ── Pre-flight checks ────────────────────────────────────────────────────
     - name: Install sshpass on teleop host
       apt:
@@ -133,8 +144,8 @@
 
     - name: Resolve left/right Robotiq comports
       set_fact:
-        left_gripper_port: "{{ ttyusb_list.stdout_lines | sort | first }}"
-        right_gripper_port: "{{ ttyusb_list.stdout_lines | sort | last }}"
+        left_gripper_port: "{{ left_gripper_port | default(ttyusb_list.stdout_lines | sort | first) }}"
+        right_gripper_port: "{{ right_gripper_port | default(ttyusb_list.stdout_lines | sort | last) }}"
       when: gripper_type == "robotiq"
 
     # ── Detect SR EtherCAT ifaces ───────────────────────────────────────────
@@ -401,7 +412,7 @@
     - name: Kill leftover robot-server / wuji hand tool processes on dexmate
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
-        pat='[r]obotenv_vega/server\.py|examples/wuji/([i]dentify_hands|[j]oint_diag|[g]love_teleop_bench|[b]ench_test)\.py'
+        pat='[r]obotenv_vega[/\.](body_server|server)(\.py)?([[:space:]]|$)|examples/wuji/([i]dentify_hands|[j]oint_diag|[g]love_teleop_bench|[b]ench_test)\.py'
         if pgrep -f "$pat" > /dev/null; then
           echo "leftover processes:"; pgrep -af "$pat"
           pkill -TERM -f "$pat" || true
@@ -445,6 +456,25 @@
         right_wuji_sn_flag: >-
           {{ ('--wuji-sn ' ~ wuji_right_sn)
              if (gripper_type in ['wuji_hand_v1', 'wuji_hand_v2'] and wuji_right_sn) else '' }}
+
+    - name: Start managed arm and body server on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        tmux new-session -d -s robot-server "bash -ic 'conda activate robot && cd ~/custom_dexcontrol && exec python -m dexcontrol.core.robotenv_vega.body_server \
+            --host 0.0.0.0 --left-port 50061 --right-port 50063 --body-port {{ vega_body_port }} \
+            --gripper-type robotiq \
+            --left-gripper {{ left_gripper_port | quote }} \
+            --right-gripper {{ right_gripper_port | quote }} \
+            --action-hz 20 --control-loop-hz 200 \
+            --use-velocity-feedforward \
+            --interpolation-method linear --interpolation-history 3 \
+            --vel-smoothing-alpha 1.0 --hw-correction-alpha 0.5 \
+            --max-delta-scale 3.0 --max-jerk 0 --rot-sensitivity 2.0 --vel-ratio 1.0'"
+        ENDSSH
+      args:
+        executable: /bin/bash
+      become: false
+      when: vega_body_control | bool
 
     - name: Start robot-server tmux session on dexmate (left + right arm)
       shell: |
@@ -490,6 +520,7 @@
       args:
         executable: /bin/bash
       become: false
+      when: not (vega_body_control | bool)
 
     # ── Health checks ────────────────────────────────────────────────────────
     - name: Wait for left arm server (port 50061)
@@ -516,6 +547,16 @@
       delay: 5
       until: health_right.rc == 0
 
+    - name: Wait for managed body gRPC server
+      wait_for:
+        host: "{{ dexmate_ip }}"
+        port: "{{ vega_body_port }}"
+        timeout: 60
+      become: false
+      when: vega_body_control | bool
+
     - name: Display success
       debug:
-        msg: "Dexmate robot-server is running — left arm (50061) and right arm (50063) are healthy"
+        msg: >-
+          Dexmate robot-server is running: left arm (50061), right arm (50063)
+          {{ ('and body (' ~ vega_body_port ~ ')') if (vega_body_control | bool) else '(legacy arm-only)' }}.

@@ -78,17 +78,27 @@ class RobotiqGripper:
 
     def __init__(
         self,
-        comport: str = "/dev/ttyUSB0",
+        comport: str | None = None,
+        side: str | None = None,
         init_timeout: float = 15.0,
     ) -> None:
         """Connect to the gripper and run full initialisation.
 
         Args:
-            comport: Serial port the gripper is connected to.
+            comport: Local serial port (e.g. /dev/ttyUSB0) for a USB-RS485
+                adapter. Takes precedence over `side` when given.
+            side: Arm side ('left'/'right') whose wrist RS485 pass-through the
+                gripper is plugged into. Used when `comport` is None.
             init_timeout: Seconds to wait for the gripper to become ready.
         """
-        logger.info("Connecting to Robotiq 2F-85 on {} ...", comport)
-        self._gripper = Robotiq2FingerGripper(comport=comport)
+        if comport:
+            logger.info("Connecting to Robotiq 2F-85 on {} ...", comport)
+            self._gripper = Robotiq2FingerGripper(comport=comport)
+        elif side:
+            logger.info("Connecting to Robotiq 2F-85 via {} arm EE RS485 pass-through ...", side)
+            self._gripper = Robotiq2FingerGripper(side=side)
+        else:
+            raise ValueError("RobotiqGripper needs either comport or side")
         self._gripper.full_init(timeout=init_timeout)
 
         # Locks
