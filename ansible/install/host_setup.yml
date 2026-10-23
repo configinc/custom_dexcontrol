@@ -37,6 +37,7 @@
     - name: Install Python dependencies on dexmate
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        set -eo pipefail
         {{ conda_activate }}
         cd ~/custom_dexcontrol
         pip install -e . 2>&1 | tail -5
@@ -48,6 +49,7 @@
     - name: Install Robotiq gripper dependencies on dexmate
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        set -eo pipefail
         {{ conda_activate }}
         pip install pymodbus pyserial
         cd ~/custom_dexcontrol
@@ -60,6 +62,7 @@
     - name: Install SR gripper dependencies on dexmate
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        set -eo pipefail
         {{ conda_activate }}
         pip install pysoem
         cd ~/custom_dexcontrol

@@ -125,6 +125,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         force_calibration_gripper_mass_kg: float = 1.2,
         force_calibration_gripper_com_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.072),
         force_calibration_storage_directory: str | None = None,
+        robot=None,
+        auto_start_control_loop: bool = True,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -151,6 +153,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self.control_hz = int(control_hz)
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
         self.base_frame_rotation = base_frame_rotation
+        self._cmd_lock = threading.RLock()
         self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(
             self.control_hz, rot_sensitivity=rot_sensitivity,
         )
@@ -179,6 +182,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             vel_ratio=vel_ratio,
             vel_damp_thresh=vel_damp_thresh,
             head_init_pos=head_init_pos,
+            robot=robot,
         )
         self._robot.launch_robot()
 
@@ -189,7 +193,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._control_loop_hz = control_loop_hz if control_loop_hz > 0 else 0
         self._control_loop_thread: Optional[threading.Thread] = None
         self._control_loop_stop = threading.Event()
-        if self._robot.interpolation_enabled and self._control_loop_hz > 0:
+        if auto_start_control_loop and self._robot.interpolation_enabled and self._control_loop_hz > 0:
             self._start_control_loop()
             LOGGER.info(
                 "Control loop thread started: %d Hz (input≈%d Hz → control=%d Hz)",
@@ -213,7 +217,6 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
         # Serialize all robot commands — prevents concurrent Reset/Step from
         # sending conflicting position commands to the same arm.
-        self._cmd_lock = threading.Lock()
         # Set by a new Reset to cancel any in-progress _move_incremental loop.
         self._cancel_move = threading.Event()
         # Calibration admission is separate from the production command law.

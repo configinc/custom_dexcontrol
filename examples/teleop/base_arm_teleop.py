@@ -94,18 +94,42 @@ class BaseIKController:
         try:
             self.bot.heartbeat.pause()
 
-            self.motion_manager = MotionManager(
+            self._motion_manager_options = dict(
                 init_visualizer=self.visualize,
-                initial_joint_configuration_dict=joint_pos_dict,
                 local_ik_solver_type=ik_solver_type,
                 custom_local_ik_config=custom_local_ik_config,
                 init_planner=False,
+            )
+            self.motion_manager = MotionManager(
+                initial_joint_configuration_dict=joint_pos_dict,
+                **self._motion_manager_options,
             )
 
             logger.success("Motion Manager setup complete")
         except Exception as e:
             logger.error(f"Error initializing Motion Manager: {e}")
             raise
+
+    def refresh_fixed_torso(self, joint_positions: dict[str, float]) -> None:
+        """Rebuild the reduced arm model at a stopped, measured torso pose.
+
+        Called only by managed body control before arm-mode reanchoring. Torso
+        joints stay locked in the model; they are never IK decision variables.
+        """
+        manager = MotionManager(
+            robot_type=self.motion_manager.robot_type,
+            initial_joint_configuration_dict=joint_positions,
+            **self._motion_manager_options,
+        )
+        expected_arms = {name for side in ("left_arm", "right_arm")
+                         for name in getattr(self.bot, side).joint_name}
+        if set(manager.get_joint_pos_dict()) != expected_arms:
+            raise RuntimeError("Arm IK must contain only the two arms' joints")
+        for name in self.bot.torso.joint_name:
+            if not np.isclose(manager.locked_joints_dict[name], joint_positions[name],
+                              atol=1e-10, rtol=0):
+                raise RuntimeError(f"IK torso lock does not match measured {name}")
+        self.motion_manager = manager
 
     def move_delta_joint_space(
         self, new_joint_pos_dict: dict[str, float]

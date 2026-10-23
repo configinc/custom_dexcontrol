@@ -144,6 +144,7 @@ class VegaRobot:
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
         head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
+        robot=None,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -187,7 +188,8 @@ class VegaRobot:
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
 
         configs = get_robot_config(robot_model)
-        self.robot = _RobotWithCustomHeadPose(
+        self._owns_robot = robot is None
+        self.robot = robot if robot is not None else _RobotWithCustomHeadPose(
             configs=configs,
             head_init_pos=np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None,
         )
@@ -1223,6 +1225,14 @@ class VegaRobot:
         except Exception:
             pass
 
+    def _measured_model_configuration(self, arm_joint_pos):
+        qpos = self.ik_controller.motion_manager.get_joint_pos_dict()
+        # The torso is part of the model's fixed geometry, not its q vector.
+        for name, value in zip(self._arm_joint_names, arm_joint_pos):
+            if name in qpos:
+                qpos[name] = float(value)
+        return qpos
+
     def _solve_cartesian_delta(self, delta_xyz: np.ndarray, delta_rpy: np.ndarray) -> np.ndarray:
         # Gradual correction: use last command + outlier-rejected hw correction as IK start
         hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
@@ -1283,10 +1293,11 @@ class VegaRobot:
 
     def _forward_kinematics(self, joint_positions: np.ndarray) -> np.ndarray:
         motion_manager = self.ik_controller.motion_manager
-        qpos_dict = motion_manager.get_joint_pos_dict()
-        for i, joint_name in enumerate(self._arm_joint_names):
-            if joint_name in qpos_dict:
-                qpos_dict[joint_name] = float(joint_positions[i])
+        qpos_dict = self._measured_model_configuration(joint_positions)
+        torso_model = getattr(self, "body_torso_kinematics", None)
+        frames = list(motion_manager.target_frames)
+        if torso_model is not None:
+            frames.append("arm_center")
 
         if robot_utils is not None:
             qpos = robot_utils.get_qpos_from_joint_dict(motion_manager.pin_robot, qpos_dict)
@@ -1295,7 +1306,7 @@ class VegaRobot:
             qpos = motion_manager.get_joint_pos()
 
         ee_pose_dict = motion_manager.fk(
-            frame_names=motion_manager.target_frames,
+            frame_names=frames,
             qpos=qpos,
             update_robot_state=False,
         )
@@ -1305,6 +1316,16 @@ class VegaRobot:
 
         ee_pose = ee_pose_dict[key]
         pose_mat = ee_pose.np if hasattr(ee_pose, "np") else np.asarray(ee_pose)
+        if torso_model is not None:
+            # Observations remain measured even while body mode moves the torso.
+            # Transform the arm's fixed-model pose through the measured shoulder;
+            # this is FK only and does not change the IK model or send a command.
+            x, z, pitch = torso_model.forward(self.robot.torso.get_joint_pos())
+            measured_shoulder = np.eye(4)
+            measured_shoulder[:3, :3] = R.from_euler("y", pitch).as_matrix()
+            measured_shoulder[:3, 3] = [x, 0., z]
+            fixed_shoulder = ee_pose_dict["arm_center"].np
+            pose_mat = measured_shoulder @ np.linalg.inv(fixed_shoulder) @ pose_mat
         xyz = pose_mat[:3, 3]
         rpy = R.from_matrix(pose_mat[:3, :3]).as_euler("xyz", degrees=False)
         return np.concatenate([xyz, rpy]).astype(np.float64)
@@ -1531,6 +1552,7 @@ class VegaRobot:
             except Exception:
                 pass
         try:
-            self.robot.shutdown()
+            if self._owns_robot:
+                self.robot.shutdown()
         except Exception:
             pass
