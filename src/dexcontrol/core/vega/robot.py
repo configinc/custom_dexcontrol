@@ -19,7 +19,7 @@ from scipy.spatial.transform import Rotation as R
 
 from dexcontrol.utils.trajectory_interpolator import TrajectoryInterpolator
 from dexcontrol.utils.filters import MultiChannelFilter
-from dexcontrol.core.vega.cartesian_target import absolute_target_to_delta
+from .cartesian_target import absolute_target_to_delta
 
 # Ensure local sibling repositories are importable in workspace deployments.
 # robot.py lives at: <repo>/src/dexcontrol/core/vega/robot.py
