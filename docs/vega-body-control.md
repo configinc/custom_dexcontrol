@@ -60,6 +60,10 @@ checks all three ports. Normal startup still opens the grippers and moves the
 arms through their existing initialization poses. SIGTERM/SIGHUP run stop/hold
 cleanup. The tested arm profile remains 20 Hz input / 200 Hz output.
 
+The managed server starts in a Bash login shell to load the robot's
+`ROBOT_NAME` and communication environment. Starting with `bash -ic` alone
+can leave the robot namespace empty and fail hand-type service discovery.
+
 Managed-server startup output is retained in the `robot-server` tmux pane and
 `~/.local/state/dexcontrol/body_server.log` on the robot PC, including when
 startup exits before the gRPC ports open. The log is outside the synced checkout

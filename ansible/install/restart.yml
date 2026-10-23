@@ -483,7 +483,8 @@
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
         set -e
         mkdir -p ~/.local/state/dexcontrol
-        tmux new-session -d -s robot-server
+        # Robot communication settings, including ROBOT_NAME, come from the login profile.
+        tmux new-session -d -s robot-server "bash -il"
         tmux set-option -t robot-server remain-on-exit on
         tmux pipe-pane -o -t robot-server 'cat >> ~/.local/state/dexcontrol/body_server.log'
         tmux send-keys -t robot-server "conda activate robot && cd ~/custom_dexcontrol && exec python -u -m dexcontrol.core.robotenv_vega.body_server \
