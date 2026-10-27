@@ -15,7 +15,7 @@ import grpc
 
 from .server import VegaRobotEnvService, robotenv_pb2, robotenv_pb2_grpc
 from .body_control import BodyControl, ControlConflict
-from .body_hardware import VegaHardware
+from .body_hardware import VegaHardware, keep_state_subscriptions_active
 from .body_grpc import BodyService
 from .force_calibration_lifecycle import ACTIVE_STATES
 from proto import vega_body_pb2_grpc
@@ -136,6 +136,7 @@ def main():
                 **arm_options(args), auto_start_control_loop=False,
                 robot=services[0]._robot.robot if services else None)
             services.append(service)
+        keep_state_subscriptions_active(services[0]._robot.robot)
         control = BodyControl(VegaHardware(services))
         for service, port in zip(services, (args.left_port, args.right_port)):
             service.control = control

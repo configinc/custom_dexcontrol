@@ -27,6 +27,14 @@ SDK Robot. Body control runs at 50 Hz. Each arm uses the original independent
 that arm's command-admission lock; IK does not lock either output loop.
 Ports 50061/50063 must be free before startup.
 
+Before opening the gRPC ports, the managed server keeps torso, head, arm,
+chassis steering/drive, and configured wrist force sensor state subscriptions
+`always_on` and waits for their initial data. State reception continues even
+without observation requests, avoiding idle/resume gaps during concurrent
+arm observations and force calibration. Missing startup data fails explicitly.
+This changes state reception only; motion, Start/Stop, and calibration math
+are unchanged. Camera and auxiliary sensor subscriptions retain their policies.
+
 The default arm profile matches the existing 04 deployment: velocity feedforward
 on, linear interpolation with 3 samples, velocity smoothing alpha 1.0, hardware
 correction alpha 0.5, max delta scale 3.0, max jerk 0 (disabled), rotation

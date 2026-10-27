@@ -4,6 +4,30 @@ from .body_control import BodyControl
 from .torso_kinematics import TorsoKinematics
 
 
+def keep_state_subscriptions_active(robot):
+    """Receive control and calibration state continuously before serving RPCs."""
+    components = {
+        "torso": robot.torso,
+        "head": getattr(robot, "head", None),
+        "chassis_steer": robot.chassis.chassis_steer,
+        "chassis_drive": robot.chassis.chassis_drive,
+    }
+    for side in ("left", "right"):
+        arm = getattr(robot, f"{side}_arm")
+        components[f"{side}_arm"] = arm
+        components[f"{side}_wrench"] = arm.wrench_sensor
+    components = {name: component for name, component in components.items()
+                  if component is not None}
+    # Enable every stream first, so they receive their initial data in parallel.
+    # Do not recursively enable unrelated camera or auxiliary sensor streams.
+    for component in components.values():
+        component.set_subscription_policy("always_on")
+    for name, component in components.items():
+        if not component.wait_for_active():
+            raise RuntimeError(f"No state data received for {name} during startup")
+        component.get_state()
+
+
 class VegaHardware:
     # A 20 ms / 0.004 rad reference can remain inside the torso drive's
     # observed startup deadband. A 100 ms lead starts motion while measured
