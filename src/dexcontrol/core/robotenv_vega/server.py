@@ -675,6 +675,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     description="Hand tactile vector (per-model layout)",
                 )
             )
+        _arm = getattr(self._robot, "arm", None)
+        if getattr(_arm, "temperature_sensor", None) is not None:
+            spec.fields["joint_temperatures"].CopyFrom(
+                robotenv_pb2.FieldSpec(
+                    dtype="float64",
+                    shape=[7],
+                    required=False,
+                    description="Arm motor temperatures in °C (NaN if a joint is missing)",
+                )
+            )
         # Report the auto-detected hand model (wuji_hand_v1 vs wuji_hand_v2) for
         # logging/debug; absent for non-wuji end-effectors.
         _model = getattr(self._robot.hand, "model", None)
@@ -1262,6 +1272,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             observation["hand_tactile"] = robotenv_pb2.Value(
                 float_array=robotenv_pb2.FloatArray(
                     values=[float(v) for v in state_dict["hand_tactile"]]
+                )
+            )
+        # Arm motor temperatures (°C, NaN for a missing joint), present only
+        # when the arm streams them; same additive contract as hand_tactile.
+        if state_dict.get("joint_temperatures") is not None:
+            observation["joint_temperatures"] = robotenv_pb2.Value(
+                float_array=robotenv_pb2.FloatArray(
+                    values=[float(v) for v in state_dict["joint_temperatures"]]
                 )
             )
         for field_name in ("torso_joint_positions", "head_joint_positions"):

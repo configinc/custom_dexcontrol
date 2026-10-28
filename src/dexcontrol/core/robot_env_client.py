@@ -550,6 +550,11 @@ class RobotEnvClient:
             val = obs["hand_tactile"]
             state["hand_tactile"] = val.tolist() if isinstance(val, np.ndarray) else list(val)
 
+        # Arm motor temperatures, only present when the arm streams them.
+        if "joint_temperatures" in obs:
+            val = obs["joint_temperatures"]
+            state["joint_temperatures"] = val.tolist() if isinstance(val, np.ndarray) else list(val)
+
         # Server-owned wrench fields are already frame- and role-qualified.
         # Preserve them verbatim instead of folding them into legacy state.
         for key, val in obs.items():

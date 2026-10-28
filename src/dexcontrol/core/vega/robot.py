@@ -235,6 +235,13 @@ class VegaRobot:
             custom_local_ik_config=custom_ik_cfg,
         )
         self._arm_joint_names = [f"{arm_side[0].upper()}_arm_j{i + 1}" for i in range(7)]
+        # Optional motor temperature stream. AUTO policy would idle-pause it
+        # before the first step and block that step up to 3 s on resume, so
+        # keep it received; missing data is never fatal.
+        self._temperature_sensor = getattr(self.arm, "temperature_sensor", None)
+        if self._temperature_sensor is not None:
+            self._temperature_sensor.set_subscription_policy("always_on")
+        self._joint_temperatures_available: bool | None = None
 
         # Use Vega unfold pose (L_shape) as default reset, same as fold_robot.py unfold.
         self.reset_joints = np.asarray(
@@ -1146,7 +1153,42 @@ class VegaRobot:
         # add this key.
         if hand_tactile is not None:
             state_dict["hand_tactile"] = hand_tactile
+        # Only present when the arm streams motor temperatures; deployments
+        # without the sensor keep the previous state keys.
+        joint_temperatures = self._get_joint_temperatures()
+        if joint_temperatures is not None:
+            state_dict["joint_temperatures"] = joint_temperatures
         return state_dict, timestamp_dict
+
+    def _get_joint_temperatures(self) -> list[float] | None:
+        """Arm temperatures (°C) in ``_arm_joint_names`` order, or None.
+
+        Uses each joint's "motor" source, else its first source, else NaN.
+        Called every step: availability changes are logged once, not per call.
+        """
+        sensor = getattr(self, "_temperature_sensor", None)
+        if sensor is None:
+            return None
+        try:
+            temperatures = sensor.get_temperatures()
+            reason = "empty temperature message"
+        except Exception as exc:  # ServiceUnavailableError before first message
+            temperatures, reason = {}, exc
+        available = bool(temperatures)
+        if available != self._joint_temperatures_available:
+            if available:
+                _logger.info("Arm joint temperatures available")
+            else:
+                _logger.warning("Arm joint temperatures unavailable: %s", reason)
+            self._joint_temperatures_available = available
+        if not available:
+            return None
+        values = []
+        for name in self._arm_joint_names:
+            sources = temperatures.get(name) or {}
+            value = sources.get("motor", next(iter(sources.values()), None))
+            values.append(float(value) if value is not None else float("nan"))
+        return values
 
     def validate_joint_limits(self, target_joint_pos: np.ndarray) -> None:
         limits = self.arm.joint_pos_limit
