@@ -550,6 +550,12 @@ class RobotEnvClient:
             val = obs["hand_tactile"]
             state["hand_tactile"] = val.tolist() if isinstance(val, np.ndarray) else list(val)
 
+        # Server-owned wrench fields are already frame- and role-qualified.
+        # Preserve them verbatim instead of folding them into legacy state.
+        for key, val in obs.items():
+            if key.startswith("external_wrench_"):
+                state[key] = val.tolist() if isinstance(val, np.ndarray) else val
+
         return state
 
     def _parse_observation(self, obs_proto: Dict) -> Dict[str, Any]:
