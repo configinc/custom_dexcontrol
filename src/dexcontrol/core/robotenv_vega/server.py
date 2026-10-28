@@ -676,6 +676,21 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 )
             )
         _arm = getattr(self._robot, "arm", None)
+        # Declared only when the firmware fills the arm state's "cur" field.
+        try:
+            _arm.get_joint_current()
+            _has_currents = True
+        except Exception:
+            _has_currents = False
+        if _has_currents:
+            spec.fields["joint_currents"].CopyFrom(
+                robotenv_pb2.FieldSpec(
+                    dtype="float64",
+                    shape=[7],
+                    required=False,
+                    description="Arm joint motor currents in A",
+                )
+            )
         if getattr(_arm, "temperature_sensor", None) is not None:
             spec.fields["joint_temperatures"].CopyFrom(
                 robotenv_pb2.FieldSpec(
@@ -1274,14 +1289,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     values=[float(v) for v in state_dict["hand_tactile"]]
                 )
             )
-        # Arm motor temperatures (°C, NaN for a missing joint), present only
-        # when the arm streams them; same additive contract as hand_tactile.
-        if state_dict.get("joint_temperatures") is not None:
-            observation["joint_temperatures"] = robotenv_pb2.Value(
-                float_array=robotenv_pb2.FloatArray(
-                    values=[float(v) for v in state_dict["joint_temperatures"]]
+        # Arm motor currents (A) and temperatures (°C, NaN for a missing
+        # joint), present only when the arm reports them; same additive
+        # contract as hand_tactile.
+        for field_name in ("joint_currents", "joint_temperatures"):
+            if state_dict.get(field_name) is not None:
+                observation[field_name] = robotenv_pb2.Value(
+                    float_array=robotenv_pb2.FloatArray(
+                        values=[float(v) for v in state_dict[field_name]]
+                    )
                 )
-            )
         for field_name in ("torso_joint_positions", "head_joint_positions"):
             if field_name in state_dict:
                 observation[field_name] = robotenv_pb2.Value(

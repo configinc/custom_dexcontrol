@@ -1084,6 +1084,13 @@ class VegaRobot:
             joint_torques = np.asarray(self.arm.get_joint_torque(), dtype=np.float64)
         except ValueError:
             joint_torques = np.zeros(7, dtype=np.float64)
+        # Motor currents (A) come from the same arm state message. Unlike
+        # torques, a firmware that omits "cur" leaves the key out instead of
+        # recording zeros that look like real readings.
+        try:
+            joint_currents = np.asarray(self.arm.get_joint_current(), dtype=np.float64).tolist()
+        except ValueError:
+            joint_currents = None
         # End-effector state under the historical key "gripper_position".
         # Scalar gripper → float in [0,1]. Multi-finger hand → the full joint
         # vector (radians), so recorded data preserves all DoF.
@@ -1153,6 +1160,8 @@ class VegaRobot:
         # add this key.
         if hand_tactile is not None:
             state_dict["hand_tactile"] = hand_tactile
+        if joint_currents is not None:
+            state_dict["joint_currents"] = joint_currents
         # Only present when the arm streams motor temperatures; deployments
         # without the sensor keep the previous state keys.
         joint_temperatures = self._get_joint_temperatures()
