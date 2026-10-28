@@ -56,6 +56,10 @@ except ImportError as e:
 # Robotiq 2F-85 stroke in metres
 _STROKE_M = 0.085
 
+# goto() speed for the arm EE RS485 pass-through. USB-RS485 keeps the
+# _enqueue_command default.
+_PASS_THROUGH_VEL = 0.055
+
 # Predefined positions in metres (open = max stroke, close = 0). Kept for
 # the VegaRobot hand interface, which addresses the gripper through
 # symbolic pose names.
@@ -91,11 +95,16 @@ class RobotiqGripper:
                 gripper is plugged into. Used when `comport` is None.
             init_timeout: Seconds to wait for the gripper to become ready.
         """
+        self._vel_override: float | None = None
         if comport:
             logger.info("Connecting to Robotiq 2F-85 on {} ...", comport)
             self._gripper = Robotiq2FingerGripper(comport=comport)
         elif side:
-            logger.info("Connecting to Robotiq 2F-85 via {} arm EE RS485 pass-through ...", side)
+            self._vel_override = _PASS_THROUGH_VEL
+            logger.info(
+                "Connecting to Robotiq 2F-85 via {} arm EE RS485 pass-through (vel={}) ...",
+                side, self._vel_override,
+            )
             self._gripper = Robotiq2FingerGripper(side=side)
         else:
             raise ValueError("RobotiqGripper needs either comport or side")
@@ -154,7 +163,12 @@ class RobotiqGripper:
                 logger.warning("Robotiq worker state refresh error: {}", e)
 
     def _enqueue_command(self, pos_m: float, vel: float = 0.05, force: float = 95) -> None:
-        """Non-blocking enqueue. Drops stale command if queue is full."""
+        """Non-blocking enqueue. Drops stale command if queue is full.
+
+        The EE pass-through always uses _PASS_THROUGH_VEL instead of `vel`.
+        """
+        if self._vel_override is not None:
+            vel = self._vel_override
         cmd = (pos_m, vel, force)
         try:
             self._command_queue.put_nowait(cmd)
