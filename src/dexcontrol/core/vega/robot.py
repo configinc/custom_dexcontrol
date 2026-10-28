@@ -235,6 +235,13 @@ class VegaRobot:
             custom_local_ik_config=custom_ik_cfg,
         )
         self._arm_joint_names = [f"{arm_side[0].upper()}_arm_j{i + 1}" for i in range(7)]
+        # Optional motor temperature stream. AUTO policy would idle-pause it
+        # before the first step and block that step up to 3 s on resume, so
+        # keep it received; missing data is never fatal.
+        self._temperature_sensor = getattr(self.arm, "temperature_sensor", None)
+        if self._temperature_sensor is not None:
+            self._temperature_sensor.set_subscription_policy("always_on")
+        self._joint_temperatures_available: bool | None = None
 
         # Use Vega unfold pose (L_shape) as default reset, same as fold_robot.py unfold.
         self.reset_joints = np.asarray(
@@ -1077,6 +1084,13 @@ class VegaRobot:
             joint_torques = np.asarray(self.arm.get_joint_torque(), dtype=np.float64)
         except ValueError:
             joint_torques = np.zeros(7, dtype=np.float64)
+        # Motor currents (A) come from the same arm state message. Unlike
+        # torques, a firmware that omits "cur" leaves the key out instead of
+        # recording zeros that look like real readings.
+        try:
+            joint_currents = np.asarray(self.arm.get_joint_current(), dtype=np.float64).tolist()
+        except ValueError:
+            joint_currents = None
         # End-effector state under the historical key "gripper_position".
         # Scalar gripper → float in [0,1]. Multi-finger hand → the full joint
         # vector (radians), so recorded data preserves all DoF.
@@ -1146,7 +1160,49 @@ class VegaRobot:
         # add this key.
         if hand_tactile is not None:
             state_dict["hand_tactile"] = hand_tactile
+        if joint_currents is not None:
+            state_dict["joint_currents"] = joint_currents
+        # Only present when the arm streams motor temperatures; deployments
+        # without the sensor keep the previous state keys.
+        joint_temperatures = self._get_joint_temperatures()
+        if joint_temperatures is not None:
+            state_dict["joint_temperatures"] = joint_temperatures
         return state_dict, timestamp_dict
+
+    def _get_joint_temperatures(self) -> list[float] | None:
+        """Arm temperatures (°C) in ``_arm_joint_names`` order, or None.
+
+        The firmware keys joints as "left_arm_j1" while ``_arm_joint_names``
+        uses "L_arm_j1"; both are accepted. Uses each joint's "motor" source,
+        else its first source, else NaN. None only without a sensor; with a
+        sensor but no usable data yet, all seven values are NaN and the next
+        call reads the latest message again. Availability changes are logged
+        once, not per call.
+        """
+        sensor = getattr(self, "_temperature_sensor", None)
+        if sensor is None:
+            return None
+        reason = "empty temperature message"
+        try:
+            temperatures = sensor.get_temperatures()
+        except Exception as exc:  # ServiceUnavailableError before first message
+            temperatures, reason = {}, exc
+        values = []
+        for name in self._arm_joint_names:
+            firmware_key = {"L": "left", "R": "right"}[name[0]] + name[1:]
+            sources = temperatures.get(firmware_key) or temperatures.get(name) or {}
+            value = sources.get("motor", next(iter(sources.values()), None))
+            values.append(float(value) if value is not None else float("nan"))
+        available = not all(np.isnan(values))
+        if not available and temperatures:
+            reason = f"no arm joints in message keys {sorted(temperatures)}"
+        if available != self._joint_temperatures_available:
+            if available:
+                _logger.info("Arm joint temperatures available")
+            else:
+                _logger.warning("Arm joint temperatures unavailable: %s", reason)
+            self._joint_temperatures_available = available
+        return values
 
     def validate_joint_limits(self, target_joint_pos: np.ndarray) -> None:
         limits = self.arm.joint_pos_limit
