@@ -1172,31 +1172,36 @@ class VegaRobot:
     def _get_joint_temperatures(self) -> list[float] | None:
         """Arm temperatures (°C) in ``_arm_joint_names`` order, or None.
 
-        Uses each joint's "motor" source, else its first source, else NaN.
-        Called every step: availability changes are logged once, not per call.
+        The firmware keys joints as "left_arm_j1" while ``_arm_joint_names``
+        uses "L_arm_j1"; both are accepted. Uses each joint's "motor" source,
+        else its first source, else NaN. None only without a sensor; with a
+        sensor but no usable data yet, all seven values are NaN and the next
+        call reads the latest message again. Availability changes are logged
+        once, not per call.
         """
         sensor = getattr(self, "_temperature_sensor", None)
         if sensor is None:
             return None
+        reason = "empty temperature message"
         try:
             temperatures = sensor.get_temperatures()
-            reason = "empty temperature message"
         except Exception as exc:  # ServiceUnavailableError before first message
             temperatures, reason = {}, exc
-        available = bool(temperatures)
+        values = []
+        for name in self._arm_joint_names:
+            firmware_key = {"L": "left", "R": "right"}[name[0]] + name[1:]
+            sources = temperatures.get(firmware_key) or temperatures.get(name) or {}
+            value = sources.get("motor", next(iter(sources.values()), None))
+            values.append(float(value) if value is not None else float("nan"))
+        available = not all(np.isnan(values))
+        if not available and temperatures:
+            reason = f"no arm joints in message keys {sorted(temperatures)}"
         if available != self._joint_temperatures_available:
             if available:
                 _logger.info("Arm joint temperatures available")
             else:
                 _logger.warning("Arm joint temperatures unavailable: %s", reason)
             self._joint_temperatures_available = available
-        if not available:
-            return None
-        values = []
-        for name in self._arm_joint_names:
-            sources = temperatures.get(name) or {}
-            value = sources.get("motor", next(iter(sources.values()), None))
-            values.append(float(value) if value is not None else float("nan"))
         return values
 
     def validate_joint_limits(self, target_joint_pos: np.ndarray) -> None:

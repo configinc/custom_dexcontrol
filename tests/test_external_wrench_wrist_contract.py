@@ -22,6 +22,10 @@ from dexcontrol.core.vega.robot import VegaRobot  # noqa: E402
 from dexcontrol.exceptions import ServiceUnavailableError  # noqa: E402
 
 
+def _no_joint_current():
+    raise ValueError("Joint currents are not available for this component.")
+
+
 def _service() -> VegaRobotEnvService:
     service = VegaRobotEnvService.__new__(VegaRobotEnvService)
     service._shutdown_started = threading.Event()
@@ -90,6 +94,7 @@ def test_observation_exposes_measured_shared_torso_and_head_state() -> None:
         get_joint_pos=lambda: np.zeros(7),
         get_joint_vel=lambda: np.zeros(7),
         get_joint_torque=lambda: np.zeros(7),
+        get_joint_current=_no_joint_current,
         get_timestamp_ns=lambda: 123_000,
         wrench_sensor=None,
     )
@@ -409,6 +414,7 @@ def test_legacy_robot_state_wrench_is_preserved_unchanged() -> None:
         get_joint_pos=lambda: np.zeros(7),
         get_joint_vel=lambda: np.zeros(7),
         get_joint_torque=lambda: np.zeros(7),
+        get_joint_current=_no_joint_current,
         get_timestamp_ns=lambda: 123_456_000,
         wrench_sensor=SimpleNamespace(
             get_wrench_state=lambda: legacy_wrench.copy(),
@@ -617,6 +623,7 @@ def test_sensor_absence_omits_optional_external_wrench() -> None:
         get_joint_pos=lambda: np.zeros(7),
         get_joint_vel=lambda: np.zeros(7),
         get_joint_torque=lambda: np.zeros(7),
+        get_joint_current=_no_joint_current,
         get_timestamp_ns=lambda: 123_456_000,
         wrench_sensor=None,
     )
