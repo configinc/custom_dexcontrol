@@ -199,6 +199,8 @@ class SubscriptionPolicyManager:
 
         # Slow path: only reached when subscriber is likely idle
         with self._lock:
+            if self._policy is not SubscriptionPolicy.AUTO:
+                return
             if self._subscriber.is_paused():
                 self._idle_paused = True
                 return

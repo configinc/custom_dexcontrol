@@ -63,3 +63,16 @@ stub = robotenv_pb2_grpc.RobotEnvStub(channel)
 response = stub.HealthCheck(robotenv_pb2.HealthCheckRequest())
 print(response.status)  # "HEALTHY"
 ```
+
+## Vega BodyControl
+
+`vega_body.proto` defines the separate `vega.body.v1.BodyControl` service for
+managed Vega base/torso control and arm-mode handover. It does not alter the
+existing RobotEnv messages or service. See `docs/vega-body-control.md` for
+endpoint discovery, modes and command deadlines.
+
+Both repositories carry identical `vega_body.proto`, `vega_body_pb2.py` and
+`vega_body_pb2_grpc.py`. Regenerate using `bash proto/compile_proto.sh` from the
+repository root with Python 3.10, grpcio-tools 1.48.2, protobuf 3.20.1 and
+setuptools <81. Preserve these runtime versions for compatibility with other
+RCI robot integrations.

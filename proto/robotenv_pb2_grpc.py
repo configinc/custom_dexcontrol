@@ -45,6 +45,36 @@ class RobotEnvStub(object):
                 request_serializer=robotenv__pb2.GetVersionRequest.SerializeToString,
                 response_deserializer=robotenv__pb2.VersionInfo.FromString,
                 )
+        self.StartForceCalibration = channel.unary_unary(
+                '/robotenv.RobotEnv/StartForceCalibration',
+                request_serializer=robotenv__pb2.StartForceCalibrationRequest.SerializeToString,
+                response_deserializer=robotenv__pb2.ForceCalibrationStatus.FromString,
+                )
+        self.AdvanceForceCalibration = channel.unary_unary(
+                '/robotenv.RobotEnv/AdvanceForceCalibration',
+                request_serializer=robotenv__pb2.AdvanceForceCalibrationRequest.SerializeToString,
+                response_deserializer=robotenv__pb2.ForceCalibrationStatus.FromString,
+                )
+        self.CommitForceCalibration = channel.unary_unary(
+                '/robotenv.RobotEnv/CommitForceCalibration',
+                request_serializer=robotenv__pb2.CommitForceCalibrationRequest.SerializeToString,
+                response_deserializer=robotenv__pb2.ForceCalibrationStatus.FromString,
+                )
+        self.GetForceCalibrationStatus = channel.unary_unary(
+                '/robotenv.RobotEnv/GetForceCalibrationStatus',
+                request_serializer=robotenv__pb2.GetForceCalibrationStatusRequest.SerializeToString,
+                response_deserializer=robotenv__pb2.ForceCalibrationStatus.FromString,
+                )
+        self.CancelForceCalibration = channel.unary_unary(
+                '/robotenv.RobotEnv/CancelForceCalibration',
+                request_serializer=robotenv__pb2.CancelForceCalibrationRequest.SerializeToString,
+                response_deserializer=robotenv__pb2.ForceCalibrationStatus.FromString,
+                )
+        self.GetForceCalibrationResult = channel.unary_unary(
+                '/robotenv.RobotEnv/GetForceCalibrationResult',
+                request_serializer=robotenv__pb2.GetForceCalibrationResultRequest.SerializeToString,
+                response_deserializer=robotenv__pb2.ForceCalibrationResult.FromString,
+                )
 
 
 class RobotEnvServicer(object):
@@ -107,6 +137,60 @@ class RobotEnvServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def StartForceCalibration(self, request, context):
+        """External-wrench calibration is prepared by Start, then released one
+        stage at a time by Advance so a coordinator can keep both arms aligned.
+        Start, Advance, Commit, and Cancel acknowledge quickly; motion/fitting
+        continue in the background and are observed through GetStatus. Status and
+        Cancel must remain serviceable during motion. While a run is non-terminal,
+        Step and Reset are rejected as FAILED_PRECONDITION. After the final stage,
+        each server fits, returns to its start pose, durably stages the candidate,
+        and reports READY_TO_APPLY. RCI commits only after both arms are ready.
+        A server must stop active motion before serving after process restart.
+        Start atomically acquires command ownership only while the robot is
+        quiescent; an in-flight Step or Reset makes Start FAILED_PRECONDITION.
+        A staged READY_TO_APPLY candidate survives restart so Commit can be
+        retried. Calibrated inference is enabled only after both arms report
+        SUCCEEDED and the empty GetResult lookup on both arms returns a committed
+        current result with the same run_id and plan_sha256. Before sending the
+        first Commit, RCI durably records the bilateral COMMIT decision. After
+        that point it never Cancels either participant and retries Commit until
+        both succeed; this closes coordinator-crash and one-sided-delivery races.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AdvanceForceCalibration(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CommitForceCalibration(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetForceCalibrationStatus(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CancelForceCalibration(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetForceCalibrationResult(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_RobotEnvServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -139,6 +223,36 @@ def add_RobotEnvServicer_to_server(servicer, server):
                     servicer.GetVersion,
                     request_deserializer=robotenv__pb2.GetVersionRequest.FromString,
                     response_serializer=robotenv__pb2.VersionInfo.SerializeToString,
+            ),
+            'StartForceCalibration': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartForceCalibration,
+                    request_deserializer=robotenv__pb2.StartForceCalibrationRequest.FromString,
+                    response_serializer=robotenv__pb2.ForceCalibrationStatus.SerializeToString,
+            ),
+            'AdvanceForceCalibration': grpc.unary_unary_rpc_method_handler(
+                    servicer.AdvanceForceCalibration,
+                    request_deserializer=robotenv__pb2.AdvanceForceCalibrationRequest.FromString,
+                    response_serializer=robotenv__pb2.ForceCalibrationStatus.SerializeToString,
+            ),
+            'CommitForceCalibration': grpc.unary_unary_rpc_method_handler(
+                    servicer.CommitForceCalibration,
+                    request_deserializer=robotenv__pb2.CommitForceCalibrationRequest.FromString,
+                    response_serializer=robotenv__pb2.ForceCalibrationStatus.SerializeToString,
+            ),
+            'GetForceCalibrationStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetForceCalibrationStatus,
+                    request_deserializer=robotenv__pb2.GetForceCalibrationStatusRequest.FromString,
+                    response_serializer=robotenv__pb2.ForceCalibrationStatus.SerializeToString,
+            ),
+            'CancelForceCalibration': grpc.unary_unary_rpc_method_handler(
+                    servicer.CancelForceCalibration,
+                    request_deserializer=robotenv__pb2.CancelForceCalibrationRequest.FromString,
+                    response_serializer=robotenv__pb2.ForceCalibrationStatus.SerializeToString,
+            ),
+            'GetForceCalibrationResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetForceCalibrationResult,
+                    request_deserializer=robotenv__pb2.GetForceCalibrationResultRequest.FromString,
+                    response_serializer=robotenv__pb2.ForceCalibrationResult.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -250,5 +364,107 @@ class RobotEnv(object):
         return grpc.experimental.unary_unary(request, target, '/robotenv.RobotEnv/GetVersion',
             robotenv__pb2.GetVersionRequest.SerializeToString,
             robotenv__pb2.VersionInfo.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def StartForceCalibration(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/robotenv.RobotEnv/StartForceCalibration',
+            robotenv__pb2.StartForceCalibrationRequest.SerializeToString,
+            robotenv__pb2.ForceCalibrationStatus.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def AdvanceForceCalibration(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/robotenv.RobotEnv/AdvanceForceCalibration',
+            robotenv__pb2.AdvanceForceCalibrationRequest.SerializeToString,
+            robotenv__pb2.ForceCalibrationStatus.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def CommitForceCalibration(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/robotenv.RobotEnv/CommitForceCalibration',
+            robotenv__pb2.CommitForceCalibrationRequest.SerializeToString,
+            robotenv__pb2.ForceCalibrationStatus.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def GetForceCalibrationStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/robotenv.RobotEnv/GetForceCalibrationStatus',
+            robotenv__pb2.GetForceCalibrationStatusRequest.SerializeToString,
+            robotenv__pb2.ForceCalibrationStatus.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def CancelForceCalibration(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/robotenv.RobotEnv/CancelForceCalibration',
+            robotenv__pb2.CancelForceCalibrationRequest.SerializeToString,
+            robotenv__pb2.ForceCalibrationStatus.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def GetForceCalibrationResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/robotenv.RobotEnv/GetForceCalibrationResult',
+            robotenv__pb2.GetForceCalibrationResultRequest.SerializeToString,
+            robotenv__pb2.ForceCalibrationResult.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)

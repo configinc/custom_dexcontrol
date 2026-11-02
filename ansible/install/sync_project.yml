@@ -47,6 +47,7 @@
         use_ssh_args: yes
         rsync_opts:
           - "--exclude=.git/"
+          - "--exclude=.git"
           - "--exclude=__pycache__/"
           - "--exclude=*.pyc"
           - "--exclude=.vscode/"
@@ -55,7 +56,6 @@
           - "--delete-excluded"
       delegate_to: localhost
       become: false
-      ignore_errors: true
 
     - name: Set proper permissions for shell scripts
       shell: |
@@ -95,6 +95,7 @@
       shell: |
         sshpass -p '{{ dexmate_pass }}' rsync -az --delete \
           --exclude='.git/' \
+          --exclude='.git' \
           --exclude='__pycache__/' \
           --exclude='*.pyc' \
           --exclude='.vscode/' \

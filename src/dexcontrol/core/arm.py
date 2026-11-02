@@ -841,6 +841,14 @@ class ArmWrenchSensor(RobotComponent):
         state = super().get_state()
         return np.array(state["wrench"], dtype=np.float32)
 
+    def get_wrench_sample(self) -> tuple[Float[np.ndarray, "6"], int]:
+        """Return one wrench and its source timestamp from the same message."""
+        state = super().get_state()
+        timestamp_ns = state.get("timestamp_ns")
+        if isinstance(timestamp_ns, bool) or not isinstance(timestamp_ns, int):
+            raise ServiceUnavailableError("Wrench sensor timestamp is unavailable")
+        return np.array(state["wrench"], dtype=np.float32), timestamp_ns
+
     def get_button_state(self) -> dict[str, bool]:
         """Get the state of the wrench sensor buttons.
 

@@ -30,7 +30,7 @@ class TemperatureSensor(RobotComponent):
     Data format::
 
         {
-            "L_arm_j1": {"motor": 35.0},
+            "left_arm_j1": {"motor": 35.0},
             "head_j1": {"motor": 30.0, "driver": 32.0},
             "torso_j1": {"motor": 27.0, "driver": 30.0},
         }
@@ -60,7 +60,7 @@ class TemperatureSensor(RobotComponent):
             Example::
 
                 {
-                    "L_arm_j1": {"motor": 35.0},
+                    "left_arm_j1": {"motor": 35.0},
                     "head_j1": {"motor": 30.0, "driver": 32.0},
                 }
 

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "plan_id": "vega-robotiq-wrist-ft-v1",
+  "stages": [
+    {"stage_id": "prepare", "arms": {"left": {"kind": "prepare", "start_joints": [-1.07108, 0.7818, 2.48133, -1.04941, 0.62852, -1.03786, -0.27219]}, "right": {"kind": "prepare", "start_joints": [1.07108, -0.7818, -2.48133, -1.04941, -0.62852, 1.03786, 0.27219]}}},
+    {"stage_id": "pose-0", "arms": {"left": {"kind": "pose", "rpy_degrees": [-30.0, 0.0, -0.0]}, "right": {"kind": "pose", "rpy_degrees": [30.0, 0.0, 0.0]}}},
+    {"stage_id": "pose-1", "arms": {"left": {"kind": "pose", "rpy_degrees": [45.0, 0.0, -0.0]}, "right": {"kind": "pose", "rpy_degrees": [-45.0, 0.0, 0.0]}}},
+    {"stage_id": "pose-2", "arms": {"left": {"kind": "pose", "rpy_degrees": [-0.0, -45.0, -0.0]}, "right": {"kind": "pose", "rpy_degrees": [0.0, -45.0, 0.0]}}},
+    {"stage_id": "pose-3", "arms": {"left": {"kind": "pose", "rpy_degrees": [32.0, -32.0, -0.0]}, "right": {"kind": "pose", "rpy_degrees": [-32.0, -32.0, 0.0]}}},
+    {"stage_id": "pose-4", "arms": {"left": {"kind": "pose", "rpy_degrees": [-32.0, -32.0, -0.0]}, "right": {"kind": "pose", "rpy_degrees": [32.0, -32.0, 0.0]}}},
+    {"stage_id": "pose-5", "arms": {"left": {"kind": "pose", "rpy_degrees": [25.0, 12.0, -0.0]}, "right": {"kind": "pose", "rpy_degrees": [-25.0, 12.0, 0.0]}}},
+    {"stage_id": "pose-6", "arms": {"left": {"kind": "pose", "rpy_degrees": [-0.0, -60.0, -0.0]}, "right": {"kind": "pose", "rpy_degrees": [0.0, -60.0, 0.0]}}},
+    {"stage_id": "pose-7", "arms": {"left": {"kind": "pose", "rpy_degrees": [60.0, 0.0, -0.0]}, "right": {"kind": "pose", "rpy_degrees": [-60.0, 0.0, 0.0]}}},
+    {"stage_id": "pose-8", "arms": {"left": {"kind": "pose", "rpy_degrees": [-0.0, 60.0, -0.0]}, "right": {"kind": "pose", "rpy_degrees": [0.0, 60.0, 0.0]}}},
+    {"stage_id": "pose-9", "arms": {"left": {"kind": "pose", "rpy_degrees": [-60.0, 0.0, -0.0]}, "right": {"kind": "pose", "rpy_degrees": [60.0, 0.0, 0.0]}}}
+  ]
+}

@@ -14,7 +14,7 @@ Phase 2 (continuous):  run a looping pick-place-like cycle automatically.
 Usage:
   # Server must be running with --gripper-type robotiq, e.g.:
   #   python src/dexcontrol/core/robotenv_vega/server.py \
-  #       --arm-side left --gripper-type robotiq --robotiq-comport /dev/ttyUSB0
+  #       --arm-side left --gripper-type robotiq
 
   python examples/test_robotiq_with_arm.py
   python examples/test_robotiq_with_arm.py --port 50062 --hz 20 --delta-m 0.03

@@ -7,7 +7,7 @@ position at each step so you can verify the gripper moves correctly.
 Usage:
   # Server must be running with --gripper-type robotiq, e.g.:
   #   python src/dexcontrol/core/robotenv_vega/server.py \
-  #       --arm-side left --gripper-type robotiq --robotiq-comport /dev/ttyUSB0
+  #       --arm-side left --gripper-type robotiq
 
   python examples/test_robotiq_gripper.py
   python examples/test_robotiq_gripper.py --port 50062 --steps 30

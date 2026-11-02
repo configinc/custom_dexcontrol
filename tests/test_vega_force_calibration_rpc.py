@@ -1,0 +1,324 @@
+from __future__ import annotations
+
+import json
+import sys
+import threading
+import time
+from types import ModuleType
+
+import grpc
+
+# Keep this RPC test independently collectible without the optional hidapi stack.
+_base_arm_teleop = ModuleType("base_arm_teleop")
+_base_arm_teleop.BaseIKController = object
+sys.modules.setdefault("base_arm_teleop", _base_arm_teleop)
+
+from dexcontrol.core.robotenv_vega.force_calibration_lifecycle import (  # noqa: E402
+    CalibrationStatusSnapshot,
+    LifecycleError,
+)
+from dexcontrol.core.robotenv_vega.server import VegaRobotEnvService  # noqa: E402
+from proto import robotenv_pb2  # noqa: E402
+
+
+class Context:
+    def __init__(self) -> None:
+        self.code = None
+        self.details = ""
+
+    def set_code(self, code):
+        self.code = code
+
+    def set_details(self, details):
+        self.details = details
+
+
+def _status(state="READY_FOR_STAGE"):
+    return CalibrationStatusSnapshot(
+        state=state,
+        run_id="run-1",
+        current_stage_index=0,
+        completed_stages=0,
+        total_stages=2,
+        message="ready",
+        arm_name="left",
+        plan_id="plan",
+        plan_sha256="a" * 64,
+        stage_id="stage-0",
+        server_instance_id="server",
+        cache_reused=False,
+        command_deadline_timestamp_us=123,
+    )
+
+
+class Manager:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def start(self, run_id, force, fit_inputs=None, normal_reset_joints=None):
+        self.calls.append(
+            ("start", run_id, force, fit_inputs, normal_reset_joints)
+        )
+        return _status()
+
+    def advance(self, run_id, index, stage_id):
+        self.calls.append(("advance", run_id, index, stage_id))
+        return _status("MOVING")
+
+    def commit(self, run_id, digest):
+        self.calls.append(("commit", run_id, digest))
+        return _status("SUCCEEDED")
+
+    def status(self, run_id):
+        self.calls.append(("status", run_id))
+        return _status()
+
+    def request_cancel(self, run_id, *, safe_return=True):
+        self.calls.append(("cancel", run_id, safe_return))
+        return _status("CANCELLING")
+
+    def result(self, run_id):
+        self.calls.append(("result", run_id))
+        return {
+            "available": True,
+            "calibrated_at_timestamp_us": 10,
+            "expires_at_timestamp_us": 20,
+            "calibration_kind": "vega_wrist_ft_v1",
+            "parameters": {"schema_version": 5},
+            "quality": {"passed": True},
+            "message": "",
+            "run_id": "run-1",
+            "schema_version": 1,
+            "reference_point_id": "sensor-origin",
+            "arm_name": "left",
+            "plan_id": "plan",
+            "plan_sha256": "a" * 64,
+            "server_instance_id": "server",
+            "source_run_id": "run-1",
+            "was_committed": True,
+        }
+
+
+def _service(manager=None):
+    service = VegaRobotEnvService.__new__(VegaRobotEnvService)
+    service._force_calibration_manager = manager or Manager()
+    service._shutdown_started = threading.Event()
+    return service
+
+
+def test_rpc_methods_forward_exact_contract_fields() -> None:
+    manager = Manager()
+    service = _service(manager)
+    context = Context()
+
+    started = service.StartForceCalibration(
+        robotenv_pb2.StartForceCalibrationRequest(
+            run_id="run-1",
+            force_recalibrate=True,
+            gripper_mass_kg=1.2,
+            gripper_com_sensor_m=[0.01, 0.02, 0.03],
+            normal_reset_joint_positions_rad=[1, 2, 3, 4, 5, 6, 7],
+        ),
+        context,
+    )
+    moved = service.AdvanceForceCalibration(
+        robotenv_pb2.AdvanceForceCalibrationRequest(
+            run_id="run-1", stage_index=0, stage_id="stage-0"
+        ),
+        context,
+    )
+    assert started.state == robotenv_pb2.FORCE_CALIBRATION_STATE_READY_FOR_STAGE
+    assert started.plan_sha256 == "a" * 64
+    assert moved.state == robotenv_pb2.FORCE_CALIBRATION_STATE_MOVING
+    assert manager.calls[0][:3] == ("start", "run-1", True)
+    assert manager.calls[0][3].gripper_mass_kg == 1.2
+    assert manager.calls[0][3].gripper_com_sensor_m == (0.01, 0.02, 0.03)
+    assert manager.calls[0][4].values == (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0)
+    assert manager.calls[1] == ("advance", "run-1", 0, "stage-0")
+
+
+def test_result_serializes_inspectable_json() -> None:
+    response = _service().GetForceCalibrationResult(
+        robotenv_pb2.GetForceCalibrationResultRequest(run_id="run-1"), Context()
+    )
+    assert response.available is True
+    assert json.loads(response.parameters_json) == {"schema_version": 5}
+    assert json.loads(response.quality_json) == {"passed": True}
+    assert response.was_committed is True
+
+
+def test_lifecycle_error_maps_to_grpc_status() -> None:
+    class RejectingManager(Manager):
+        def start(self, run_id, force, fit_inputs=None, normal_reset_joints=None):
+            raise LifecycleError("FAILED_PRECONDITION", "busy")
+
+    context = Context()
+    response = _service(RejectingManager()).StartForceCalibration(
+        robotenv_pb2.StartForceCalibrationRequest(
+            run_id="run-2",
+            gripper_mass_kg=1.2,
+            gripper_com_sensor_m=[0.01, 0.02, 0.03],
+        ),
+        context,
+    )
+    assert response == robotenv_pb2.ForceCalibrationStatus()
+    assert context.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert context.details == "busy"
+
+
+def test_start_rejects_invalid_normal_reset_joint_target_before_manager() -> None:
+    manager = Manager()
+    context = Context()
+    response = _service(manager).StartForceCalibration(
+        robotenv_pb2.StartForceCalibrationRequest(
+            run_id="run-2",
+            gripper_mass_kg=1.2,
+            gripper_com_sensor_m=[0.01, 0.02, 0.03],
+            normal_reset_joint_positions_rad=[1.0] * 6,
+        ),
+        context,
+    )
+    assert response == robotenv_pb2.ForceCalibrationStatus()
+    assert context.code == grpc.StatusCode.INVALID_ARGUMENT
+    assert "seven finite values" in context.details
+    assert manager.calls == []
+
+
+def test_empty_cancel_is_not_found_without_touching_manager() -> None:
+    manager = Manager()
+    context = Context()
+    response = _service(manager).CancelForceCalibration(
+        robotenv_pb2.CancelForceCalibrationRequest(), context
+    )
+    assert response == robotenv_pb2.ForceCalibrationStatus()
+    assert context.code == grpc.StatusCode.NOT_FOUND
+    assert manager.calls == []
+
+
+def test_calibration_claim_isolated_from_normal_command_implementation() -> None:
+    service = _service()
+    service._cmd_lock = threading.Lock()
+    service._force_calibration_admission_lock = threading.Lock()
+    service._force_calibration_owns_robot = threading.Event()
+    service._cancel_move = threading.Event()
+    service._cancel_move.set()
+    service._control_loop_thread = None
+
+    assert service._claim_robot_for_force_calibration() is True
+    assert service._force_calibration_owns_robot.is_set()
+    assert not service._cancel_move.is_set()
+    assert service._claim_robot_for_force_calibration() is False
+
+    service._release_robot_from_force_calibration()
+    assert not service._force_calibration_owns_robot.is_set()
+    assert service._cmd_lock.acquire(blocking=False)
+    service._cmd_lock.release()
+
+
+def test_step_and_reset_fail_busy_only_while_calibration_owns_robot() -> None:
+    service = _service()
+    service._force_calibration_owns_robot = threading.Event()
+    service._force_calibration_owns_robot.set()
+
+    step_context = Context()
+    step = service.Step(robotenv_pb2.StepRequest(), step_context)
+    assert step.status == "BUSY"
+    assert step_context.code == grpc.StatusCode.FAILED_PRECONDITION
+
+    reset_context = Context()
+    reset = service.Reset(robotenv_pb2.ResetRequest(), reset_context)
+    assert reset.status == "BUSY"
+    assert reset_context.code == grpc.StatusCode.FAILED_PRECONDITION
+
+    service._create_observation = lambda: ({}, 123)
+    current_context = Context()
+    current = service.Reset(
+        robotenv_pb2.ResetRequest(mode="current"), current_context
+    )
+    assert current.status == "SUCCESS"
+    assert current.timestamp_us == 123
+    assert current_context.code is None
+
+
+def test_reset_current_is_read_only_outside_calibration() -> None:
+    service = _service()
+    service._force_calibration_owns_robot = threading.Event()
+    service._cancel_move = threading.Event()
+    service._control_loop_thread = type("RunningThread", (), {"is_alive": lambda self: True})()
+    service._stop_control_loop = lambda: (_ for _ in ()).throw(
+        AssertionError("current observation must not stop the control loop")
+    )
+    service._start_control_loop = lambda: (_ for _ in ()).throw(
+        AssertionError("current observation must not restart the control loop")
+    )
+    service._cmd_lock = None
+    service._create_observation = lambda: ({}, 456)
+
+    context = Context()
+    response = service.Reset(robotenv_pb2.ResetRequest(mode="current"), context)
+
+    assert response.status == "SUCCESS"
+    assert response.timestamp_us == 456
+    assert context.code is None
+    assert not service._cancel_move.is_set()
+
+
+def test_reset_skip_intermediate_pose_is_forwarded_only_when_requested() -> None:
+    service = _service()
+    service.arm_side = "left"
+    service.reset_joints = [0.0] * 7
+    service._force_calibration_owns_robot = threading.Event()
+    service._cancel_move = threading.Event()
+    service._control_loop_thread = None
+    service._cmd_lock = threading.Lock()
+    calls = []
+    service._execute_reset_sequence = lambda target, **kwargs: calls.append(
+        bool(kwargs.get("skip_intermediate_pose", False))
+    )
+    service._create_observation = lambda: ({"ok": robotenv_pb2.Value(int_value=1)}, 123)
+
+    direct = service.Reset(
+        robotenv_pb2.ResetRequest(
+            mode="home",
+            params={"skip_intermediate_pose": robotenv_pb2.Value(int_value=1)},
+        ),
+        Context(),
+    )
+    default = service.Reset(robotenv_pb2.ResetRequest(mode="home"), Context())
+
+    assert direct.status == "SUCCESS"
+    assert default.status == "SUCCESS"
+    assert calls == [True, False]
+
+
+def test_reset_losing_claim_race_does_not_cancel_calibration_motion() -> None:
+    service = _service()
+    service.arm_side = "left"
+    service._cmd_lock = threading.Lock()
+    service._cmd_lock.acquire()
+    service._force_calibration_owns_robot = threading.Event()
+    service._cancel_move = threading.Event()
+    service._control_loop_thread = None
+    context = Context()
+    response = []
+
+    worker = threading.Thread(
+        target=lambda: response.append(
+            service.Reset(robotenv_pb2.ResetRequest(mode="home"), context)
+        ),
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + 1.0
+    while not service._cancel_move.is_set() and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert service._cancel_move.is_set()
+
+    service._force_calibration_owns_robot.set()
+    service._cmd_lock.release()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert response[0].status == "BUSY"
+    assert context.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert not service._cancel_move.is_set()

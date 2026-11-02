@@ -127,7 +127,7 @@ class VegaRobot:
         gripper_type: str = "default",
         ik_solver_type: str = "pink",
         use_velocity_feedforward: bool = False,
-        robotiq_comport: str = "/dev/ttyUSB0",
+        robotiq_comport: str | None = None,
         wuji_sn: str | None = None,
         wuji_effort_limit: float | None = None,
         ema_alpha: float = 0.0,
@@ -144,6 +144,7 @@ class VegaRobot:
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
         head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
+        robot=None,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -187,7 +188,8 @@ class VegaRobot:
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
 
         configs = get_robot_config(robot_model)
-        self.robot = _RobotWithCustomHeadPose(
+        self._owns_robot = robot is None
+        self.robot = robot if robot is not None else _RobotWithCustomHeadPose(
             configs=configs,
             head_init_pos=np.asarray(head_init_pos, dtype=np.float32) if head_init_pos is not None else None,
         )
@@ -196,10 +198,12 @@ class VegaRobot:
 
         if gripper_type == "robotiq":
             from dexcontrol.core.robotiq_gripper import RobotiqGripper  # lazy import
-            self.hand = RobotiqGripper(comport=self._robotiq_comport)
+            # No comport -> gripper sits on this arm's wrist RS485 pass-through.
+            self.hand = RobotiqGripper(comport=self._robotiq_comport, side=arm_side)
         elif gripper_type == "sr_gripper":
             from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
-            self.hand = SrGripperAdapter(comport=self._robotiq_comport)
+            sr_kwargs = {"comport": self._robotiq_comport} if self._robotiq_comport else {}
+            self.hand = SrGripperAdapter(**sr_kwargs)
         elif gripper_type in ("wuji_hand_v1", "wuji_hand_v2"):
             from dexcontrol.core.wuji_hand import WujiHandAdapter  # lazy import
             if wuji_effort_limit is None:
@@ -231,6 +235,13 @@ class VegaRobot:
             custom_local_ik_config=custom_ik_cfg,
         )
         self._arm_joint_names = [f"{arm_side[0].upper()}_arm_j{i + 1}" for i in range(7)]
+        # Optional motor temperature stream. AUTO policy would idle-pause it
+        # before the first step and block that step up to 3 s on resume, so
+        # keep it received; missing data is never fatal.
+        self._temperature_sensor = getattr(self.arm, "temperature_sensor", None)
+        if self._temperature_sensor is not None:
+            self._temperature_sensor.set_subscription_policy("always_on")
+        self._joint_temperatures_available: bool | None = None
 
         # Use Vega unfold pose (L_shape) as default reset, same as fold_robot.py unfold.
         self.reset_joints = np.asarray(
@@ -1073,6 +1084,13 @@ class VegaRobot:
             joint_torques = np.asarray(self.arm.get_joint_torque(), dtype=np.float64)
         except ValueError:
             joint_torques = np.zeros(7, dtype=np.float64)
+        # Motor currents (A) come from the same arm state message. Unlike
+        # torques, a firmware that omits "cur" leaves the key out instead of
+        # recording zeros that look like real readings.
+        try:
+            joint_currents = np.asarray(self.arm.get_joint_current(), dtype=np.float64).tolist()
+        except ValueError:
+            joint_currents = None
         # End-effector state under the historical key "gripper_position".
         # Scalar gripper → float in [0,1]. Multi-finger hand → the full joint
         # vector (radians), so recorded data preserves all DoF.
@@ -1129,11 +1147,62 @@ class VegaRobot:
             "prev_command_successful": bool(self._prev_command_successful),
             "prev_gripper_command_successful": bool(self._prev_gripper_command_successful),
         }
+        for field_name, component_name in (
+            ("torso_joint_positions", "torso"),
+            ("head_joint_positions", "head"),
+        ):
+            component = getattr(getattr(self, "robot", None), component_name, None)
+            if component is not None:
+                values = np.asarray(component.get_joint_pos(), dtype=np.float64)
+                if values.shape == (3,) and np.isfinite(values).all():
+                    state_dict[field_name] = values
         # Only present for hands with a tactile stream; scalar grippers never
         # add this key.
         if hand_tactile is not None:
             state_dict["hand_tactile"] = hand_tactile
+        if joint_currents is not None:
+            state_dict["joint_currents"] = joint_currents
+        # Only present when the arm streams motor temperatures; deployments
+        # without the sensor keep the previous state keys.
+        joint_temperatures = self._get_joint_temperatures()
+        if joint_temperatures is not None:
+            state_dict["joint_temperatures"] = joint_temperatures
         return state_dict, timestamp_dict
+
+    def _get_joint_temperatures(self) -> list[float] | None:
+        """Arm temperatures (°C) in ``_arm_joint_names`` order, or None.
+
+        The firmware keys joints as "left_arm_j1" while ``_arm_joint_names``
+        uses "L_arm_j1"; both are accepted. Uses each joint's "motor" source,
+        else its first source, else NaN. None only without a sensor; with a
+        sensor but no usable data yet, all seven values are NaN and the next
+        call reads the latest message again. Availability changes are logged
+        once, not per call.
+        """
+        sensor = getattr(self, "_temperature_sensor", None)
+        if sensor is None:
+            return None
+        reason = "empty temperature message"
+        try:
+            temperatures = sensor.get_temperatures()
+        except Exception as exc:  # ServiceUnavailableError before first message
+            temperatures, reason = {}, exc
+        values = []
+        for name in self._arm_joint_names:
+            firmware_key = {"L": "left", "R": "right"}[name[0]] + name[1:]
+            sources = temperatures.get(firmware_key) or temperatures.get(name) or {}
+            value = sources.get("motor", next(iter(sources.values()), None))
+            values.append(float(value) if value is not None else float("nan"))
+        available = not all(np.isnan(values))
+        if not available and temperatures:
+            reason = f"no arm joints in message keys {sorted(temperatures)}"
+        if available != self._joint_temperatures_available:
+            if available:
+                _logger.info("Arm joint temperatures available")
+            else:
+                _logger.warning("Arm joint temperatures unavailable: %s", reason)
+            self._joint_temperatures_available = available
+        return values
 
     def validate_joint_limits(self, target_joint_pos: np.ndarray) -> None:
         limits = self.arm.joint_pos_limit
@@ -1212,6 +1281,14 @@ class VegaRobot:
         except Exception:
             pass
 
+    def _measured_model_configuration(self, arm_joint_pos):
+        qpos = self.ik_controller.motion_manager.get_joint_pos_dict()
+        # The torso is part of the model's fixed geometry, not its q vector.
+        for name, value in zip(self._arm_joint_names, arm_joint_pos):
+            if name in qpos:
+                qpos[name] = float(value)
+        return qpos
+
     def _solve_cartesian_delta(self, delta_xyz: np.ndarray, delta_rpy: np.ndarray) -> np.ndarray:
         # Gradual correction: use last command + outlier-rejected hw correction as IK start
         hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
@@ -1272,10 +1349,11 @@ class VegaRobot:
 
     def _forward_kinematics(self, joint_positions: np.ndarray) -> np.ndarray:
         motion_manager = self.ik_controller.motion_manager
-        qpos_dict = motion_manager.get_joint_pos_dict()
-        for i, joint_name in enumerate(self._arm_joint_names):
-            if joint_name in qpos_dict:
-                qpos_dict[joint_name] = float(joint_positions[i])
+        qpos_dict = self._measured_model_configuration(joint_positions)
+        torso_model = getattr(self, "body_torso_kinematics", None)
+        frames = list(motion_manager.target_frames)
+        if torso_model is not None:
+            frames.append("arm_center")
 
         if robot_utils is not None:
             qpos = robot_utils.get_qpos_from_joint_dict(motion_manager.pin_robot, qpos_dict)
@@ -1284,7 +1362,7 @@ class VegaRobot:
             qpos = motion_manager.get_joint_pos()
 
         ee_pose_dict = motion_manager.fk(
-            frame_names=motion_manager.target_frames,
+            frame_names=frames,
             qpos=qpos,
             update_robot_state=False,
         )
@@ -1294,6 +1372,16 @@ class VegaRobot:
 
         ee_pose = ee_pose_dict[key]
         pose_mat = ee_pose.np if hasattr(ee_pose, "np") else np.asarray(ee_pose)
+        if torso_model is not None:
+            # Observations remain measured even while body mode moves the torso.
+            # Transform the arm's fixed-model pose through the measured shoulder;
+            # this is FK only and does not change the IK model or send a command.
+            x, z, pitch = torso_model.forward(self.robot.torso.get_joint_pos())
+            measured_shoulder = np.eye(4)
+            measured_shoulder[:3, :3] = R.from_euler("y", pitch).as_matrix()
+            measured_shoulder[:3, 3] = [x, 0., z]
+            fixed_shoulder = ee_pose_dict["arm_center"].np
+            pose_mat = measured_shoulder @ np.linalg.inv(fixed_shoulder) @ pose_mat
         xyz = pose_mat[:3, 3]
         rpy = R.from_matrix(pose_mat[:3, :3]).as_euler("xyz", degrees=False)
         return np.concatenate([xyz, rpy]).astype(np.float64)
@@ -1520,6 +1608,7 @@ class VegaRobot:
             except Exception:
                 pass
         try:
-            self.robot.shutdown()
+            if self._owns_robot:
+                self.robot.shutdown()
         except Exception:
             pass
