@@ -101,18 +101,26 @@ def parse_args(argv=None):
     parser.add_argument("--max-jerk", type=float, default=0.0)
     parser.add_argument("--rot-sensitivity", type=float, default=2.0)
     parser.add_argument("--vel-ratio", type=float, default=1.0)
+    parser.add_argument("--head-init-pos", type=float, nargs=3, default=None,
+                        metavar=("J1", "J2", "J3"),
+                        help="Head joint init position in rad before torso-pitch "
+                             "compensation. Omit to keep the server default "
+                             "(2.0, 0.0, -0.3), tilted down for the top-mounted USB camera.")
     return parser.parse_args(argv)
 
 
 def arm_options(args):
-    return dict(control_hz=args.action_hz, control_loop_hz=args.control_loop_hz,
-                use_velocity_feedforward=args.use_velocity_feedforward,
-                interpolation_method=args.interpolation_method,
-                interpolation_history=args.interpolation_history,
-                vel_smoothing_alpha=args.vel_smoothing_alpha,
-                hw_correction_alpha=args.hw_correction_alpha,
-                max_delta_scale=args.max_delta_scale, max_jerk=args.max_jerk,
-                rot_sensitivity=args.rot_sensitivity, vel_ratio=args.vel_ratio)
+    options = dict(control_hz=args.action_hz, control_loop_hz=args.control_loop_hz,
+                   use_velocity_feedforward=args.use_velocity_feedforward,
+                   interpolation_method=args.interpolation_method,
+                   interpolation_history=args.interpolation_history,
+                   vel_smoothing_alpha=args.vel_smoothing_alpha,
+                   hw_correction_alpha=args.hw_correction_alpha,
+                   max_delta_scale=args.max_delta_scale, max_jerk=args.max_jerk,
+                   rot_sensitivity=args.rot_sensitivity, vel_ratio=args.vel_ratio)
+    if args.head_init_pos is not None:
+        options["head_init_pos"] = tuple(args.head_init_pos)
+    return options
 
 
 def main():
