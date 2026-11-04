@@ -261,9 +261,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         else:
             LOGGER.info("Smoothing: disabled (alpha=0.0)")
 
-        # Move to init position on startup.
-        LOGGER.info("Moving to init position on startup (arm=%s)", arm_side)
-        self._execute_reset_sequence(self.reset_joints)
+        # Connection and observations do not imply an initial-pose motion.
 
         # Fetch and cache robot firmware version once at startup.
         self._firmware_version = self._fetch_firmware_version()
@@ -924,6 +922,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 )
             self._cancel_move.clear()
             try:
+                if self.gripper_type == "robotiq":
+                    self._robot.hand.initialize(self._cancel_move, lambda operation: operation())
                 if mode == "home":
                     target_joints = self.reset_joints
                     self._execute_reset_sequence(
@@ -1581,9 +1581,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         else:
             actual = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
             max_err = float(np.max(np.abs(target - actual)))
-            LOGGER.warning(
-                "Reset move timed out after %.1fs (max_err=%.4f rad, tol=%.4f)",
-                t_max, max_err, tol,
+            raise TimeoutError(
+                f"Reset move timed out after {t_max:.1f}s (max_err={max_err:.4f} rad, tol={tol:.4f})"
             )
 
     def _extract_target_joints(self, request) -> np.ndarray:

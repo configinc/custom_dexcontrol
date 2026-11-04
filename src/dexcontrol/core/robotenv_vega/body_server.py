@@ -5,73 +5,139 @@ python -m dexcontrol.core.robotenv_vega.body_server --help
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import logging
 import signal
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import grpc
 
-from .server import VegaRobotEnvService, robotenv_pb2, robotenv_pb2_grpc
-from .body_control import BodyControl, ControlConflict
-from .body_hardware import VegaHardware, keep_state_subscriptions_active
-from .body_grpc import BodyService
-from .force_calibration_lifecycle import ACTIVE_STATES
 from proto import vega_body_pb2_grpc
+
+from ..control.config import load_config
+from .body_control import ControlConflict
+from .body_grpc import BodyService
+from .body_hardware import keep_state_subscriptions_active
+from .control_node import VegaControlNode
+from .managed_hardware import ManagedVegaHardware
+from .server import VegaRobotEnvService, robotenv_pb2, robotenv_pb2_grpc
 
 LOG = logging.getLogger(__name__)
 
 
 class ManagedArm(VegaRobotEnvService):
     control = None
+    _calibration_direct_reset = False
+
+    @contextmanager
+    def calibration_reset(self):
+        # Drain an in-flight calibration interpolation tick before direct joint
+        # commands begin. The other arm keeps its own interpolation running.
+        with self.control.gate.lock:
+            self._calibration_direct_reset = True
+            self._robot.reset_filter_state()
+        try:
+            yield
+        finally:
+            with self.control.gate.lock:
+                self._robot.reset_filter_state()
+                self._calibration_direct_reset = False
 
     def _start_control_loop(self):
-        # A reset/calibration finally block must not restart output after Stop.
-        with self._cmd_lock:
-            if self.control is None or self.control.mode == "arms":
-                super()._start_control_loop()
+        # All managed output is scheduled by VegaControlNode.
+        return
 
     def _claim_robot_for_force_calibration(self):
-        # Calibration uses the arm command path, so it must not compete with
-        # body-mode holds. Before control is assigned, the parent constructor
-        # may restore a motionless calibration candidate for a later commit.
-        if not self._cmd_lock.acquire(blocking=False):
-            return False
-        try:
-            if self.control is not None and self.control.mode != "arms":
-                return False
+        if self.control is None:
             return super()._claim_robot_for_force_calibration()
-        finally:
-            self._cmd_lock.release()
+        try:
+            # Keep the node lock through admission: Stop must see the fully
+            # attached participant and its cancellation event.
+            with self.control.lock:
+                action = self.control.claim_calibration(self)
+                if action is None:
+                    return False
+                acquired = super()._claim_robot_for_force_calibration()
+                if acquired:
+                    self._force_calibration_manager.action = action
+                else:
+                    action.finish(cancelled=True)
+                return acquired
+        except ControlConflict:
+            return False
+
+    def _release_robot_from_force_calibration(self):
+        super()._release_robot_from_force_calibration()
+        manager = getattr(self, "_force_calibration_manager", None)
+        if manager is not None and manager.action is not None:
+            status = manager.lifecycle.status()
+            manager.action.finish(
+                error=status.message if status.state == "FAILED" else None,
+                cancelled=status.state == "CANCELLED",
+            )
 
     def _cancel_force_calibration_motion(self):
-        manager = self._force_calibration_manager
-        status = manager.status()
-        # Preserve the wrench branch's durable, already motionless candidate.
-        if status.state in ACTIVE_STATES and status.state != "READY_TO_APPLY":
-            manager.request_cancel(status.run_id, safe_return=False)
+        # Signal the stage immediately. Lifecycle cancellation may need the
+        # manager lock, so it must not block the control/output thread.
+        if not self._force_calibration_owns_robot.is_set():
+            return
+        self._force_calibration_manager.interrupt_motion()
 
     def Step(self, request, context):
         with self._cmd_lock:
             try:
-                self.control.accept_arm(self.arm_side)
+                with self.control.arm_input(self.arm_side):
+                    return super().Step(request, context)
             except ControlConflict as exc:
                 context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
-            return super().Step(request, context)
 
     def Reset(self, request, context):
-        with self._cmd_lock:
-            if request.mode != "current":
-                try:
-                    self.control.accept_arm(self.arm_side)
-                except ControlConflict as exc:
-                    context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+        if request.mode == "current":
             return super().Reset(request, context)
+        mode = request.mode or "home"
+        try:
+            if mode == "home":
+                target = self.reset_joints
+            elif mode == "target":
+                target = self._extract_target_joints(request)
+            elif mode == "random":
+                target = self._sample_random_target()
+            else:
+                raise ValueError(f"Unknown reset mode: {mode}")
+            skip = bool(request.params["skip_intermediate_pose"].int_value) if "skip_intermediate_pose" in request.params else False
+            def move(cancelled):
+                self._cancel_move.clear()
+                self.control.hardware.initialize_gripper(self, cancelled)
+                with self._cmd_lock:
+                    self._execute_reset_sequence(target, cancelled=cancelled,
+                        interruptible_gripper=True, skip_intermediate_pose=skip)
+            self.control.start_action(f"initial_pose_{self.arm_side}", move)
+            worker = self.control.actions.worker
+            while worker.is_alive():
+                worker.join(.05)
+                if not context.is_active():
+                    self.control.stop()
+            # Finish the action before accepting another arm's Reset.
+            self.control.finish_action()
+            status = self.control.actions.snapshot()
+            if status["state"] != "succeeded":
+                raise RuntimeError(status["error"] or f"Action {status['state']}")
+            observation, timestamp = self._create_observation()
+            return robotenv_pb2.ResetResponse(observation=observation, status="SUCCESS",
+                message=f"Reset to {mode}", timestamp_us=timestamp)
+        except ControlConflict as exc:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+        except ValueError as exc:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+        except Exception as exc:
+            context.abort(grpc.StatusCode.INTERNAL, str(exc))
 
     def GetConfig(self, request, context):
         result = super().GetConfig(request, context)
         result.metadata["body_control_required"] = "true"
+        result.metadata["body_control_lifecycle"] = "true"
         result.metadata["body_control_port"] = str(self.body_port)
         return result
 
@@ -79,6 +145,7 @@ class ManagedArm(VegaRobotEnvService):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--control-config", default=None)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--body-port", type=int, default=50065)
     parser.add_argument("--left-port", type=int, default=50061)
@@ -101,7 +168,10 @@ def parse_args(argv=None):
     parser.add_argument("--max-jerk", type=float, default=0.0)
     parser.add_argument("--rot-sensitivity", type=float, default=2.0)
     parser.add_argument("--vel-ratio", type=float, default=1.0)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.control_loop_hz <= 0 or args.action_hz <= 0:
+        parser.error("Managed input and output frequencies must be positive")
+    return args
 
 
 def arm_options(args):
@@ -118,6 +188,7 @@ def arm_options(args):
 def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
+    config = load_config(args.control_config)
 
     def shutdown(signum, frame):
         raise KeyboardInterrupt
@@ -137,7 +208,7 @@ def main():
                 robot=services[0]._robot.robot if services else None)
             services.append(service)
         keep_state_subscriptions_active(services[0]._robot.robot)
-        control = BodyControl(VegaHardware(services))
+        control = VegaControlNode(ManagedVegaHardware(services, config), config)
         for service, port in zip(services, (args.left_port, args.right_port)):
             service.control = control
             service.body_port = args.body_port
@@ -161,7 +232,7 @@ def main():
                     control.tick()
                 except Exception:
                     LOG.exception("Control stopped after fault")
-                    # Retry holding, never motion. A new explicit mode is required.
+                    # Fault remains latched until an explicit reset and start.
                 next_tick += control.PERIOD
                 now = time.monotonic()
                 next_tick = max(next_tick, now)
@@ -182,6 +253,8 @@ def main():
         try:
             if control:
                 control.stop()
+                control.actions.join()
+                control.close()
         finally:
             for service in reversed(services):
                 service._force_calibration_manager.shutdown()

@@ -1,0 +1,13 @@
+{
+  "source_commit": "45196f6558fe8ba9d89bc8a105396c68c3e7e892",
+  "driver_angle_rad": [
+    0.0,
+    0.8
+  ],
+  "step_rad": 0.001,
+  "envelope_padding_m": {
+    "base": 1e-07,
+    "left": 0.00010088989989974973,
+    "right": 0.00010088989989974973
+  }
+}

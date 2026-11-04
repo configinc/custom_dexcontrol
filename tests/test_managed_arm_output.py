@@ -8,16 +8,15 @@ from types import SimpleNamespace
 import pytest
 import grpc
 
-pytest.importorskip('dexmotion')
 ROOT = Path(__file__).parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'src'), str(ROOT / 'src/dexcontrol')]
-from core.robotenv_vega.body_server import ManagedArm, arm_options, parse_args
-from core.robotenv_vega.server import VegaRobotEnvService
-from core.robotenv_vega.body_control import BodyControl
+from dexcontrol.core.robotenv_vega.body_server import ManagedArm
+from dexcontrol.core.robotenv_vega.server import VegaRobotEnvService
+from dexcontrol.core.robotenv_vega.control_node import VegaControlNode
+from test_control_runtime import Hardware, arm_mode
 from dexcontrol.core.robotenv_vega.vega_force_calibration import VegaForceCalibrationManager
 from proto import robotenv_pb2
 from test_vega_force_calibration_manager import FakeAdapter, _lifecycle, _wait_state
-from test_body_hardware import make_hardware
 
 
 def service(control):
@@ -32,13 +31,14 @@ def service(control):
     arm._force_calibration_admission_lock = threading.Lock()
     arm._force_calibration_owns_robot = threading.Event()
     arm.sent = []
-    arm._robot = SimpleNamespace(execute_interpolated_tick=lambda: arm.sent.append(time.monotonic()))
+    arm._robot = SimpleNamespace(execute_interpolated_tick=lambda **kwargs: arm.sent.append(time.monotonic()))
     return arm
 
 
 def test_slow_arm_step_does_not_block_either_output_loop(monkeypatch):
-    control = BodyControl.__new__(BodyControl)
-    control.mode = 'arms'
+    hardware = Hardware()
+    control = VegaControlNode(hardware, hardware.config)
+    arm_mode(control)
     left, right = service(control), service(control)
     right.arm_side = 'right'
     entered, release, right_done = threading.Event(), threading.Event(), threading.Event()
@@ -50,7 +50,13 @@ def test_slow_arm_step_does_not_block_either_output_loop(monkeypatch):
             right_done.set()
         return SimpleNamespace(status='SUCCESS')
     monkeypatch.setattr(VegaRobotEnvService, 'Step', step)
-    left._start_control_loop();right._start_control_loop()
+    stop_tick = threading.Event()
+    hardware.arm_tick = lambda: [arm._robot.execute_interpolated_tick(raise_errors=True) for arm in (left, right)]
+    def tick():
+        while not stop_tick.wait(.005):
+            control.tick()
+    output = threading.Thread(target=tick)
+    output.start()
     blocked = threading.Thread(target=left.Step, args=(None, None))
     other = threading.Thread(target=right.Step, args=(None, None))
     try:
@@ -64,12 +70,14 @@ def test_slow_arm_step_does_not_block_either_output_loop(monkeypatch):
         assert len(right.sent) > counts[1] + 5
     finally:
         release.set();blocked.join(2);other.join(2)
-        left._stop_control_loop();right._stop_control_loop()
+        stop_tick.set();output.join(2)
+        control.stop()
 
 
 def test_arm_step_failure_retains_original_response(monkeypatch):
-    control = BodyControl.__new__(BodyControl)
-    control.mode = 'arms'
+    hardware = Hardware()
+    control = VegaControlNode(hardware, hardware.config)
+    arm_mode(control)
     arm = service(control)
     failure = SimpleNamespace(status='IK_FAILED', message='Unreachable target')
     monkeypatch.setattr(VegaRobotEnvService, 'Step', lambda *args: failure)
@@ -89,7 +97,12 @@ class CalibrationContext:
 
 
 def calibration_service(tmp_path, mode='arms'):
-    arm = service(None if mode is None else SimpleNamespace(mode=mode))
+    hardware = Hardware()
+    control = None if mode is None else VegaControlNode(hardware, hardware.config)
+    if control is not None:
+        control.start()
+        control.mode = mode
+    arm = service(control)
     adapter = FakeAdapter()
     manager = VegaForceCalibrationManager(
         lifecycle=_lifecycle(tmp_path),
@@ -180,66 +193,3 @@ def test_stop_preserves_completed_calibration_for_bilateral_commit(tmp_path):
         assert adapter.safe_returns == 0
     finally:
         manager.shutdown()
-
-
-def test_stop_drains_reset_restart_before_stopping_arm_output(monkeypatch):
-    arm = service(SimpleNamespace(mode='arms'))
-    hardware = make_hardware()
-    arm._robot = hardware.services[0]._robot
-    arm._robot.execute_interpolated_tick = lambda: arm.sent.append(time.monotonic())
-    arm._cancel_force_calibration_motion = lambda: None
-    arm._cancel_move.clear()
-    hardware.services[0] = arm
-    admitted, finish_reset, draining = threading.Event(), threading.Event(), threading.Event()
-
-    class ObservedLock:
-        def __init__(self):
-            self.lock = threading.RLock()
-
-        def __enter__(self):
-            if threading.current_thread().name == 'holding':
-                draining.set()
-            self.lock.acquire()
-            return self
-
-        def __exit__(self, *args):
-            self.lock.release()
-
-    arm._cmd_lock = ObservedLock()
-    start = VegaRobotEnvService._start_control_loop
-
-    def delayed_start(service):
-        # Pause after ManagedArm accepted ARMS but before the thread starts.
-        admitted.set()
-        finish_reset.wait(1)
-        start(service)
-
-    monkeypatch.setattr(VegaRobotEnvService, '_start_control_loop', delayed_start)
-
-    def reset_worker():
-        with arm._cmd_lock:
-            # The original Reset and calibration adapters restart in finally.
-            arm._start_control_loop()
-
-    worker = threading.Thread(target=reset_worker)
-    holder = threading.Thread(target=hardware.hold, name='holding')
-    try:
-        worker.start()
-        assert admitted.wait(1)
-        arm.control.mode = 'hold'
-        holder.start()
-        assert draining.wait(1)
-        finish_reset.set()
-        worker.join(1)
-        holder.join(1)
-        assert not worker.is_alive()
-        assert not holder.is_alive()
-        count = len(arm.sent)
-        time.sleep(.03)
-        assert len(arm.sent) == count
-    finally:
-        finish_reset.set()
-        worker.join(1)
-        if holder.ident is not None:
-            holder.join(1)
-        arm._stop_control_loop()

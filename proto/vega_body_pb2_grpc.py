@@ -39,6 +39,26 @@ class BodyControlStub(object):
                 request_serializer=vega__body__pb2.Empty.SerializeToString,
                 response_deserializer=vega__body__pb2.BodyState.FromString,
                 )
+        self.Halt = channel.unary_unary(
+                '/vega.body.v1.BodyControl/Halt',
+                request_serializer=vega__body__pb2.Empty.SerializeToString,
+                response_deserializer=vega__body__pb2.BodyState.FromString,
+                )
+        self.Start = channel.unary_unary(
+                '/vega.body.v1.BodyControl/Start',
+                request_serializer=vega__body__pb2.Empty.SerializeToString,
+                response_deserializer=vega__body__pb2.BodyState.FromString,
+                )
+        self.ResetFault = channel.unary_unary(
+                '/vega.body.v1.BodyControl/ResetFault',
+                request_serializer=vega__body__pb2.Empty.SerializeToString,
+                response_deserializer=vega__body__pb2.BodyState.FromString,
+                )
+        self.StartAction = channel.unary_unary(
+                '/vega.body.v1.BodyControl/StartAction',
+                request_serializer=vega__body__pb2.ActionRequest.SerializeToString,
+                response_deserializer=vega__body__pb2.BodyState.FromString,
+                )
 
 
 class BodyControlServicer(object):
@@ -75,6 +95,31 @@ class BodyControlServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Halt(self, request, context):
+        """Cancel motion without disabling control (for grip release / mode handover).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Start(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ResetFault(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StartAction(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_BodyControlServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -101,6 +146,26 @@ def add_BodyControlServicer_to_server(servicer, server):
             'Stop': grpc.unary_unary_rpc_method_handler(
                     servicer.Stop,
                     request_deserializer=vega__body__pb2.Empty.FromString,
+                    response_serializer=vega__body__pb2.BodyState.SerializeToString,
+            ),
+            'Halt': grpc.unary_unary_rpc_method_handler(
+                    servicer.Halt,
+                    request_deserializer=vega__body__pb2.Empty.FromString,
+                    response_serializer=vega__body__pb2.BodyState.SerializeToString,
+            ),
+            'Start': grpc.unary_unary_rpc_method_handler(
+                    servicer.Start,
+                    request_deserializer=vega__body__pb2.Empty.FromString,
+                    response_serializer=vega__body__pb2.BodyState.SerializeToString,
+            ),
+            'ResetFault': grpc.unary_unary_rpc_method_handler(
+                    servicer.ResetFault,
+                    request_deserializer=vega__body__pb2.Empty.FromString,
+                    response_serializer=vega__body__pb2.BodyState.SerializeToString,
+            ),
+            'StartAction': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartAction,
+                    request_deserializer=vega__body__pb2.ActionRequest.FromString,
                     response_serializer=vega__body__pb2.BodyState.SerializeToString,
             ),
     }
@@ -194,6 +259,74 @@ class BodyControl(object):
             metadata=None):
         return grpc.experimental.unary_unary(request, target, '/vega.body.v1.BodyControl/Stop',
             vega__body__pb2.Empty.SerializeToString,
+            vega__body__pb2.BodyState.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def Halt(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/vega.body.v1.BodyControl/Halt',
+            vega__body__pb2.Empty.SerializeToString,
+            vega__body__pb2.BodyState.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def Start(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/vega.body.v1.BodyControl/Start',
+            vega__body__pb2.Empty.SerializeToString,
+            vega__body__pb2.BodyState.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def ResetFault(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/vega.body.v1.BodyControl/ResetFault',
+            vega__body__pb2.Empty.SerializeToString,
+            vega__body__pb2.BodyState.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def StartAction(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/vega.body.v1.BodyControl/StartAction',
+            vega__body__pb2.ActionRequest.SerializeToString,
             vega__body__pb2.BodyState.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)

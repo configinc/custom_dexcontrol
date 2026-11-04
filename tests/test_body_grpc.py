@@ -125,3 +125,64 @@ def test_absolute_goal_round_trip_and_rejection(connection):
         assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
         assert stub.GetState(pb.Empty(),timeout=1).shoulder_target == command.shoulder_target
         assert not control.command.any()
+
+
+@pytest.mark.parametrize("clearance", [None, 0.0, -0.001])
+def test_collision_diagnostics_preserve_unavailable_and_zero_clearance(connection, clearance):
+    stub, control, hardware = connection
+    snapshot = hardware.snapshot
+    hardware.snapshot = lambda: dict(snapshot(), collision={
+        "state": "blocked", "blocked": True, "reason": "Target reduces clearance",
+        "clearance_m": clearance, "pair": ["base", "L_robotiq"],
+        "result_age_s": None, "check_ms": 1.5,
+    })
+    state = stub.GetState(pb.Empty(), timeout=1)
+    assert state.collision.blocked
+    assert state.collision.reason == "Target reduces clearance"
+    assert list(state.collision.pair) == ["base", "L_robotiq"]
+    assert state.collision.HasField("clearance_m") == (clearance is not None)
+    if clearance is not None:
+        assert state.collision.clearance_m == clearance
+    assert not state.collision.HasField("result_age_s")
+
+
+@pytest.mark.parametrize("margin", [None, 0.0, -0.001])
+def test_static_stability_diagnostics_over_grpc(connection, margin):
+    stub, control, hardware = connection
+    snapshot = hardware.snapshot
+    hardware.snapshot = lambda: dict(snapshot(), stability={
+        "state": "blocked", "blocked": True, "reason": "Target reduces support clearance",
+        "margin_m": margin, "target_margin_m": None, "com_m": [0.2, 0.0, 0.5],
+        "mass_kg": 143.3, "required_margin_m": 0.02, "result_age_s": None, "check_ms": 1.8,
+    })
+    state = stub.GetState(pb.Empty(), timeout=1).stability
+    assert state.blocked
+    assert state.HasField("margin_m") == (margin is not None)
+    if margin is not None:
+        assert state.margin_m == margin
+    assert list(state.com_m) == [0.2, 0.0, 0.5]
+    assert state.mass_kg == 143.3 and state.required_margin_m == 0.02
+    assert not state.HasField("target_margin_m")
+    assert not state.HasField("result_age_s")
+
+
+def test_torque_diagnostics_preserve_candidate_and_final_output(connection):
+    stub, control, hardware = connection
+    snapshot = hardware.snapshot
+    arm = dict(
+        component="left_arm", joint_names=[f"left_j{i}" for i in range(1, 8)],
+        current_a=[5.0] * 7, estimated_torque_nm=[21.275] * 7,
+        torque_limit_nm=[20.0] * 7, requested_position_rad=[0.5] * 7,
+        candidate_position_rad=[0.499] * 7, candidate_offset_rad=[-0.001] * 7,
+        output_position_rad=[0.0] * 7, over_limit=[True] * 7,
+    )
+    hardware.snapshot = lambda: dict(
+        snapshot(), arm_torque={"state": "model_hold", "arms": [arm]}
+    )
+    state = stub.GetState(pb.Empty(), timeout=1).arm_torque
+    assert state.state == "model_hold"
+    output = state.arms[0]
+    assert output.component == "left_arm"
+    for name, values in arm.items():
+        if name != "component":
+            assert list(getattr(output, name)) == values

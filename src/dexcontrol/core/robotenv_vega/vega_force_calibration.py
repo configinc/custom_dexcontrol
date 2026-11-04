@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from math import ceil, isfinite
@@ -527,7 +528,7 @@ class VegaRobotCalibrationAdapter:
         set_phase: Callable[[str, str], None],
     ) -> WristFtCalibrationHold | None:
         kind = payload.get("kind")
-        with self.service._cmd_lock:
+        with self._command_context(), self.service._cmd_lock:
             if kind == "prepare":
                 set_phase("MOVING", "moving to calibration start")
                 self._prepare(payload, cancelled)
@@ -546,12 +547,18 @@ class VegaRobotCalibrationAdapter:
         )
         if was_running:
             self.service._stop_control_loop()
+        reset_context = (
+            nullcontext()
+            if getattr(self.service, "control", None) is None
+            else self.service.calibration_reset()
+        )
         try:
-            self.service._execute_reset_sequence(
-                target,
-                cancelled=cancelled,
-                interruptible_gripper=True,
-            )
+            with reset_context:
+                self.service._execute_reset_sequence(
+                    target,
+                    cancelled=cancelled,
+                    interruptible_gripper=True,
+                )
         finally:
             if was_running:
                 self.service._start_control_loop()
@@ -560,7 +567,7 @@ class VegaRobotCalibrationAdapter:
         if self._start_joints is None:
             return
         safe_cancel = threading.Event() if cancelled is None else cancelled
-        with self.service._cmd_lock:
+        with self._command_context(), self.service._cmd_lock:
             target = self._validated_reset_target(self._start_joints)
             self._execute_reset(target, safe_cancel)
             self._verify_joint_return(target)
@@ -572,10 +579,16 @@ class VegaRobotCalibrationAdapter:
         if configured_target is None:
             configured_target = np.asarray(self.service.reset_joints, dtype=np.float64)
         target = self._validated_reset_target(configured_target)
-        with self.service._cmd_lock:
+        with self._command_context(), self.service._cmd_lock:
             self._execute_reset(target, safe_cancel)
             self._check_cancelled(safe_cancel)
             self._verify_joint_return(target)
+
+    def _command_context(self):
+        control = getattr(self.service, "control", None)
+        if control is None:
+            return nullcontext()
+        return self.service._force_calibration_manager.action.commands()
 
     def fit(self, holds: Sequence[WristFtCalibrationHold]) -> WristFtCalibrationParameters:
         return fit_wrist_ft_calibration(
@@ -640,6 +653,7 @@ class VegaForceCalibrationManager:
         self._claim_robot = claim_robot
         self._release_robot = release_robot
         self._lock = threading.RLock()
+        self.action = None
         self._worker: threading.Thread | None = None
         self._deadline_timer: threading.Timer | None = None
         self._terminal_retry_timer: threading.Timer | None = None
@@ -655,6 +669,13 @@ class VegaForceCalibrationManager:
         ) = None
         self._owns_robot = False
         self._restore_runtime_state()
+
+    def _make_worker(self, **kwargs):
+        # Standalone arm servers retain their existing local execution. Managed
+        # servers register every stage and cleanup job with the common action.
+        if self.action is not None:
+            return self.action.worker(**kwargs)
+        return threading.Thread(**kwargs)
 
     def _cancel_deadline_locked(self) -> None:
         if self._deadline_timer is not None:
@@ -917,6 +938,10 @@ class VegaForceCalibrationManager:
             validator = getattr(self.adapter, "validate_start", None)
             if callable(validator):
                 validator()
+            # Initialize before admission so a concurrent Stop cannot signal an
+            # old event which would then be replaced by the newly accepted run.
+            self._cancelled = threading.Event()
+            self._cancel_safe_return = True
             if not self._claim_robot():
                 raise LifecycleError(
                     "FAILED_PRECONDITION", "robot command path is busy"
@@ -946,8 +971,6 @@ class VegaForceCalibrationManager:
                         None, expires_at_timestamp_us=1
                     )
                     self._runtime_install_pending_run_id = None
-                self._cancelled = threading.Event()
-                self._cancel_safe_return = True
                 self._holds = []
                 self._candidate = None
                 self._pending_terminal = None
@@ -973,7 +996,7 @@ class VegaForceCalibrationManager:
             if payload is None:
                 return status
             self._cancel_deadline_locked()
-            worker = threading.Thread(
+            worker = self._make_worker(
                 target=self._run_stage,
                 args=(run_id, stage_index, stage_id, deepcopy(payload)),
                 name=f"vega-force-cal-{self.lifecycle.plan.arm_name}",
@@ -1100,6 +1123,41 @@ class VegaForceCalibrationManager:
             )
             self._persist_pending_terminal_locked()
 
+    def interrupt_motion(self):
+        """Revoke motion immediately; serialize durable cancellation off the tick.
+
+        The captured event belongs to one run. A delayed cleanup cannot cancel
+        a later run, and a controller stop never invokes an automatic return.
+        """
+        # Registration and signalling must precede a concurrent stage's
+        # release. This lock never waits for the manager or arm command lock.
+        lock = nullcontext() if self.action is None else self.action.runner.lock
+        with lock:
+            if self.action is not None and self.action.finished:
+                return
+            cancelled = self._cancelled
+            if cancelled.is_set() and not self._cancel_safe_return:
+                return
+
+            def cancel():
+                with self._lock:
+                    if self._cancelled is not cancelled:
+                        return
+                    status = self.lifecycle.status()
+                    if status.state == "READY_TO_APPLY":
+                        # Keep the durable bilateral candidate, but end this
+                        # motion action. A later Commit cannot reclaim output.
+                        self._release_if_owned()
+                    elif status.state in ACTIVE_CALIBRATION_STATES:
+                        self.request_cancel(status.run_id, safe_return=False)
+
+            worker = self._make_worker(
+                target=cancel, name="vega-calibration-stop", daemon=True
+            )
+            self._cancel_safe_return = False
+            cancelled.set()
+            worker.start()
+
     def request_cancel(
         self, run_id: str, *, safe_return: bool = True
     ) -> CalibrationStatusSnapshot:
@@ -1123,7 +1181,7 @@ class VegaForceCalibrationManager:
             if status.state == "CANCELLING":
                 self._cancelled.set()
                 if self._worker is None or not self._worker.is_alive():
-                    self._worker = threading.Thread(
+                    self._worker = self._make_worker(
                         target=self._finish_cancel_safely,
                         args=(run_id,),
                         name=f"vega-force-cal-cancel-{self.lifecycle.plan.arm_name}",

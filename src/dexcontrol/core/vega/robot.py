@@ -35,12 +35,7 @@ from dexbot_utils.configs import get_robot_config
 
 
 class _RobotWithCustomHeadPose(Robot):
-    """Robot subclass that skips the default head home pose on startup.
-
-    head_init_pos is passed via __init__ so that _set_default_state() moves
-    the head directly to the desired position instead of the predefined "home"
-    pose.
-    """
+    """Connect without a head motion; retain its target for initial_pose."""
 
     def __init__(self, *args, head_init_pos: np.ndarray | None = None, **kwargs):
         self._head_init_pos = head_init_pos
@@ -65,16 +60,7 @@ class _RobotWithCustomHeadPose(Robot):
         head = getattr(self, "head", None)
         if head is not None:
             head.set_mode("enable")
-            if self._head_init_pos is not None:
-                init_pos = self.compensate_torso_pitch(
-                    np.asarray(self._head_init_pos, dtype=np.float32).copy(), "head"
-                )
-                _logger.info("Setting custom head init pos: %s", init_pos.tolist())
-            else:
-                init_pos = self.compensate_torso_pitch(
-                    head.get_predefined_pose("home"), "head"
-                )
-            head.set_joint_pos(init_pos)
+            # Positioning belongs to the explicit initial_pose action.
 
 _base_arm_teleop_error = None
 try:
@@ -199,7 +185,7 @@ class VegaRobot:
         if gripper_type == "robotiq":
             from dexcontrol.core.robotiq_gripper import RobotiqGripper  # lazy import
             # No comport -> gripper sits on this arm's wrist RS485 pass-through.
-            self.hand = RobotiqGripper(comport=self._robotiq_comport, side=arm_side)
+            self.hand = RobotiqGripper(comport=self._robotiq_comport, side=arm_side, initialize=False)
         elif gripper_type == "sr_gripper":
             from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
             sr_kwargs = {"comport": self._robotiq_comport} if self._robotiq_comport else {}
@@ -434,7 +420,7 @@ class VegaRobot:
         if self.arm.joint_pos_limit is None:
             raise RuntimeError("Arm joint position limits are unavailable")
         self.reset_filter_state()
-        self.sync_motion_manager_with_arm(self.reset_joints)
+        self.sync_motion_manager_with_arm(self.arm.get_joint_pos())
 
     def _start_gripper_worker(self) -> None:
         if self.hand is None:
@@ -510,6 +496,14 @@ class VegaRobot:
         wait_time: float,
         raise_on_error: bool,
     ) -> bool:
+        gate = getattr(self, "command_gate", None)
+        if gate is not None and not hasattr(self.hand, "bind_command_sink"):
+            gate.defer(f"{self.arm_side}_gripper", lambda: self._send_gripper_command(
+                target, 0.0, True))
+            return True
+        return self._send_gripper_command(target, wait_time, raise_on_error)
+
+    def _send_gripper_command(self, target, wait_time, raise_on_error):
         if self.hand is None:
             self._prev_gripper_command_successful = True
             return True
@@ -538,6 +532,9 @@ class VegaRobot:
 
     def _enqueue_gripper_target(self, target: float) -> None:
         target = float(np.clip(target, 0.0, 1.0))
+        if getattr(self, "command_gate", None) is not None:
+            self._execute_gripper_command(target, 0.0, True)
+            return
         if self._gripper_command_queue is None:
             self._execute_gripper_command(target, wait_time=0.0, raise_on_error=False)
             return
@@ -556,12 +553,16 @@ class VegaRobot:
     def get_cached_gripper_position(self) -> float:
         if self.hand is None:
             return 0.0
+        if getattr(self, "command_gate", None) is not None:
+            self._refresh_gripper_state()
         with self._gripper_state_lock:
             return float(self._gripper_position)
 
     def get_cached_gripper_joint_pos(self) -> np.ndarray:
         if self.hand is None:
             return np.zeros(1, dtype=np.float64)
+        if getattr(self, "command_gate", None) is not None:
+            self._refresh_gripper_state()
         with self._gripper_state_lock:
             return np.asarray(self._gripper_joint_pos, dtype=np.float64).copy()
 
@@ -798,7 +799,7 @@ class VegaRobot:
             self._latest_gripper_action = float(hand_action.reshape(-1)[0]) if hand_action.size else 0.0
             self._latest_gripper_action_space = gripper_action_space
 
-    def execute_interpolated_tick(self) -> bool:
+    def execute_interpolated_tick(self, *, raise_errors=False) -> bool:
         """Run one control-loop tick using interpolated position.
 
         Called at control rate (e.g. 100 Hz) by the background control
@@ -854,8 +855,12 @@ class VegaRobot:
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
             self._prev_command_successful = False
+            if raise_errors:
+                raise
         except Exception as exc:
             self._prev_command_successful = False
+            if raise_errors:
+                raise
             _logger.error("Interpolated tick failed: %s", exc)
 
         return True

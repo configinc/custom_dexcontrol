@@ -8,6 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src" / "dexcontrol"))
 from core.robotenv_vega.body_hardware import VegaHardware
+from core.robotenv_vega.managed_hardware import ManagedVegaHardware
 from core.robotenv_vega.torso_kinematics import TorsoKinematics
 from core.chassis_kinematics import bounded_wheel_control
 
@@ -84,6 +85,30 @@ def test_stop_confirmation_requires_new_sensor_samples():
     assert not h.stationary()
     for c in h.components():c.stamp+=1
     assert h.stationary()
+
+
+def test_managed_handover_does_not_wait_for_head_velocity_noise():
+    h = ManagedVegaHardware.__new__(ManagedVegaHardware)
+    h.__dict__.update(make_hardware().__dict__)
+    head = Component([1.22, -.1, -.28])
+    head.vel[:] = [.037, -.011, -.022]
+    head.set_joint_pos = lambda q: setattr(head, "command_pos", q.copy())
+    h.robot = SimpleNamespace(head=head)
+    for service in h.services:
+        service.gripper_type = "default"
+        service._robot.hand = None
+    h.hold()
+    for component in h.components():
+        component.stamp += 1
+    head.stamp += 1
+    assert h.stationary()
+    np.testing.assert_array_equal(head.command_pos, head.q)
+
+    # Moving components whose command ownership changes still block handover.
+    for component in h.components():
+        component.vel[:] = .1
+        assert not h.stationary()
+        component.vel[:] = 0
 
 
 def test_stop_cancels_both_reset_moves_before_waiting_for_arm_commands():

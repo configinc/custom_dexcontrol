@@ -18,13 +18,19 @@ Robotiq defaults to each arm's wrist RS485 pass-through, following the existing
 per-arm server convention. For USB-RS485 adapters, add
 `--left-gripper /dev/ttyUSB0 --right-gripper /dev/ttyUSB1` to the command.
 
-This opens real hardware and performs the existing DexControl startup sequence:
-head initialization, gripper opening, and each arm's middle/init pose movement.
-After initialization it starts in **hold**, retaining the measured joint positions.
-The supplied entrypoint supports built-in and Robotiq grippers. Both arms share one
-SDK Robot. Body control runs at 50 Hz. Each arm uses the original independent
-200 Hz output loop, with 20 Hz RCI input (`--action-hz`). An arm Step holds only
-that arm's command-admission lock; IK does not lock either output loop.
+This opens real hardware and starts in **IDLE / hold**, retaining the measured
+joint positions. Connection does not move to an initial pose or activate/open
+Robotiq grippers. `initial_pose` is an explicit, cancellable action on Vega Control
+after starting Robot Control on the main RCI page. Legacy per-arm servers also no longer move on construction; their
+explicit Reset RPC still performs the existing arm reset sequence.
+
+The supplied entrypoint supports built-in and Robotiq grippers. Both arms share
+one SDK Robot. One managed output tick runs at 200 Hz, with 20 Hz RCI input
+(`--action-hz`); the existing body calculation runs at 50 Hz. The arm IK,
+interpolation, position correction, and velocity feedforward formulas are
+unchanged. An arm Step holds only that arm's command-admission lock; slow IK
+requests do not take the common output lock. Commands from both arms are staged
+before validation and publication. See [control architecture](control-architecture.md).
 Ports 50061/50063 must be free before startup.
 
 Before opening the gRPC ports, the managed server keeps torso, head, arm,
@@ -32,16 +38,14 @@ chassis steering/drive, and configured wrist force sensor state subscriptions
 `always_on` and waits for their initial data. State reception continues even
 without observation requests, avoiding idle/resume gaps during concurrent
 arm observations and force calibration. Missing startup data fails explicitly.
-This changes state reception only; motion, Start/Stop, and calibration math
-are unchanged. Camera and auxiliary sensor subscriptions retain their policies.
+Calibration math is unchanged. Camera and auxiliary sensor subscriptions retain their policies.
 
 The default arm profile matches the existing 04 deployment: velocity feedforward
 on, linear interpolation with 3 samples, velocity smoothing alpha 1.0, hardware
 correction alpha 0.5, max delta scale 3.0, max jerk 0 (disabled), rotation
 sensitivity 2.0 and velocity ratio 1.0. These are CLI options on body_server.
-The per-arm server's defaults and command calculations remain unchanged.
-This branch is based on `refactor/vega-force-calibration-clean-v2`, preserving
-its force-calibration RPCs, wrench observations, and torso/head observation fields.
+The per-arm command calculations, force-calibration RPCs, wrench observations,
+and torso/head observation fields are retained.
 
 RCI must use both managed gRPC endpoints. Its connection code recognizes
 `body_control_required=true` and skips automatic homing. Open RCI's
@@ -64,9 +68,9 @@ teleop PC to the robot PC, installs dependencies, then runs `restart.yml`.
 For a Robotiq unit, restart now launches **one** `body_server` in the existing
 `robot-server` tmux session. The arm ports stay 50061 and 50063; body gRPC uses
 50065. It removes old per-arm and managed server processes before starting and
-checks all three ports. Normal startup still opens the grippers and moves the
-arms through their existing initialization poses. SIGTERM/SIGHUP run stop/hold
-cleanup. The tested arm profile remains 20 Hz input / 200 Hz output.
+checks all three ports. Startup leaves the robot in IDLE / hold. Initial Pose
+must be requested explicitly on Vega Control. SIGTERM/SIGHUP cancel actions
+and run stop/hold cleanup. The tested arm profile remains 20 Hz input / 200 Hz output.
 
 The managed server starts in a Bash login shell to load the robot's
 `ROBOT_NAME` and communication environment. Starting with `bash -ic` alone
@@ -128,18 +132,41 @@ initializes the pinned submodules before Ansible syncs them.
   Return `arm_ready`, without enabling arm motion.
 - RCI fetches fresh observations for both arms, updates only Oculus Cartesian
   anchors (preserving gripper target and VR axes), then enables arm control.
-- **arms**: accept normal Step/Reset commands. The body stays stopped.
+- **arms**: accept normal Step commands. Reset is an exclusive action. The body stays stopped.
+- **action**: a named action or calibration owns movement; teleop and mode changes are blocked.
 - **hold**: zero chassis drive, hold current torso/arm positions, discard queued
   targets. Motion requests are rejected while held.
 
-Body input expires after 0.4 seconds. Body faults and expired body input enter
-hold and require explicit mode selection. Arm commands retain the original
-per-arm error handling and have no added body watchdog or bilateral fault stop.
-An explicit Stop or body-mode transition closes arm command admission, stops
-the independent output loops, drains in-flight Steps and clears buffered targets
-before holding the measured pose. The body loop does not run additional continuous freshness or
-`is_active()` checks. The UI sends body commands
-at 10 Hz, only from the window that selected body mode.
+Body input expires after 0.4 seconds. With the default safety config, expiry,
+invalid output, I/O errors and failed actions latch **FAULT** and invoke hold.
+Stop does not clear FAULT. Reset Fault validates stopped feedback and returns
+to IDLE; Start is still required before selecting a mode. Arm Step/IK rejection
+retains its existing RPC response; failure of the output tick stops both arms.
+There is no added arm input watchdog. The final managed output uses
+asynchronous self-collision checking (10 mm margin; nearby targets
+are approved at up to 20 Hz, collision-increasing inputs are blocked without
+latching a collision fault). Static tipping protection shares the same worker
+and requires a 20 mm fixed-support margin; below the margin it permits improving
+posture recovery and blocks base drive. Approach/release thresholds are 50/60 mm
+in `vega_control.json`. This is a level-ground estimate without payload or
+dynamic tipping prediction. `GetState.stability` exposes margin and blocking details.
+Managed arm commands support optional continuous position-offset torque relief,
+disabled by default (`safety.arm_torque.enabled: false`). It is configured in the
+same file under `safety.arm_torque` and `arm_torque`. The initial per-joint
+limits are `[60, 60, 30, 30, 10, 10, 10]` N·m on both arms. Original arm velocity
+feedforward is retained; the corrected position then passes model approval.
+`GetState.arm_torque` exposes current, estimated torque, correction and final
+output positions for tuning. Stop/Halt/Fault clears the correction and holds as
+before. No physical torque guarantee or new RCI UI is implied by this feature.
+See [Control architecture](control-architecture.md) for configuration, model
+coverage, recovery rules and offline timing. Robotiq 2F-85 full-stroke envelopes
+are included; opposite external grippers are excluded from mutual collisions
+only in manual Arms mode. Actions, Body and Hold include that collision pair.
+
+`Halt` cancels movement and enters hold while keeping RUNNING authorization.
+Quest grip release and the body page's stop use Halt. The main page's control
+stop uses `Stop`, which revokes authorization and returns to IDLE. The UI sends
+body commands at 10 Hz, only from the window that selected body mode.
 
 RCI mode transitions are limited to manual teleop: stop policy inference and
 calibration before changing mode. The body feature is not a new policy action
@@ -218,7 +245,10 @@ The server uses runtime values, not this table. Command caps are base X/Y
 torso joints are capped at the minimum of URDF, SDK and 0.2 rad/s.
 There is no additional fixed target-tracking error cutoff. Joint speeds are
 bounded in the trajectory; measured lag does not redefine the accepted goal.
-These are kinematic paths, not collision checking.
+The torso planner produces kinematic paths. The common output gate separately
+monitors measured posture and approves candidate endpoints near collisions;
+it does not inspect intermediate interpolation points or pre-approve the entire
+torso trajectory.
 
 Arm IK optimizes only the 14 arm joints, as in the original per-arm server.
 The torso is fixed model geometry, never an optimization variable. Before
@@ -304,3 +334,18 @@ python -m pytest tests/test_body_control.py tests/test_body_hardware.py tests/te
 
 Physical robot startup, tracking, braking and grasp retention require a separate
 hardware test. The development verification did not actuate a robot.
+
+### Managed fold action
+
+After control has been started on the main page, `BodyControl.StartAction` with
+`name: "fold"` folds the left arm, then the right arm, then moves the torso to
+`[0, 0, -1.5]` rad. Each stage waits for measured completion. Arm reference speed
+is 0.5 rad/s and torso reference speed is 0.2 rad/s, further bounded by SDK limits.
+The action uses the shared
+command gate, collision and static stability protection.
+Stop/Halt or a blocked waypoint cancels the sequence; it does not advance to the
+next phase. Head posture and grasp are retained. Completion returns to hold.
+
+`poses.folded` and `actions.fold` in `vega_control.json` define the angles and
+execution settings. The other named action remains `initial_pose`; per-arm
+Reset and force calibration retain their existing RPCs.

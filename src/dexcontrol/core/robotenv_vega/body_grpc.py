@@ -8,13 +8,19 @@ from .body_control import ControlConflict
 
 LOG = logging.getLogger(__name__)
 MODES = {"hold": pb.HOLD, "transition": pb.TRANSITION, "body": pb.BODY,
-         "arm_ready": pb.ARM_READY, "arms": pb.ARMS}
+         "arm_ready": pb.ARM_READY, "arms": pb.ARMS, "action": pb.ACTION}
 VELOCITY_FIELDS = ("base_vx", "base_vy", "base_wz", "shoulder_vx", "shoulder_vz", "pitch_rate")
 
 
 def state_message(state):
     limits = state["limits"]
     return pb.BodyState(
+        control_state=state.get("control_state", ""),
+        fault_reason=state.get("fault_reason", ""), fault_action=state.get("fault_action", ""),
+        action=pb.ActionState(**state.get("action", {})),
+        collision=pb.CollisionState(**{k: v for k, v in state.get("collision", {}).items() if v is not None}),
+        stability=pb.StabilityState(**{k: v for k, v in state.get("stability", {}).items() if v is not None}),
+        arm_torque=pb.TorqueLimiterState(**state.get("arm_torque", {})),
         mode=MODES[state["mode"]],
         error=state["error"] or "", torso=state["torso"],
         shoulder=pb.ShoulderPose(**dict(zip(("x", "z", "pitch"), state["shoulder"]))),
@@ -73,3 +79,15 @@ class BodyService(rpc.BodyControlServicer):
 
     def Stop(self, request, context):
         return self._call(context, self.control.stop)
+
+    def Halt(self, request, context):
+        return self._call(context, self.control.halt)
+
+    def Start(self, request, context):
+        return self._call(context, self.control.start)
+
+    def ResetFault(self, request, context):
+        return self._call(context, self.control.reset_fault)
+
+    def StartAction(self, request, context):
+        return self._call(context, lambda: self.control.start_action(request.name))

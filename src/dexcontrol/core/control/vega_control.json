@@ -1,0 +1,244 @@
+{
+  "body_timeout_s": 0.4,
+  "safety": {
+    "input_timeout": {
+      "enabled": true,
+      "on_violation": "fault",
+      "fault_action": "hold"
+    },
+    "execution_error": {
+      "enabled": true,
+      "on_violation": "fault",
+      "fault_action": "hold"
+    },
+    "action_error": {
+      "enabled": true,
+      "on_violation": "fault",
+      "fault_action": "hold"
+    },
+    "self_collision": {
+      "enabled": true,
+      "on_violation": "block"
+    },
+    "static_stability": {
+      "enabled": true,
+      "on_violation": "block"
+    },
+    "arm_torque": {
+      "enabled": false,
+      "on_violation": "warn",
+      "log_interval_s": 1.0
+    }
+  },
+  "collision": {
+    "margin_m": 0.01,
+    "approach_m": 0.03,
+    "release_m": 0.04,
+    "monitor_hz": 100.0,
+    "approval_hz": 20.0,
+    "result_timeout_s": 0.1,
+    "max_outer_error_m": 0.001,
+    "arms_mode_excluded_pairs": [
+      [
+        "L_robotiq",
+        "R_robotiq"
+      ]
+    ],
+    "excluded_links": [
+      "B_wheel_l2",
+      "L_wheel_l2",
+      "R_wheel_l2"
+    ]
+  },
+  "stability": {
+    "margin_m": 0.02,
+    "approach_m": 0.05,
+    "release_m": 0.06
+  },
+  "poses": {
+    "folded": {
+      "left_arm": [
+        1.57079,
+        0.0,
+        0.0,
+        -3.071,
+        0.0,
+        0.0,
+        -0.69813
+      ],
+      "right_arm": [
+        -1.57079,
+        0.0,
+        0.0,
+        -3.071,
+        0.0,
+        0.0,
+        0.69813
+      ],
+      "torso": [
+        0.0,
+        0.0,
+        -1.5
+      ]
+    }
+  },
+  "actions": {
+    "fold": {
+      "arm_joint_velocity_rad_s": 0.5,
+      "torso_joint_velocity_rad_s": 0.2,
+      "position_tolerance_rad": 0.02,
+      "velocity_tolerance_rad_s": 0.03,
+      "settle_time_s": 0.2,
+      "stage_timeout_s": 60.0
+    }
+  },
+  "model": {
+    "robotiq_mount_xyz_m": [
+      0.0,
+      0.0,
+      0.0185
+    ],
+    "robotiq_mount_yaw_deg": {
+      "left": 90.0,
+      "right": -90.0
+    },
+    "robotiq_mass_kg": 1.2,
+    "robotiq_com_sensor_m": [
+      0.0,
+      0.0,
+      0.072
+    ],
+    "support_points_xy_m": [
+      [
+        -0.299,
+        0.0015
+      ],
+      [
+        0.185,
+        -0.223
+      ],
+      [
+        0.185,
+        0.223
+      ]
+    ],
+    "ground_z_m": -0.0547
+  },
+  "arm_torque": {
+    "feedback_timeout_s": 0.2,
+    "arms": {
+      "left_arm": {
+        "torque_constant_nm_per_a": [
+          4.255,
+          4.255,
+          1.592,
+          1.592,
+          1.621,
+          1.621,
+          1.621
+        ],
+        "current_sign": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "torque_limit_nm": [
+          60,
+          60,
+          30,
+          30,
+          10,
+          10,
+          10
+        ],
+        "gain_rad_per_nm_s": [
+          0.015,
+          0.015,
+          0.015,
+          0.015,
+          0.015,
+          0.015,
+          0.015
+        ],
+        "max_relief_speed_rad_s": [
+          0.15,
+          0.15,
+          0.15,
+          0.15,
+          0.15,
+          0.15,
+          0.15
+        ],
+        "recovery_speed_rad_s": [
+          0.15,
+          0.15,
+          0.15,
+          0.15,
+          0.15,
+          0.15,
+          0.15
+        ]
+      },
+      "right_arm": {
+        "torque_constant_nm_per_a": [
+          4.255,
+          4.255,
+          1.592,
+          1.592,
+          1.621,
+          1.621,
+          1.621
+        ],
+        "current_sign": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "torque_limit_nm": [
+          60,
+          60,
+          30,
+          30,
+          10,
+          10,
+          10
+        ],
+        "gain_rad_per_nm_s": [
+          0.015,
+          0.015,
+          0.015,
+          0.015,
+          0.015,
+          0.015,
+          0.015
+        ],
+        "max_relief_speed_rad_s": [
+          0.15,
+          0.15,
+          0.15,
+          0.15,
+          0.15,
+          0.15,
+          0.15
+        ],
+        "recovery_speed_rad_s": [
+          0.15,
+          0.15,
+          0.15,
+          0.15,
+          0.15,
+          0.15,
+          0.15
+        ]
+      }
+    }
+  }
+}

@@ -8,6 +8,18 @@ service BodyControl {
   rpc EnableArms (Empty) returns (BodyState);
   rpc Command (BodyCommand) returns (BodyState);
   rpc Stop (Empty) returns (BodyState);
+  // Cancel motion without disabling control (for grip release / mode handover).
+  rpc Halt (Empty) returns (BodyState);
+  rpc Start (Empty) returns (BodyState);
+  rpc ResetFault (Empty) returns (BodyState);
+  rpc StartAction (ActionRequest) returns (BodyState);
+}
+
+message ActionRequest { string name = 1; }
+message ActionState {
+  string name = 1;
+  string state = 2;
+  string error = 3;
 }
 
 enum Mode {
@@ -17,6 +29,7 @@ enum Mode {
   BODY = 3;
   ARM_READY = 4;
   ARMS = 5;
+  ACTION = 6;
 }
 message Empty {}
 message SelectModeRequest {
@@ -49,6 +62,44 @@ message Limits {
   string reference_frame = 6;
   double watchdog_seconds = 7;
 }
+message CollisionState {
+  string state = 1;
+  bool blocked = 2;
+  string reason = 3;
+  optional double clearance_m = 4;
+  repeated string pair = 5;
+  optional double result_age_s = 6;
+  double check_ms = 7;
+  double required_margin_m = 8;
+}
+message StabilityState {
+  string state = 1;
+  bool blocked = 2;
+  string reason = 3;
+  optional double margin_m = 4;
+  optional double target_margin_m = 5;
+  repeated double com_m = 6;
+  optional double mass_kg = 7;
+  optional double result_age_s = 8;
+  double check_ms = 9;
+  double required_margin_m = 10;
+}
+message ArmTorqueState {
+  string component = 1;
+  repeated string joint_names = 2;
+  repeated double current_a = 3;
+  repeated double estimated_torque_nm = 4;
+  repeated double torque_limit_nm = 5;
+  repeated double requested_position_rad = 6;
+  repeated double candidate_position_rad = 7;
+  repeated double candidate_offset_rad = 8;
+  repeated double output_position_rad = 9;
+  repeated bool over_limit = 10;
+}
+message TorqueLimiterState {
+  string state = 1;
+  repeated ArmTorqueState arms = 2;
+}
 message BodyState {
   Mode mode = 1;
   string error = 2;
@@ -60,4 +111,13 @@ message BodyState {
   // Accepted final targets; independent of intermediate commands and feedback.
   repeated double torso_target = 8;
   ShoulderPose shoulder_target = 9;
+  string control_state = 10;
+  string fault_reason = 11;
+  string fault_action = 12;
+  ActionState action = 13;
+  CollisionState collision = 14;
+  StabilityState stability = 15;
+  reserved 16;
+  reserved "arm_position_delta";
+  TorqueLimiterState arm_torque = 17;
 }

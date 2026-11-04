@@ -7,8 +7,7 @@ import time
 import numpy as np
 
 
-class ControlConflict(RuntimeError):
-    pass
+from ..control.fsm import ControlConflict
 
 
 class BodyControl:
@@ -47,6 +46,7 @@ class BodyControl:
         if mode not in ("body", "prepare_arms"):
             raise ValueError("Expected body or prepare_arms")
         with self.lock:
+            self._check_transition()
             if self.mode == "transition":
                 raise ControlConflict("Mode transition already in progress")
             self._hold()
@@ -79,6 +79,9 @@ class BodyControl:
                 raise ControlConflict("Mode transition was stopped")
             self._hold("Robot did not stop within 3 seconds")
         raise ControlConflict("Robot did not stop within 3 seconds")
+
+    def _check_transition(self):
+        """Lifecycle admission hook for the managed controller."""
 
     def enable_arms(self):
         with self.lock:

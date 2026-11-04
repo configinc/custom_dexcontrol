@@ -81,8 +81,9 @@ class RobotiqGripper:
         comport: str | None = None,
         side: str | None = None,
         init_timeout: float = 15.0,
+        initialize: bool = True,
     ) -> None:
-        """Connect to the gripper and run full initialisation.
+        """Connect to the gripper; optionally run activation and opening.
 
         Args:
             comport: Local serial port (e.g. /dev/ttyUSB0) for a USB-RS485
@@ -90,6 +91,7 @@ class RobotiqGripper:
             side: Arm side ('left'/'right') whose wrist RS485 pass-through the
                 gripper is plugged into. Used when `comport` is None.
             init_timeout: Seconds to wait for the gripper to become ready.
+            initialize: Activate on connection. Managed control sets this false.
         """
         if comport:
             logger.info("Connecting to Robotiq 2F-85 on {} ...", comport)
@@ -99,7 +101,10 @@ class RobotiqGripper:
             self._gripper = Robotiq2FingerGripper(side=side)
         else:
             raise ValueError("RobotiqGripper needs either comport or side")
-        self._gripper.full_init(timeout=init_timeout)
+        if initialize:
+            self._gripper.full_init(timeout=init_timeout)
+        elif not self._gripper.getStatus():
+            raise RuntimeError("Cannot read Robotiq state")
 
         # Locks
         self._gripper_io_lock = threading.Lock()
@@ -107,9 +112,12 @@ class RobotiqGripper:
 
         # Cached state (updated by worker thread only — measured, never commanded)
         self._cached_pos = self._gripper.get_pos()
+        self._command_generation = 0
+        self._motion_started = self._gripper.is_ready()
+        self._worker_error = None
 
         # Worker thread
-        self._command_queue: Queue[tuple[float, float, float]] = Queue(maxsize=1)
+        self._command_queue = Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._worker = threading.Thread(
             target=self._worker_loop,
@@ -118,13 +126,81 @@ class RobotiqGripper:
         )
         self._worker.start()
 
-        logger.info("Robotiq 2F-85 ready (async worker started).")
+        logger.info("Robotiq 2F-85 connected (async worker started).")
+
+    def initialize(self, cancelled, submit, timeout=15.0):
+        """Run activation only as an explicit, cancellable controller action."""
+        if cancelled.is_set():
+            raise RuntimeError("Gripper initialization cancelled")
+        with self._gripper_io_lock:
+            if self._gripper.is_ready():
+                return
+        def send(operation):
+            done = threading.Event()
+            def execute():
+                with self._gripper_io_lock:
+                    self._motion_started = True
+                    operation()
+                    self._gripper.sendCommand()
+                done.set()
+            submit(execute)
+            while not done.wait(.02):
+                if cancelled.is_set():
+                    raise RuntimeError("Gripper initialization cancelled")
+        for operation in (self._gripper.activate_emergency_release,
+                          self._gripper.deactivate_emergency_release,
+                          self._gripper.activate_gripper):
+            if cancelled.is_set():
+                raise RuntimeError("Gripper initialization cancelled")
+            send(operation)
+            if cancelled.wait(1.0):
+                raise RuntimeError("Gripper initialization cancelled")
+        deadline = time.monotonic() + timeout
+        while not cancelled.is_set():
+            with self._gripper_io_lock:
+                self._gripper.getStatus()
+                if self._gripper.is_ready():
+                    return
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Robotiq activation timed out")
+            cancelled.wait(.02)
+        raise RuntimeError("Gripper initialization cancelled")
+
+    def stop_motion(self):
+        """Discard unsent targets and stop travel without opening the fingers."""
+        with self._gripper_io_lock:
+            self._command_generation += 1
+            while True:
+                try:
+                    self._command_queue.get_nowait()
+                except Empty:
+                    break
+            # Connecting/holding must not activate an inactive gripper.
+            if self._motion_started:
+                self._gripper.deactivate_emergency_release()
+                if self._gripper.is_ready():
+                    self._gripper.stop()
+                else:
+                    # Cancel incomplete activation without starting it again.
+                    self._gripper.deactivate_gripper()
+                self._gripper.sendCommand()
+                self._motion_started = False
+
+    def check_error(self):
+        if self._worker_error is not None:
+            raise RuntimeError(f"Robotiq I/O failed: {self._worker_error}")
+
+    def reset_error(self):
+        with self._gripper_io_lock:
+            if not self._gripper.getStatus():
+                raise RuntimeError("Cannot read Robotiq state")
+            self._worker_error = None
 
     def _worker_loop(self) -> None:
         """Background loop: execute queued commands and refresh measured state."""
         while not self._stop_event.is_set():
             # Drain queue — only keep the latest command
-            latest_cmd: tuple[float, float, float] | None = None
+            latest_cmd = None
             try:
                 latest_cmd = self._command_queue.get(timeout=0.02)
                 # Drain any newer commands
@@ -135,12 +211,17 @@ class RobotiqGripper:
 
             # Execute command
             if latest_cmd is not None:
-                pos_m, vel, force = latest_cmd
+                generation, pos_m, vel, force = latest_cmd
                 try:
                     with self._gripper_io_lock:
-                        self._gripper.goto(pos=pos_m, vel=vel, force=force)
-                        self._gripper.sendCommand()
+                        if generation == self._command_generation:
+                            if not self._gripper.is_ready():
+                                raise RuntimeError("Gripper is inactive; run initial_pose first")
+                            self._motion_started = True
+                            self._gripper.goto(pos=pos_m, vel=vel, force=force)
+                            self._gripper.sendCommand()
                 except Exception as e:
+                    self._worker_error = e
                     logger.warning("Robotiq worker command error: {}", e)
 
             # Refresh cached state from real Modbus read
@@ -150,12 +231,16 @@ class RobotiqGripper:
                 if status_ok:
                     with self._state_lock:
                         self._cached_pos = self._gripper.get_pos()
+                else:
+                    raise RuntimeError("No Robotiq status response")
             except Exception as e:
+                self._worker_error = e
                 logger.warning("Robotiq worker state refresh error: {}", e)
 
     def _enqueue_command(self, pos_m: float, vel: float = 0.05, force: float = 95) -> None:
         """Non-blocking enqueue. Drops stale command if queue is full."""
-        cmd = (pos_m, vel, force)
+        self.check_error()
+        cmd = (self._command_generation, pos_m, vel, force)
         try:
             self._command_queue.put_nowait(cmd)
         except Full:

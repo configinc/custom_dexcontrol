@@ -265,6 +265,7 @@ def test_reset_current_is_read_only_outside_calibration() -> None:
 
 def test_reset_skip_intermediate_pose_is_forwarded_only_when_requested() -> None:
     service = _service()
+    service.gripper_type = "default"
     service.arm_side = "left"
     service.reset_joints = [0.0] * 7
     service._force_calibration_owns_robot = threading.Event()

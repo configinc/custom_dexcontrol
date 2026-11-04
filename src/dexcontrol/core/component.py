@@ -246,7 +246,18 @@ class RobotJointComponent(RobotComponent):
         Args:
             control_msg: Protobuf control message to publish.
         """
-        # DexComm publisher with protobuf encoder handles this
+        sink = getattr(self, "_command_sink", None)
+        if sink is not None:
+            sink(control_msg)
+            return
+        self.publish_staged_command(control_msg)
+
+    def bind_command_sink(self, sink) -> None:
+        """Route local commands through an owning controller's output gate."""
+        self._command_sink = sink
+
+    def publish_staged_command(self, control_msg: Any) -> None:
+        """Publish a command already admitted by the owning controller."""
         self._publisher.publish(control_msg)
         # Reset idle timer — controlling a component means we need its state feedback
         self._policy_manager.touch()
@@ -1077,6 +1088,8 @@ class ManagedJointComponent(RobotJointComponent, MotionPluginManaged):
         to keep the state subscriber from being auto-idled while a motion
         is being streamed/executed.
         """
+        if getattr(self, "_command_sink", None) is not None:
+            raise RuntimeError("Managed control requires locally checked streaming commands")
         self._target_publisher.publish(msg)
         self._policy_manager.touch()
 

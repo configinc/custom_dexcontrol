@@ -34,12 +34,20 @@ dependencies = [
     "scipy",
     "pytransform3d",
     "dexmotion",
+    "pin>=3.9,<4",
+    "coal>=3.0.2,<4",
+    "trimesh>=4.7,<6",
+    "rtree>=1,<2",
     "dualsense-controller",
     "proxsuite"
 ]
 requires-python = ">=3.10,<=3.13.11"
 
 [project.optional-dependencies]
+pose-lab = [
+    "viser>=1.1.1,<2",
+    "yourdfpy>=0.0.60,<0.1",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",

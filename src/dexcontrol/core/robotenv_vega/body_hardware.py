@@ -62,6 +62,8 @@ class VegaHardware:
                 "watchdog_seconds": BodyControl.TIMEOUT}
 
     def components(self):
+        # These components hand control between arm and body modes. Head
+        # telemetry is not part of that handover's stopped-state condition.
         return [self.torso, self.chassis.chassis_steer, self.chassis.chassis_drive,
                 *(s._robot.arm for s in self.services)]
 

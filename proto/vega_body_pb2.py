@@ -15,7 +15,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0fvega_body.proto\x12\x0cvega.body.v1\"\x07\n\x05\x45mpty\"5\n\x11SelectModeRequest\x12 \n\x04mode\x18\x01 \x01(\x0e\x32\x12.vega.body.v1.Mode\"{\n\x08Velocity\x12\x0f\n\x07\x62\x61se_vx\x18\x01 \x01(\x01\x12\x0f\n\x07\x62\x61se_vy\x18\x02 \x01(\x01\x12\x0f\n\x07\x62\x61se_wz\x18\x03 \x01(\x01\x12\x13\n\x0bshoulder_vx\x18\x04 \x01(\x01\x12\x13\n\x0bshoulder_vz\x18\x05 \x01(\x01\x12\x12\n\npitch_rate\x18\x06 \x01(\x01\"l\n\x0b\x42odyCommand\x12(\n\x08velocity\x18\x01 \x01(\x0b\x32\x16.vega.body.v1.Velocity\x12\x33\n\x0fshoulder_target\x18\x02 \x01(\x0b\x32\x1a.vega.body.v1.ShoulderPose\"*\n\nJointRange\x12\r\n\x05lower\x18\x01 \x01(\x01\x12\r\n\x05upper\x18\x02 \x01(\x01\"3\n\x0cShoulderPose\x12\t\n\x01x\x18\x01 \x01(\x01\x12\t\n\x01z\x18\x02 \x01(\x01\x12\r\n\x05pitch\x18\x03 \x01(\x01\"\xf8\x01\n\x06Limits\x12*\n\x08steering\x18\x01 \x03(\x0b\x32\x18.vega.body.v1.JointRange\x12\'\n\x05torso\x18\x02 \x03(\x0b\x32\x18.vega.body.v1.JointRange\x12\x30\n\x10\x63ommand_velocity\x18\x03 \x01(\x0b\x32\x16.vega.body.v1.Velocity\x12\x1c\n\x14torso_joint_velocity\x18\x04 \x03(\x01\x12\x16\n\x0eshoulder_frame\x18\x05 \x01(\t\x12\x17\n\x0freference_frame\x18\x06 \x01(\t\x12\x18\n\x10watchdog_seconds\x18\x07 \x01(\x01\"\x94\x02\n\tBodyState\x12 \n\x04mode\x18\x01 \x01(\x0e\x32\x12.vega.body.v1.Mode\x12\r\n\x05\x65rror\x18\x02 \x01(\t\x12$\n\x06limits\x18\x03 \x01(\x0b\x32\x14.vega.body.v1.Limits\x12\r\n\x05torso\x18\x04 \x03(\x01\x12,\n\x08shoulder\x18\x05 \x01(\x0b\x32\x1a.vega.body.v1.ShoulderPose\x12\x10\n\x08steering\x18\x06 \x03(\x01\x12\x16\n\x0ewheel_velocity\x18\x07 \x03(\x01\x12\x14\n\x0ctorso_target\x18\x08 \x03(\x01\x12\x33\n\x0fshoulder_target\x18\t \x01(\x0b\x32\x1a.vega.body.v1.ShoulderPose*Y\n\x04Mode\x12\x14\n\x10MODE_UNSPECIFIED\x10\x00\x12\x08\n\x04HOLD\x10\x01\x12\x0e\n\nTRANSITION\x10\x02\x12\x08\n\x04\x42ODY\x10\x03\x12\r\n\tARM_READY\x10\x04\x12\x08\n\x04\x41RMS\x10\x05\x32\xc0\x02\n\x0b\x42odyControl\x12\x38\n\x08GetState\x12\x13.vega.body.v1.Empty\x1a\x17.vega.body.v1.BodyState\x12\x46\n\nSelectMode\x12\x1f.vega.body.v1.SelectModeRequest\x1a\x17.vega.body.v1.BodyState\x12:\n\nEnableArms\x12\x13.vega.body.v1.Empty\x1a\x17.vega.body.v1.BodyState\x12=\n\x07\x43ommand\x12\x19.vega.body.v1.BodyCommand\x1a\x17.vega.body.v1.BodyState\x12\x34\n\x04Stop\x12\x13.vega.body.v1.Empty\x1a\x17.vega.body.v1.BodyStateb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0fvega_body.proto\x12\x0cvega.body.v1\"\x1d\n\rActionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"9\n\x0b\x41\x63tionState\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\r\n\x05state\x18\x02 \x01(\t\x12\r\n\x05\x65rror\x18\x03 \x01(\t\"\x07\n\x05\x45mpty\"5\n\x11SelectModeRequest\x12 \n\x04mode\x18\x01 \x01(\x0e\x32\x12.vega.body.v1.Mode\"{\n\x08Velocity\x12\x0f\n\x07\x62\x61se_vx\x18\x01 \x01(\x01\x12\x0f\n\x07\x62\x61se_vy\x18\x02 \x01(\x01\x12\x0f\n\x07\x62\x61se_wz\x18\x03 \x01(\x01\x12\x13\n\x0bshoulder_vx\x18\x04 \x01(\x01\x12\x13\n\x0bshoulder_vz\x18\x05 \x01(\x01\x12\x12\n\npitch_rate\x18\x06 \x01(\x01\"l\n\x0b\x42odyCommand\x12(\n\x08velocity\x18\x01 \x01(\x0b\x32\x16.vega.body.v1.Velocity\x12\x33\n\x0fshoulder_target\x18\x02 \x01(\x0b\x32\x1a.vega.body.v1.ShoulderPose\"*\n\nJointRange\x12\r\n\x05lower\x18\x01 \x01(\x01\x12\r\n\x05upper\x18\x02 \x01(\x01\"3\n\x0cShoulderPose\x12\t\n\x01x\x18\x01 \x01(\x01\x12\t\n\x01z\x18\x02 \x01(\x01\x12\r\n\x05pitch\x18\x03 \x01(\x01\"\xf8\x01\n\x06Limits\x12*\n\x08steering\x18\x01 \x03(\x0b\x32\x18.vega.body.v1.JointRange\x12\'\n\x05torso\x18\x02 \x03(\x0b\x32\x18.vega.body.v1.JointRange\x12\x30\n\x10\x63ommand_velocity\x18\x03 \x01(\x0b\x32\x16.vega.body.v1.Velocity\x12\x1c\n\x14torso_joint_velocity\x18\x04 \x03(\x01\x12\x16\n\x0eshoulder_frame\x18\x05 \x01(\t\x12\x17\n\x0freference_frame\x18\x06 \x01(\t\x12\x18\n\x10watchdog_seconds\x18\x07 \x01(\x01\"\xd1\x01\n\x0e\x43ollisionState\x12\r\n\x05state\x18\x01 \x01(\t\x12\x0f\n\x07\x62locked\x18\x02 \x01(\x08\x12\x0e\n\x06reason\x18\x03 \x01(\t\x12\x18\n\x0b\x63learance_m\x18\x04 \x01(\x01H\x00\x88\x01\x01\x12\x0c\n\x04pair\x18\x05 \x03(\t\x12\x19\n\x0cresult_age_s\x18\x06 \x01(\x01H\x01\x88\x01\x01\x12\x10\n\x08\x63heck_ms\x18\x07 \x01(\x01\x12\x19\n\x11required_margin_m\x18\x08 \x01(\x01\x42\x0e\n\x0c_clearance_mB\x0f\n\r_result_age_s\"\xa0\x02\n\x0eStabilityState\x12\r\n\x05state\x18\x01 \x01(\t\x12\x0f\n\x07\x62locked\x18\x02 \x01(\x08\x12\x0e\n\x06reason\x18\x03 \x01(\t\x12\x15\n\x08margin_m\x18\x04 \x01(\x01H\x00\x88\x01\x01\x12\x1c\n\x0ftarget_margin_m\x18\x05 \x01(\x01H\x01\x88\x01\x01\x12\r\n\x05\x63om_m\x18\x06 \x03(\x01\x12\x14\n\x07mass_kg\x18\x07 \x01(\x01H\x02\x88\x01\x01\x12\x19\n\x0cresult_age_s\x18\x08 \x01(\x01H\x03\x88\x01\x01\x12\x10\n\x08\x63heck_ms\x18\t \x01(\x01\x12\x19\n\x11required_margin_m\x18\n \x01(\x01\x42\x0b\n\t_margin_mB\x12\n\x10_target_margin_mB\n\n\x08_mass_kgB\x0f\n\r_result_age_s\"\x90\x02\n\x0e\x41rmTorqueState\x12\x11\n\tcomponent\x18\x01 \x01(\t\x12\x13\n\x0bjoint_names\x18\x02 \x03(\t\x12\x11\n\tcurrent_a\x18\x03 \x03(\x01\x12\x1b\n\x13\x65stimated_torque_nm\x18\x04 \x03(\x01\x12\x17\n\x0ftorque_limit_nm\x18\x05 \x03(\x01\x12\x1e\n\x16requested_position_rad\x18\x06 \x03(\x01\x12\x1e\n\x16\x63\x61ndidate_position_rad\x18\x07 \x03(\x01\x12\x1c\n\x14\x63\x61ndidate_offset_rad\x18\x08 \x03(\x01\x12\x1b\n\x13output_position_rad\x18\t \x03(\x01\x12\x12\n\nover_limit\x18\n \x03(\x08\"O\n\x12TorqueLimiterState\x12\r\n\x05state\x18\x01 \x01(\t\x12*\n\x04\x61rms\x18\x02 \x03(\x0b\x32\x1c.vega.body.v1.ArmTorqueState\"\xb4\x04\n\tBodyState\x12 \n\x04mode\x18\x01 \x01(\x0e\x32\x12.vega.body.v1.Mode\x12\r\n\x05\x65rror\x18\x02 \x01(\t\x12$\n\x06limits\x18\x03 \x01(\x0b\x32\x14.vega.body.v1.Limits\x12\r\n\x05torso\x18\x04 \x03(\x01\x12,\n\x08shoulder\x18\x05 \x01(\x0b\x32\x1a.vega.body.v1.ShoulderPose\x12\x10\n\x08steering\x18\x06 \x03(\x01\x12\x16\n\x0ewheel_velocity\x18\x07 \x03(\x01\x12\x14\n\x0ctorso_target\x18\x08 \x03(\x01\x12\x33\n\x0fshoulder_target\x18\t \x01(\x0b\x32\x1a.vega.body.v1.ShoulderPose\x12\x15\n\rcontrol_state\x18\n \x01(\t\x12\x14\n\x0c\x66\x61ult_reason\x18\x0b \x01(\t\x12\x14\n\x0c\x66\x61ult_action\x18\x0c \x01(\t\x12)\n\x06\x61\x63tion\x18\r \x01(\x0b\x32\x19.vega.body.v1.ActionState\x12/\n\tcollision\x18\x0e \x01(\x0b\x32\x1c.vega.body.v1.CollisionState\x12/\n\tstability\x18\x0f \x01(\x0b\x32\x1c.vega.body.v1.StabilityState\x12\x34\n\narm_torque\x18\x11 \x01(\x0b\x32 .vega.body.v1.TorqueLimiterStateJ\x04\x08\x10\x10\x11R\x12\x61rm_position_delta*e\n\x04Mode\x12\x14\n\x10MODE_UNSPECIFIED\x10\x00\x12\x08\n\x04HOLD\x10\x01\x12\x0e\n\nTRANSITION\x10\x02\x12\x08\n\x04\x42ODY\x10\x03\x12\r\n\tARM_READY\x10\x04\x12\x08\n\x04\x41RMS\x10\x05\x12\n\n\x06\x41\x43TION\x10\x06\x32\xae\x04\n\x0b\x42odyControl\x12\x38\n\x08GetState\x12\x13.vega.body.v1.Empty\x1a\x17.vega.body.v1.BodyState\x12\x46\n\nSelectMode\x12\x1f.vega.body.v1.SelectModeRequest\x1a\x17.vega.body.v1.BodyState\x12:\n\nEnableArms\x12\x13.vega.body.v1.Empty\x1a\x17.vega.body.v1.BodyState\x12=\n\x07\x43ommand\x12\x19.vega.body.v1.BodyCommand\x1a\x17.vega.body.v1.BodyState\x12\x34\n\x04Stop\x12\x13.vega.body.v1.Empty\x1a\x17.vega.body.v1.BodyState\x12\x34\n\x04Halt\x12\x13.vega.body.v1.Empty\x1a\x17.vega.body.v1.BodyState\x12\x35\n\x05Start\x12\x13.vega.body.v1.Empty\x1a\x17.vega.body.v1.BodyState\x12:\n\nResetFault\x12\x13.vega.body.v1.Empty\x1a\x17.vega.body.v1.BodyState\x12\x43\n\x0bStartAction\x12\x1b.vega.body.v1.ActionRequest\x1a\x17.vega.body.v1.BodyStateb\x06proto3')
 
 _MODE = DESCRIPTOR.enum_types_by_name['Mode']
 Mode = enum_type_wrapper.EnumTypeWrapper(_MODE)
@@ -25,8 +25,11 @@ TRANSITION = 2
 BODY = 3
 ARM_READY = 4
 ARMS = 5
+ACTION = 6
 
 
+_ACTIONREQUEST = DESCRIPTOR.message_types_by_name['ActionRequest']
+_ACTIONSTATE = DESCRIPTOR.message_types_by_name['ActionState']
 _EMPTY = DESCRIPTOR.message_types_by_name['Empty']
 _SELECTMODEREQUEST = DESCRIPTOR.message_types_by_name['SelectModeRequest']
 _VELOCITY = DESCRIPTOR.message_types_by_name['Velocity']
@@ -34,7 +37,25 @@ _BODYCOMMAND = DESCRIPTOR.message_types_by_name['BodyCommand']
 _JOINTRANGE = DESCRIPTOR.message_types_by_name['JointRange']
 _SHOULDERPOSE = DESCRIPTOR.message_types_by_name['ShoulderPose']
 _LIMITS = DESCRIPTOR.message_types_by_name['Limits']
+_COLLISIONSTATE = DESCRIPTOR.message_types_by_name['CollisionState']
+_STABILITYSTATE = DESCRIPTOR.message_types_by_name['StabilityState']
+_ARMTORQUESTATE = DESCRIPTOR.message_types_by_name['ArmTorqueState']
+_TORQUELIMITERSTATE = DESCRIPTOR.message_types_by_name['TorqueLimiterState']
 _BODYSTATE = DESCRIPTOR.message_types_by_name['BodyState']
+ActionRequest = _reflection.GeneratedProtocolMessageType('ActionRequest', (_message.Message,), {
+  'DESCRIPTOR' : _ACTIONREQUEST,
+  '__module__' : 'vega_body_pb2'
+  # @@protoc_insertion_point(class_scope:vega.body.v1.ActionRequest)
+  })
+_sym_db.RegisterMessage(ActionRequest)
+
+ActionState = _reflection.GeneratedProtocolMessageType('ActionState', (_message.Message,), {
+  'DESCRIPTOR' : _ACTIONSTATE,
+  '__module__' : 'vega_body_pb2'
+  # @@protoc_insertion_point(class_scope:vega.body.v1.ActionState)
+  })
+_sym_db.RegisterMessage(ActionState)
+
 Empty = _reflection.GeneratedProtocolMessageType('Empty', (_message.Message,), {
   'DESCRIPTOR' : _EMPTY,
   '__module__' : 'vega_body_pb2'
@@ -84,6 +105,34 @@ Limits = _reflection.GeneratedProtocolMessageType('Limits', (_message.Message,),
   })
 _sym_db.RegisterMessage(Limits)
 
+CollisionState = _reflection.GeneratedProtocolMessageType('CollisionState', (_message.Message,), {
+  'DESCRIPTOR' : _COLLISIONSTATE,
+  '__module__' : 'vega_body_pb2'
+  # @@protoc_insertion_point(class_scope:vega.body.v1.CollisionState)
+  })
+_sym_db.RegisterMessage(CollisionState)
+
+StabilityState = _reflection.GeneratedProtocolMessageType('StabilityState', (_message.Message,), {
+  'DESCRIPTOR' : _STABILITYSTATE,
+  '__module__' : 'vega_body_pb2'
+  # @@protoc_insertion_point(class_scope:vega.body.v1.StabilityState)
+  })
+_sym_db.RegisterMessage(StabilityState)
+
+ArmTorqueState = _reflection.GeneratedProtocolMessageType('ArmTorqueState', (_message.Message,), {
+  'DESCRIPTOR' : _ARMTORQUESTATE,
+  '__module__' : 'vega_body_pb2'
+  # @@protoc_insertion_point(class_scope:vega.body.v1.ArmTorqueState)
+  })
+_sym_db.RegisterMessage(ArmTorqueState)
+
+TorqueLimiterState = _reflection.GeneratedProtocolMessageType('TorqueLimiterState', (_message.Message,), {
+  'DESCRIPTOR' : _TORQUELIMITERSTATE,
+  '__module__' : 'vega_body_pb2'
+  # @@protoc_insertion_point(class_scope:vega.body.v1.TorqueLimiterState)
+  })
+_sym_db.RegisterMessage(TorqueLimiterState)
+
 BodyState = _reflection.GeneratedProtocolMessageType('BodyState', (_message.Message,), {
   'DESCRIPTOR' : _BODYSTATE,
   '__module__' : 'vega_body_pb2'
@@ -95,24 +144,36 @@ _BODYCONTROL = DESCRIPTOR.services_by_name['BodyControl']
 if _descriptor._USE_C_DESCRIPTORS == False:
 
   DESCRIPTOR._options = None
-  _MODE._serialized_start=959
-  _MODE._serialized_end=1048
-  _EMPTY._serialized_start=33
-  _EMPTY._serialized_end=40
-  _SELECTMODEREQUEST._serialized_start=42
-  _SELECTMODEREQUEST._serialized_end=95
-  _VELOCITY._serialized_start=97
-  _VELOCITY._serialized_end=220
-  _BODYCOMMAND._serialized_start=222
-  _BODYCOMMAND._serialized_end=330
-  _JOINTRANGE._serialized_start=332
-  _JOINTRANGE._serialized_end=374
-  _SHOULDERPOSE._serialized_start=376
-  _SHOULDERPOSE._serialized_end=427
-  _LIMITS._serialized_start=430
-  _LIMITS._serialized_end=678
-  _BODYSTATE._serialized_start=681
-  _BODYSTATE._serialized_end=957
-  _BODYCONTROL._serialized_start=1051
-  _BODYCONTROL._serialized_end=1371
+  _MODE._serialized_start=2196
+  _MODE._serialized_end=2297
+  _ACTIONREQUEST._serialized_start=33
+  _ACTIONREQUEST._serialized_end=62
+  _ACTIONSTATE._serialized_start=64
+  _ACTIONSTATE._serialized_end=121
+  _EMPTY._serialized_start=123
+  _EMPTY._serialized_end=130
+  _SELECTMODEREQUEST._serialized_start=132
+  _SELECTMODEREQUEST._serialized_end=185
+  _VELOCITY._serialized_start=187
+  _VELOCITY._serialized_end=310
+  _BODYCOMMAND._serialized_start=312
+  _BODYCOMMAND._serialized_end=420
+  _JOINTRANGE._serialized_start=422
+  _JOINTRANGE._serialized_end=464
+  _SHOULDERPOSE._serialized_start=466
+  _SHOULDERPOSE._serialized_end=517
+  _LIMITS._serialized_start=520
+  _LIMITS._serialized_end=768
+  _COLLISIONSTATE._serialized_start=771
+  _COLLISIONSTATE._serialized_end=980
+  _STABILITYSTATE._serialized_start=983
+  _STABILITYSTATE._serialized_end=1271
+  _ARMTORQUESTATE._serialized_start=1274
+  _ARMTORQUESTATE._serialized_end=1546
+  _TORQUELIMITERSTATE._serialized_start=1548
+  _TORQUELIMITERSTATE._serialized_end=1627
+  _BODYSTATE._serialized_start=1630
+  _BODYSTATE._serialized_end=2194
+  _BODYCONTROL._serialized_start=2300
+  _BODYCONTROL._serialized_end=2858
 # @@protoc_insertion_point(module_scope)
